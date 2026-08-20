@@ -6,6 +6,7 @@ import { db } from "./firebase-init.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
 import { evaluatePrelimMatch } from "./match-logic.js";
 import { generateRoundRobin } from "./schedule.js";
+import { normalizeBackupData } from "./backup-format.js";
 
 const TID = TOURNAMENT_ID;
 
@@ -13,7 +14,7 @@ const tDoc = () => doc(db, "tournaments", TID);
 const groupsCol = () => collection(db, "tournaments", TID, "groups");
 const teamsCol = () => collection(db, "tournaments", TID, "teams");
 const prelimCol = () => collection(db, "tournaments", TID, "prelimMatches");
-const finalCol = () => collection(db, "tournaments", TID, "finalMatches");
+const finalCol = (division) => collection(db, "tournaments", TID, "divisions", division, "finalMatches");
 
 /** onSnapshot 오류를 콘솔뿐 아니라 화면(firestore-error 이벤트)으로도 알린다 */
 function reportSnapshotError(label, err) {
@@ -51,20 +52,35 @@ export function subscribeTournamentInfo(cb) {
 
 // ---------- 조 ----------
 
-export async function addGroup(name) {
-  await addDoc(groupsCol(), { name, order: Date.now() });
+export async function addGroup(name, division) {
+  await addDoc(groupsCol(), { name, division, order: Date.now() });
+}
+
+/** 조 카드의 드래그 순서를 저장한다. */
+export async function reorderGroups(orderedGroupIds) {
+  const batch = writeBatch(db);
+  orderedGroupIds.forEach((groupId, index) => {
+    batch.update(doc(groupsCol(), groupId), { order: index });
+  });
+  await batch.commit();
 }
 
 /** 조를 삭제하면서, 그 조에 속해 있던 팀들은 '미배정' 상태(groupId: null)로 되돌린다.
  *  (이렇게 하지 않으면 팀이 삭제된 조의 id를 계속 들고 있어 화면에서 보이지도, 지워지지도 않는
  *  '고아 팀'이 되어버린다.) */
 export async function deleteGroup(id) {
-  const teamsSnap = await getDocs(teamsCol());
+  const [teamsSnap, prelimSnap] = await Promise.all([
+    getDocs(teamsCol()),
+    getDocs(prelimCol()),
+  ]);
   const batch = writeBatch(db);
   teamsSnap.docs.forEach((d) => {
     if (d.data().groupId === id) {
       batch.update(d.ref, { groupId: null });
     }
+  });
+  prelimSnap.docs.forEach((d) => {
+    if (d.data().groupId === id) batch.delete(d.ref);
   });
   batch.delete(doc(groupsCol(), id));
   await batch.commit();
@@ -72,16 +88,20 @@ export async function deleteGroup(id) {
 
 /** 등록된 모든 조를 삭제한다 ('조 편성' 초기화 버튼용).
  *  팀은 지우지 않고 모두 '미배정' 상태(groupId: null)로 되돌리며, 조에 딸린 예선 경기도 함께 삭제한다. */
-export async function deleteAllGroups() {
+export async function deleteAllGroups(division) {
   const [groupsSnap, teamsSnap, prelimSnap] = await Promise.all([
     getDocs(groupsCol()), getDocs(teamsCol()), getDocs(prelimCol()),
   ]);
   const batch = writeBatch(db);
   teamsSnap.docs.forEach((d) => {
-    if (d.data().groupId) batch.update(d.ref, { groupId: null });
+    if (d.data().division === division && d.data().groupId) batch.update(d.ref, { groupId: null });
   });
-  prelimSnap.docs.forEach((d) => batch.delete(d.ref));
-  groupsSnap.docs.forEach((d) => batch.delete(d.ref));
+  prelimSnap.docs.forEach((d) => {
+    if (d.data().division === division) batch.delete(d.ref);
+  });
+  groupsSnap.docs.forEach((d) => {
+    if (d.data().division === division) batch.delete(d.ref);
+  });
   await batch.commit();
 }
 
@@ -97,11 +117,11 @@ export async function setGroupRingOrder(groupId, ringOrder) {
 
 /** 모든 조의 링크제 꼭짓점 배치(ringOrder)를 비운다 ('예선 대진 설정' 전체 초기화 버튼용).
  *  예선 경기 자체는 clearAllPrelimMatches가 지우므로, 이 함수는 도형에 남아있는 팀 배치만 정리한다. */
-export async function resetAllRingOrders() {
+export async function resetAllRingOrders(division) {
   const existing = await getDocs(groupsCol());
   const batch = writeBatch(db);
   existing.docs.forEach((d) => {
-    if (d.data().ringOrder && d.data().ringOrder.length) batch.update(d.ref, { ringOrder: [] });
+    if (d.data().division === division && d.data().ringOrder && d.data().ringOrder.length) batch.update(d.ref, { ringOrder: [] });
   });
   await batch.commit();
 }
@@ -119,12 +139,23 @@ export function subscribeGroups(cb) {
 
 // ---------- 팀 ----------
 
-export async function addTeam(name, groupId) {
-  await addDoc(teamsCol(), { name, groupId: groupId || null, order: Date.now(), advanced: false });
+export async function addTeam(name, groupId, division) {
+  await addDoc(teamsCol(), { name, groupId: groupId || null, division, order: Date.now(), advanced: false });
 }
 
 export async function updateTeam(id, data) {
   await updateDoc(doc(teamsCol(), id), data);
+}
+
+/** 팀을 대상 조로 옮기면서 그 조 안의 카드 순서를 한 번에 저장한다. */
+export async function moveAndReorderTeam(teamId, targetGroupId, orderedTeamIds) {
+  const batch = writeBatch(db);
+  orderedTeamIds.forEach((orderedTeamId, index) => {
+    const data = { order: index };
+    if (orderedTeamId === teamId) data.groupId = targetGroupId || null;
+    batch.update(doc(teamsCol(), orderedTeamId), data);
+  });
+  await batch.commit();
 }
 
 export async function deleteTeam(id) {
@@ -133,13 +164,17 @@ export async function deleteTeam(id) {
 
 /** 등록된 모든 팀을 삭제한다 ('참가팀 등록' 초기화 버튼용).
  *  팀에 의존하는 예선/본선 경기 기록도 함께 삭제해 고아 데이터가 남지 않게 한다. */
-export async function deleteAllTeams() {
+export async function deleteAllTeams(division) {
   const [teamsSnap, prelimSnap, finalSnap] = await Promise.all([
-    getDocs(teamsCol()), getDocs(prelimCol()), getDocs(finalCol()),
+    getDocs(teamsCol()), getDocs(prelimCol()), getDocs(finalCol(division)),
   ]);
   const batch = writeBatch(db);
-  teamsSnap.docs.forEach((d) => batch.delete(d.ref));
-  prelimSnap.docs.forEach((d) => batch.delete(d.ref));
+  teamsSnap.docs.forEach((d) => {
+    if (d.data().division === division) batch.delete(d.ref);
+  });
+  prelimSnap.docs.forEach((d) => {
+    if (d.data().division === division) batch.delete(d.ref);
+  });
   finalSnap.docs.forEach((d) => batch.delete(d.ref));
   await batch.commit();
 }
@@ -159,7 +194,11 @@ export function subscribeTeams(cb) {
 
 /** 해당 조의 기존 예선 경기를 모두 지우고 라운드로빈 일정을 새로 만든다 */
 export async function generatePrelimMatchesForGroup(groupId, teamIds) {
-  const existing = await getDocs(prelimCol());
+  const [existing, groupSnap] = await Promise.all([
+    getDocs(prelimCol()), getDoc(doc(groupsCol(), groupId)),
+  ]);
+  if (!groupSnap.exists()) throw new Error("조를 찾을 수 없습니다.");
+  const division = groupSnap.data().division;
   const batch = writeBatch(db);
   existing.docs.forEach((d) => {
     if (d.data().groupId === groupId) batch.delete(d.ref);
@@ -169,6 +208,7 @@ export async function generatePrelimMatchesForGroup(groupId, teamIds) {
     const ref = doc(prelimCol());
     batch.set(ref, {
       groupId,
+      division,
       teamA: p.teamA,
       teamB: p.teamB,
       round: p.round,
@@ -192,16 +232,22 @@ export async function clearPrelimMatchesForGroup(groupId) {
 }
 
 /** 모든 조의 예선 경기(대진+결과)를 전부 삭제한다 ('예선 대진 설정' 초기화 버튼용). */
-export async function clearAllPrelimMatches() {
+export async function clearAllPrelimMatches(division) {
   const existing = await getDocs(prelimCol());
   const batch = writeBatch(db);
-  existing.docs.forEach((d) => batch.delete(d.ref));
+  existing.docs.forEach((d) => {
+    if (d.data().division === division) batch.delete(d.ref);
+  });
   await batch.commit();
 }
 
 /** 해당 조의 기존 예선 경기를 모두 지우고, 링크제(인접 꼭짓점) 대진쌍으로 새로 만든다 */
 export async function generateRingMatchesForGroup(groupId, pairs) {
-  const existing = await getDocs(prelimCol());
+  const [existing, groupSnap] = await Promise.all([
+    getDocs(prelimCol()), getDoc(doc(groupsCol(), groupId)),
+  ]);
+  if (!groupSnap.exists()) throw new Error("조를 찾을 수 없습니다.");
+  const division = groupSnap.data().division;
   const batch = writeBatch(db);
   existing.docs.forEach((d) => {
     if (d.data().groupId === groupId) batch.delete(d.ref);
@@ -210,6 +256,7 @@ export async function generateRingMatchesForGroup(groupId, pairs) {
     const ref = doc(prelimCol());
     batch.set(ref, {
       groupId,
+      division,
       teamA: p.teamA,
       teamB: p.teamB,
       round: idx + 1,
@@ -264,22 +311,22 @@ export function subscribePrelimMatches(cb) {
  * 하면 이전에 공개됐던 경기 문서가 고스란히 남아 유령 경기로 보일 수 있다. 그래서 새 배열에 없는
  * 기존 문서는 지우고, 새 배열은 전부 덮어쓰는 "완전 교체" 방식으로 공개한다.
  */
-export async function publishFinalBracket(matches) {
-  const existing = await getDocs(finalCol());
+export async function publishFinalBracket(division, matches) {
+  const existing = await getDocs(finalCol(division));
   const keepIds = new Set(matches.map((m) => m.id));
   const batch = writeBatch(db);
   existing.docs.forEach((d) => {
     if (!keepIds.has(d.id)) batch.delete(d.ref);
   });
   matches.forEach((m) => {
-    batch.set(doc(finalCol(), m.id), m);
+    batch.set(doc(finalCol(division), m.id), m);
   });
   await batch.commit();
 }
 
-export function subscribeFinalMatches(cb) {
+export function subscribeFinalMatches(division, cb) {
   const clearWatch = watchForTimeout("본선경기");
-  return onSnapshot(finalCol(), (snap) => {
+  return onSnapshot(finalCol(division), (snap) => {
     clearWatch();
     cb(snap.docs.map((d) => d.data()));
   }, (err) => {
@@ -288,8 +335,8 @@ export function subscribeFinalMatches(cb) {
   });
 }
 
-export async function clearFinalBracket() {
-  const existing = await getDocs(finalCol());
+export async function clearFinalBracket(division) {
+  const existing = await getDocs(finalCol(division));
   const batch = writeBatch(db);
   existing.docs.forEach((d) => batch.delete(d.ref));
   await batch.commit();
@@ -304,12 +351,13 @@ export async function clearFinalBracket() {
  * 있는" 백업 파일을 만드는 용도다.
  */
 export async function exportAllData() {
-  const [infoSnap, groups, teams, prelim, finalM] = await Promise.all([
+  const [infoSnap, groups, teams, prelim, menFinal, womenFinal] = await Promise.all([
     getDoc(tDoc()),
     getDocs(groupsCol()),
     getDocs(teamsCol()),
     getDocs(prelimCol()),
-    getDocs(finalCol()),
+    getDocs(finalCol("men")),
+    getDocs(finalCol("women")),
   ]);
   const toArr = (snap) => snap.docs.map((d) => ({ id: d.id, data: d.data() }));
 
@@ -320,14 +368,17 @@ export async function exportAllData() {
   return {
     app: "bounce-volleyball",
     type: "backup",
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     tournamentId: TID,
     info,
     groups: toArr(groups),
     teams: toArr(teams),
     prelimMatches: toArr(prelim),
-    finalMatches: toArr(finalM),
+    finalMatches: {
+      men: toArr(menFinal),
+      women: toArr(womenFinal),
+    },
   };
 }
 
@@ -337,25 +388,33 @@ export async function exportAllData() {
  * 넘지 않도록 청크로 나눠 커밋한다.
  */
 export async function importAllData(data) {
-  if (!data || data.type !== "backup" || !Array.isArray(data.teams)) {
-    throw new Error("올바른 백업 파일이 아닙니다.");
-  }
+  data = normalizeBackupData(data);
 
   const ops = [];
-  // 1) 기존 데이터 전부 삭제
-  const cols = [groupsCol(), teamsCol(), prelimCol(), finalCol()];
+  // 1) 백업에 없는 기존 데이터만 삭제한다. 같은 문서에 delete와 set을
+  // 함께 넣으면 Firestore 배치가 거부하므로, 기존 문서는 교체 대상이면
+  // set 한 번만 수행한다.
+  const cols = [groupsCol(), teamsCol(), prelimCol(), finalCol("men"), finalCol("women")];
   const existing = await Promise.all(cols.map((c) => getDocs(c)));
-  existing.forEach((snap) => snap.docs.forEach((d) => ops.push({ kind: "delete", ref: d.ref })));
 
-  // 2) 백업 데이터 기록 (문서 ID 그대로 유지)
   const writeCol = (col, arr) =>
     (arr || []).forEach((item) => {
       if (item && item.id) ops.push({ kind: "set", ref: doc(col, item.id), data: item.data || {} });
     });
+
+  const desiredFinalMatches = data.finalMatches;
+  const desiredByCollection = [data.groups, data.teams, data.prelimMatches, desiredFinalMatches.men, desiredFinalMatches.women]
+    .map((arr) => new Set((arr || []).filter((item) => item && item.id).map((item) => item.id)));
+  existing.forEach((snap, index) => snap.docs.forEach((d) => {
+    if (!desiredByCollection[index].has(d.id)) ops.push({ kind: "delete", ref: d.ref });
+  }));
+
+  // 2) 백업 데이터 기록 (문서 ID 그대로 유지)
   writeCol(groupsCol(), data.groups);
   writeCol(teamsCol(), data.teams);
   writeCol(prelimCol(), data.prelimMatches);
-  writeCol(finalCol(), data.finalMatches);
+  writeCol(finalCol("men"), data.finalMatches.men);
+  writeCol(finalCol("women"), data.finalMatches.women);
 
   // 3) 배치 한도(500)를 넘지 않게 청크로 커밋
   for (let i = 0; i < ops.length; i += 450) {

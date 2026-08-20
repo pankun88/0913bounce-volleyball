@@ -9,12 +9,27 @@ import {
 import { generateBracket, recordMatchResult, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, roundLabel } from './bracket.js';
 import { generateRoundRobin } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
+import { normalizeBackupData } from './backup-format.js';
 
 let pass = 0, fail = 0;
 function check(label, cond) {
   if (cond) { pass++; }
   else { fail++; console.error('FAIL:', label); }
 }
+
+// ---- backup format migration ----
+const legacyBackup = {
+  type: 'backup', version: 1,
+  info: { name: '기존 여자부', qualifyPerGroup: 2 },
+  groups: [{ id: 'g1', data: { name: 'A조' } }],
+  teams: [{ id: 't1', data: { name: '팀1', groupId: 'g1' } }],
+  prelimMatches: [{ id: 'p1', data: { teamA: 't1' } }],
+  finalMatches: [{ id: 'f1', data: { status: 'done' } }],
+};
+const migratedBackup = normalizeBackupData(legacyBackup);
+check('legacy backup migrates to women division', migratedBackup.teams[0].data.division === 'women');
+check('legacy final matches migrate to women bracket', migratedBackup.finalMatches.men.length === 0 && migratedBackup.finalMatches.women.length === 1);
+check('legacy qualify count becomes division-specific', migratedBackup.info.qualifyPerGroup.women === 2);
 
 // ---- getSetWinner ----
 check('10:0 -> A', getSetWinner(10, 0, 10) === 'A');

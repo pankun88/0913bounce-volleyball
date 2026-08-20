@@ -34,6 +34,14 @@
 
   <div id="errorBanner" class="error-banner"></div>
 
+  <div class="card" style="margin-bottom:12px;">
+    <h2 style="margin-bottom:10px;">🏐 경기 부문 선택</h2>
+    <div class="division-switch" role="group" aria-label="경기 부문">
+      <button type="button" class="division-btn active" data-division="men">남자부</button>
+      <button type="button" class="division-btn" data-division="women">여자부</button>
+    </div>
+  </div>
+
   <div class="tabs">
     <button class="tab-btn active" data-tab="setup">대회설정</button>
     <button class="tab-btn" data-tab="prelim">예선</button>
@@ -51,8 +59,31 @@
     </div>
 
     <div class="card">
+      <h2>📺 경기장 송출 설정</h2>
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <label>표시 부문
+          <select id="venueDisplayMode">
+            <option value="auto">자동 교대</option>
+            <option value="men">남자부</option>
+            <option value="women">여자부</option>
+          </select>
+        </label>
+        <label>교대 간격
+          <select id="venueDisplayInterval">
+            <option value="10">10초</option>
+            <option value="15" selected>15초</option>
+            <option value="20">20초</option>
+            <option value="30">30초</option>
+          </select>
+        </label>
+        <button class="btn primary" id="saveVenueDisplayBtn">송출 설정 저장</button>
+        <a class="btn" href="dashboard.html?display=venue&amp;tab=prelim" target="_blank">경기장 화면 열기 ↗</a>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>💾 데이터 백업 / 복원</h2>
-      <p class="empty-hint" style="margin:0 0 12px;">현재 전체 데이터(팀·조·예선·본선 결과·대진표)를 파일 하나로 저장하거나, 백업 파일로 되돌립니다. 다음 학기에 이어서 쓰려면 지금 <b>백업 파일 저장</b>을 눌러 안전한 곳(예: 구글 드라이브)에 보관해 두세요.</p>
+      <p class="empty-hint" style="margin:0 0 12px;">현재 전체 데이터(팀·조·예선·본선 결과·대진표)를 파일 하나로 저장하거나, 백업 파일로 되돌립니다. 기존 v1 백업 파일도 자동 변환해 복원합니다. 다음 학기에 이어서 쓰려면 지금 <b>백업 파일 저장</b>을 눌러 안전한 곳(예: 구글 드라이브)에 보관해 두세요.</p>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
         <button class="btn primary" id="backupBtn">⬇️ 백업 파일 저장</button>
         <button class="btn" id="restoreBtn">⬆️ 백업 파일에서 복원</button>
@@ -78,7 +109,7 @@
         <button class="btn" id="addTeamBtn" disabled>팀 추가</button>
       </div>
       <div id="groupTeamLists" class="grid-auto"></div>
-      <p class="empty-hint" style="margin:8px 0 0;">팀을 드래그해서 다른 조로 옮길 수 있어요.</p>
+      <p class="empty-hint" style="margin:8px 0 0;">조·팀 카드를 드래그해 순서를 바꾸거나, 팀을 다른 조로 옮길 수 있어요.</p>
     </div>
   </section>
 

@@ -6,50 +6,208 @@ import { evaluatePrelimMatch, computeGroupStandings } from "./match-logic.js";
 import { renderBracket, displayTeamName } from "./bracket-render.js";
 import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
 
+const DIVISIONS = ["men", "women"];
+const DIVISION_LABELS = { men: "남자부", women: "여자부" };
+const params = new URLSearchParams(window.location.search);
+const isVenueMode = params.get("display") === "venue";
+const requestedDivision = params.get("division");
+const requestedTab = ["prelim", "final"].includes(params.get("tab")) ? params.get("tab") : "prelim";
+
 let tournamentInfo = {};
-let groups = [];
-let teams = [];
-let prelimMatches = [];
-let finalMatches = [];
+let allGroups = [];
+let allTeams = [];
+let allPrelimMatches = [];
+const finalMatchesByDivision = { men: [], women: [] };
+let activeDivision = DIVISIONS.includes(requestedDivision) ? requestedDivision : "men";
+let activeTab = requestedTab;
+let venueTimer = null;
+let venueConfigKey = "";
+let venueDisplayLocked = isVenueMode;
 
 initTabs();
+initDivisionSwitch();
 initConnectionWatch();
 initBracketFullscreen();
+activateTab(activeTab, false);
+document.body.classList.toggle("venue-mode", venueDisplayLocked);
+applyVenueDisplaySettings();
 
 subscribeTournamentInfo((info) => {
   hideErrorBanner();
   tournamentInfo = info || {};
   document.getElementById("dashTitle").textContent = tournamentInfo.name || "바운스발리볼";
-  document.getElementById("dashBracketTitle").textContent = (tournamentInfo.name || "바운스발리볼") + " 본선 대진표";
-  renderIntro();
+  applyVenueDisplaySettings();
+  renderActiveDivision();
 });
 
 subscribeGroups((data) => {
-  groups = data;
-  renderIntro();
-  renderGroupOverview();
-  renderPrelim();
+  allGroups = data;
+  renderActiveDivision();
 });
 
 subscribeTeams((data) => {
-  teams = data;
-  renderIntro();
-  renderGroupOverview();
-  renderPrelim();
+  allTeams = data;
+  renderActiveDivision();
 });
 
 subscribePrelimMatches((data) => {
-  prelimMatches = data;
-  renderPrelim();
+  allPrelimMatches = data;
+  renderActiveDivision();
 });
 
-subscribeFinalMatches((data) => {
-  finalMatches = data;
-  renderBracket(document.getElementById("dashBracketContainer"), finalMatches, {
-    editable: false,
-    getTeamLabel: teamGroupRankLabel,
+DIVISIONS.forEach((division) => {
+  subscribeFinalMatches(division, (data) => {
+    finalMatchesByDivision[division] = data;
+    if (division === activeDivision) renderFinalBracket();
   });
 });
+
+function divisionData(division = activeDivision) {
+  const groups = allGroups.filter((group) => group.division === division);
+  const groupIds = new Set(groups.map((group) => group.id));
+  return {
+    groups,
+    teams: allTeams.filter((team) => team.division === division),
+    prelimMatches: allPrelimMatches.filter((match) => match.division === division && groupIds.has(match.groupId)),
+    finalMatches: finalMatchesByDivision[division],
+  };
+}
+
+function setActiveDivision(division, { updateUrl = false, announce = true } = {}) {
+  if (!DIVISIONS.includes(division)) return;
+  const changed = division !== activeDivision;
+  activeDivision = division;
+  document.body.dataset.division = division;
+  document.querySelectorAll("#dashDivisionSwitch [data-division]").forEach((button) => {
+    const active = button.dataset.division === division;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  if (updateUrl && !venueDisplayLocked) {
+    const nextParams = new URLSearchParams(window.location.search);
+    nextParams.set("division", division);
+    nextParams.delete("display");
+    history.replaceState(null, "", `${window.location.pathname}?${nextParams.toString()}`);
+  }
+  renderActiveDivision();
+  if (changed && announce) {
+    const shell = document.getElementById("dashboardShell");
+    shell.classList.remove("division-refresh");
+    void shell.offsetWidth;
+    shell.classList.add("division-refresh");
+  }
+}
+
+function renderActiveDivision() {
+  const label = DIVISION_LABELS[activeDivision];
+  document.getElementById("dashDivisionBadge").textContent = label;
+  document.getElementById("dashBracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${label} 본선 대진표`;
+  renderPrelim();
+  renderFinalBracket();
+}
+
+function initDivisionSwitch() {
+  const switcher = document.getElementById("dashDivisionSwitch");
+  switcher.querySelectorAll("[data-division]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.division === activeDivision));
+    button.addEventListener("click", () => {
+      if (venueDisplayLocked) return;
+      setActiveDivision(button.dataset.division, { updateUrl: true });
+    });
+  });
+  updateDivisionSwitchState();
+  setActiveDivision(activeDivision, { announce: false });
+}
+
+function updateDivisionSwitchState() {
+  const switcher = document.getElementById("dashDivisionSwitch");
+  switcher.classList.toggle("is-venue", venueDisplayLocked);
+  switcher.querySelectorAll("[data-division]").forEach((button) => {
+    button.disabled = venueDisplayLocked;
+    button.title = venueDisplayLocked ? "관리자 페이지의 송출 설정에 따라 자동 전환됩니다" : "";
+  });
+}
+
+function applyVenueDisplaySettings() {
+  const config = tournamentInfo.venueDisplay || {};
+  const hasSavedSettings = ["auto", "men", "women"].includes(config.mode);
+  venueDisplayLocked = isVenueMode || hasSavedSettings;
+  document.body.classList.toggle("venue-mode", venueDisplayLocked);
+  updateDivisionSwitchState();
+  placeVenueStatus();
+
+  if (!venueDisplayLocked) {
+    stopVenueTimer();
+    document.getElementById("venueSwitcher").hidden = true;
+    venueConfigKey = "";
+    return;
+  }
+
+  const mode = ["auto", "men", "women"].includes(config.mode) ? config.mode : "auto";
+  const intervalSeconds = [10, 15, 20, 30].includes(Number(config.intervalSeconds)) ? Number(config.intervalSeconds) : 15;
+  const cycleStartedAt = Number(config.cycleStartedAt) || Date.now();
+  const key = `${mode}:${intervalSeconds}:${cycleStartedAt}`;
+  if (key === venueConfigKey) return;
+  venueConfigKey = key;
+  stopVenueTimer();
+
+  const status = document.getElementById("venueSwitcher");
+  status.hidden = false;
+  status.classList.toggle("is-pinned", mode !== "auto");
+  if (mode === "men" || mode === "women") {
+    setActiveDivision(mode);
+    renderPinnedVenueStatus(mode);
+    return;
+  }
+
+  const sync = () => syncVenueCycle(intervalSeconds, cycleStartedAt);
+  sync();
+  venueTimer = window.setInterval(sync, 250);
+}
+
+function syncVenueCycle(intervalSeconds, cycleStartedAt) {
+  const intervalMs = intervalSeconds * 1000;
+  const elapsed = Math.max(0, Date.now() - cycleStartedAt);
+  const slot = Math.floor(elapsed / intervalMs);
+  const elapsedInSlot = elapsed % intervalMs;
+  const current = slot % 2 === 0 ? "men" : "women";
+  const next = current === "men" ? "women" : "men";
+  if (current !== activeDivision) setActiveDivision(current);
+
+  const remainingMs = intervalMs - elapsedInSlot;
+  const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
+  const remainingPercent = Math.max(0, Math.min(100, (remainingMs / intervalMs) * 100));
+  document.getElementById("venueCurrentDivision").textContent = `${DIVISION_LABELS[current]} 송출 중`;
+  document.getElementById("venueNextDivision").textContent = `다음: ${DIVISION_LABELS[next]}`;
+  document.getElementById("venueCountdown").textContent = `${remainingSeconds}초 후 전환`;
+  const track = document.getElementById("venueProgressTrack");
+  track.setAttribute("aria-valuenow", String(Math.round(100 - remainingPercent)));
+  track.setAttribute("aria-valuetext", `${remainingSeconds}초 후 ${DIVISION_LABELS[next]}로 전환`);
+  document.getElementById("venueProgressBar").style.transform = `scaleX(${remainingPercent / 100})`;
+}
+
+function renderPinnedVenueStatus(division) {
+  document.getElementById("venueCurrentDivision").textContent = `${DIVISION_LABELS[division]} · 고정 송출 중`;
+  document.getElementById("venueNextDivision").textContent = "";
+  document.getElementById("venueCountdown").textContent = "";
+  document.getElementById("venueProgressTrack").hidden = true;
+}
+
+function stopVenueTimer() {
+  if (venueTimer) window.clearInterval(venueTimer);
+  venueTimer = null;
+  document.getElementById("venueProgressTrack").hidden = false;
+}
+
+function placeVenueStatus() {
+  const status = document.getElementById("venueSwitcher");
+  const card = document.getElementById("dashBracketCard");
+  const home = document.getElementById("venueStatusHome");
+  const inBracket = venueDisplayLocked && activeTab === "final";
+  document.body.classList.toggle("venue-status-in-bracket", inBracket);
+  if (inBracket) card.appendChild(status);
+  else home.after(status);
+}
 
 function initConnectionWatch() {
   window.addEventListener("firestore-error", (e) => {
@@ -74,45 +232,29 @@ function showErrorBanner(text) {
 }
 
 function hideErrorBanner() {
-  const el = document.getElementById("errorBanner");
-  if (el) el.classList.remove("show");
+  document.getElementById("errorBanner")?.classList.remove("show");
 }
 
-/** 체육관 모니터 등에 화면 꽉 채워 송출할 때 쓰는 본선 대진표 전체화면 토글.
- * 카드 전체(제목+트리)를 전체화면 대상으로 삼되, 전체화면 중에는 제목을 숨기고
- * 종료 버튼만 작게 코너에 띄워서 트리가 차지할 공간을 최대로 넓힌다.
- * container.dataset.fullscreenZoom 값을 bracket-render.js의 redraw가 읽어서,
- * 전체화면일 때는 가로/세로 모두에 맞춰(필요하면 1배 이상으로) 확대한다.
- *
- * PC/안드로이드 크롬에서는 표준 Fullscreen API(requestFullscreen)를 쓴다. 다만 iOS Safari는
- * <video> 외 일반 요소에는 이 API를 지원하지 않고, 카카오톡 등 인앱 브라우저는 API가 있어도
- * 막혀 있어 호출이 조용히 실패하는 경우가 있다 — 이런 환경에서는 버튼을 눌러도 아무 반응이
- * 없는 것처럼 보인다. 그래서 API가 없거나(없으면 즉시), 호출했는데도 일정 시간 안에 실제
- * 전체화면으로 전환되지 않으면(있어도 막혀 있으면) 카드를 화면에 고정 오버레이로 띄우는
- * "의사 전체화면"으로 자동 대체한다. */
 function initBracketFullscreen() {
   const btn = document.getElementById("dashBracketFullscreenBtn");
   const card = document.getElementById("dashBracketCard");
   const container = document.getElementById("dashBracketContainer");
-  if (!btn || !card || !container) return;
+  if (!btn || !card || !container) return null;
 
   let pseudoFullscreen = false;
-
-  const applyState = (isFs) => {
-    card.classList.toggle("is-fullscreen", isFs);
-    btn.textContent = isFs ? "전체화면 종료" : "⛶ 전체화면";
-    container.dataset.fullscreenZoom = isFs ? "1" : "";
-    // 전체화면 전환 직후 바로 새 비율로 다시 그린다(ResizeObserver가 곧 한 번 더 보정해준다).
-    renderBracket(container, finalMatches, { editable: false, getTeamLabel: teamGroupRankLabel });
+  const applyState = (isFullscreen) => {
+    card.classList.toggle("is-fullscreen", isFullscreen);
+    btn.textContent = isFullscreen ? "전체화면 종료" : "⛶ 전체화면";
+    container.dataset.fullscreenZoom = isFullscreen ? "1" : "";
+    placeVenueStatus();
+    renderFinalBracket();
   };
-
   const enterPseudoFullscreen = () => {
     pseudoFullscreen = true;
     card.classList.add("is-fullscreen-fallback");
     document.documentElement.classList.add("bracket-fallback-lock-scroll");
     applyState(true);
   };
-
   const exitPseudoFullscreen = () => {
     pseudoFullscreen = false;
     card.classList.remove("is-fullscreen-fallback");
@@ -121,39 +263,34 @@ function initBracketFullscreen() {
   };
 
   btn.addEventListener("click", () => {
-    if (pseudoFullscreen) {
-      exitPseudoFullscreen();
-      return;
-    }
-    const isNativeFs = document.fullscreenElement || document.webkitFullscreenElement;
-    if (isNativeFs) {
+    if (pseudoFullscreen) return exitPseudoFullscreen();
+    const isNativeFullscreen = document.fullscreenElement || document.webkitFullscreenElement;
+    if (isNativeFullscreen) {
       (document.exitFullscreen || document.webkitExitFullscreen || function () {}).call(document);
       return;
     }
     const request = card.requestFullscreen || card.webkitRequestFullscreen;
-    if (!request) {
-      enterPseudoFullscreen(); // 이 브라우저는 Fullscreen API 자체가 없음(예: 구형 iOS Safari)
-      return;
-    }
+    if (!request) return enterPseudoFullscreen();
     let settled = false;
     const fallbackTimer = setTimeout(() => {
       if (!settled && !document.fullscreenElement && !document.webkitFullscreenElement) {
         settled = true;
-        enterPseudoFullscreen(); // API는 있지만 실제로 전환되지 않음(인앱 브라우저 등에서 막힘)
+        enterPseudoFullscreen();
       }
     }, 400);
     try {
       const result = request.call(card);
       if (result && typeof result.catch === "function") {
-        result
-          .then(() => { settled = true; clearTimeout(fallbackTimer); })
-          .catch(() => {
-            if (!settled) {
-              settled = true;
-              clearTimeout(fallbackTimer);
-              enterPseudoFullscreen();
-            }
-          });
+        result.then(() => {
+          settled = true;
+          clearTimeout(fallbackTimer);
+        }).catch(() => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(fallbackTimer);
+            enterPseudoFullscreen();
+          }
+        });
       }
     } catch (err) {
       settled = true;
@@ -163,74 +300,57 @@ function initBracketFullscreen() {
   });
 
   const onFullscreenChange = () => {
-    if (pseudoFullscreen) return; // 의사 전체화면 중에는 (관련 없는) 네이티브 이벤트를 무시
-    const isFs = (document.fullscreenElement || document.webkitFullscreenElement) === card;
-    applyState(isFs);
+    if (pseudoFullscreen) return;
+    applyState((document.fullscreenElement || document.webkitFullscreenElement) === card);
   };
   document.addEventListener("fullscreenchange", onFullscreenChange);
   document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+  return { applyState };
 }
 
 function initTabs() {
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-      btn.classList.add("active");
-      document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
-    });
+  document.querySelectorAll(".tab-btn").forEach((button) => {
+    button.addEventListener("click", () => activateTab(button.dataset.tab, true));
   });
 }
 
-function renderIntro() {
-  const el = document.getElementById("dashIntro");
-  if (!el) return;
-  el.textContent = `${tournamentInfo.name || "바운스발리볼"} · 참가팀 ${teams.length}팀 · ${groups.length}개 조`;
-}
-
-function renderGroupOverview() {
-  const el = document.getElementById("dashGroupOverview");
-  if (!groups.length) {
-    el.innerHTML = '<div class="empty-hint">조 편성 정보가 아직 없습니다.</div>';
-    return;
+function activateTab(tab, updateUrl) {
+  activeTab = ["prelim", "final"].includes(tab) ? tab : "prelim";
+  document.querySelectorAll(".tab-btn").forEach((button) => button.classList.toggle("active", button.dataset.tab === activeTab));
+  document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `tab-${activeTab}`));
+  placeVenueStatus();
+  if (updateUrl) {
+    const nextParams = new URLSearchParams(window.location.search);
+    nextParams.set("tab", activeTab);
+    history.replaceState(null, "", `${window.location.pathname}?${nextParams.toString()}`);
   }
-  el.innerHTML = "";
-  groups.forEach((g) => {
-    const groupTeams = teams.filter((t) => t.groupId === g.id);
-    const box = document.createElement("div");
-    box.className = "card";
-    box.style.margin = "0";
-    box.innerHTML = `<h3>${escapeHtml(g.name)} <span style="color:var(--muted); font-weight:400;">(${groupTeams.length}팀)</span></h3>
-      <div>${groupTeams.map((t) => `<span class="team-pill">${escapeHtml(displayTeamName(t.name))}</span>`).join(" ") || '<span class="empty-hint">팀 없음</span>'}</div>`;
-    el.appendChild(box);
-  });
+  if (activeTab === "final") window.setTimeout(renderFinalBracket, 0);
 }
 
 function renderPrelim() {
+  const state = divisionData();
   const el = document.getElementById("dashPrelim");
-  if (!groups.length) {
-    el.innerHTML = '<div class="empty-hint">예선 정보가 아직 없습니다.</div>';
+  if (!state.groups.length) {
+    el.innerHTML = `<div class="empty-hint">${DIVISION_LABELS[activeDivision]} 예선 정보가 아직 없습니다.</div>`;
     return;
   }
   el.innerHTML = "";
-  groups.forEach((g) => {
-    const groupTeams = teams.filter((t) => t.groupId === g.id);
-    // Firestore는 정렬 없이 구독 중이라 docId 순서로 오므로, 화면에 보여줄 때는 항상 round 순으로 정렬한다
-    const groupMatches = prelimMatches.filter((m) => m.groupId === g.id).sort((a, b) => (a.round || 0) - (b.round || 0));
+  state.groups.forEach((group) => {
+    const groupTeams = state.teams.filter((team) => team.groupId === group.id);
+    const groupMatches = state.prelimMatches.filter((match) => match.groupId === group.id).sort((a, b) => (a.round || 0) - (b.round || 0));
     const standings = computeGroupStandings(groupTeams, groupMatches);
-
     const card = document.createElement("div");
     card.className = "card";
-    card.innerHTML = `<h2>📋 ${escapeHtml(g.name)}</h2>`;
+    card.innerHTML = `<h2>📋 ${escapeHtml(group.name)}</h2>`;
 
-    if ((g.matchMode || "roundrobin") === "ring" && groupTeams.length >= 2) {
-      const ringOrder = normalizeRingOrder(g.ringOrder, groupTeams.map((t) => t.id));
+    if ((group.matchMode || "roundrobin") === "ring" && groupTeams.length >= 2) {
+      const ringOrder = normalizeRingOrder(group.ringOrder, groupTeams.map((team) => team.id));
       const diagramHost = document.createElement("div");
       diagramHost.style.margin = "0 auto 14px";
       card.appendChild(diagramHost);
       renderRingDiagram(diagramHost, {
         ringOrder,
-        teamNameById: (id) => teamName(id),
+        teamNameById: (id) => teamName(id, state),
         editable: false,
       });
     }
@@ -238,21 +358,17 @@ function renderPrelim() {
     if (standings.length) {
       const table = document.createElement("table");
       table.className = "standings-table";
-      table.innerHTML = `<thead><tr>
-        <th>순위</th><th>팀</th><th>승</th><th>무</th><th>패</th><th>승점</th><th>세트득실</th><th>득실차</th>
-      </tr></thead>`;
+      table.innerHTML = `<thead><tr><th>순위</th><th>팀</th><th>승</th><th>무</th><th>패</th><th>승점</th><th>세트득실</th><th>득실차</th></tr></thead>`;
       const tbody = document.createElement("tbody");
-      standings.forEach((s) => {
-        const tr = document.createElement("tr");
-        if (s.rank === 1) tr.className = "rank-1";
-        tr.innerHTML = `<td>${s.rank}${s.needsLottery ? '<div class="lottery-flag">동률</div>' : ""}</td>
-          <td>${escapeHtml(displayTeamName(s.name))}</td><td>${s.win}</td><td>${s.draw}</td><td>${s.loss}</td>
-          <td>${s.points}</td><td>${s.setDiff >= 0 ? "+" : ""}${s.setDiff}</td><td>${s.pointDiff >= 0 ? "+" : ""}${s.pointDiff}</td>`;
-        tbody.appendChild(tr);
+      standings.forEach((standing) => {
+        const row = document.createElement("tr");
+        if (standing.rank === 1) row.className = "rank-1";
+        row.innerHTML = `<td>${standing.rank}${standing.needsLottery ? '<div class="lottery-flag">동률</div>' : ""}</td>
+          <td>${escapeHtml(displayTeamName(standing.name))}</td><td>${standing.win}</td><td>${standing.draw}</td><td>${standing.loss}</td>
+          <td>${standing.points}</td><td>${standing.setDiff >= 0 ? "+" : ""}${standing.setDiff}</td><td>${standing.pointDiff >= 0 ? "+" : ""}${standing.pointDiff}</td>`;
+        tbody.appendChild(row);
       });
       table.appendChild(tbody);
-      // 컬럼이 8칸이라 좁은 화면에서 넘칠 수 있으므로, 표를 가로 스크롤 컨테이너로 감싸
-      // 표 자체 비율(칸 정렬)은 깨지지 않게 하고 넘칠 때만 좌우로 밀어 보게 한다.
       const scroll = document.createElement("div");
       scroll.className = "table-scroll";
       scroll.appendChild(table);
@@ -261,13 +377,13 @@ function renderPrelim() {
 
     const matchList = document.createElement("div");
     matchList.style.marginTop = "12px";
-    groupMatches.forEach((m) => {
-      const evald = evaluatePrelimMatch(m.sets || []);
-      const scoreText = (m.sets || []).filter((s) => Number(s.a) > 0 || Number(s.b) > 0).map((s) => `${s.a}:${s.b}`).join(" / ");
-      const badge = evald.result === "A" ? `<span class="badge win">${escapeHtml(teamName(m.teamA))} 승</span>`
-        : evald.result === "B" ? `<span class="badge win">${escapeHtml(teamName(m.teamB))} 승</span>`
-        : evald.result === "draw" ? '<span class="badge draw">무승부</span>'
-        : evald.status === "in_progress" ? '<span class="badge">경기중</span>'
+    groupMatches.forEach((match) => {
+      const evaluated = evaluatePrelimMatch(match.sets || []);
+      const scoreText = (match.sets || []).filter((set) => Number(set.a) > 0 || Number(set.b) > 0).map((set) => `${set.a}:${set.b}`).join(" / ");
+      const badge = evaluated.result === "A" ? `<span class="badge win">${escapeHtml(teamName(match.teamA, state))} 승</span>`
+        : evaluated.result === "B" ? `<span class="badge win">${escapeHtml(teamName(match.teamB, state))} 승</span>`
+        : evaluated.result === "draw" ? '<span class="badge draw">무승부</span>'
+        : evaluated.status === "in_progress" ? '<span class="badge">경기중</span>'
         : '<span class="badge">경기전</span>';
       const row = document.createElement("div");
       row.className = "row";
@@ -275,7 +391,7 @@ function renderPrelim() {
       row.style.padding = "6px 2px";
       row.style.borderBottom = "1px solid var(--line)";
       row.style.fontSize = "13px";
-      row.innerHTML = `<span>${escapeHtml(teamName(m.teamA))} vs ${escapeHtml(teamName(m.teamB))} <span style="color:var(--muted);">${scoreText}</span></span>${badge}`;
+      row.innerHTML = `<span>${escapeHtml(teamName(match.teamA, state))} vs ${escapeHtml(teamName(match.teamB, state))} <span style="color:var(--muted);">${scoreText}</span></span>${badge}`;
       matchList.appendChild(row);
     });
     card.appendChild(matchList);
@@ -283,25 +399,31 @@ function renderPrelim() {
   });
 }
 
-function teamName(id) {
-  const t = teams.find((x) => x.id === id);
-  // 화면 표시용 이름은 뒤에 붙은 코드(예: "삼화초A(A1)" → "삼화초A")를 떼어 가독성을 높인다.
-  return t ? displayTeamName(t.name) : "?";
+function renderFinalBracket() {
+  const state = divisionData();
+  renderBracket(document.getElementById("dashBracketContainer"), state.finalMatches, {
+    editable: false,
+    getTeamLabel: (teamId) => teamGroupRankLabel(teamId, state),
+  });
 }
 
-/** teamId가 속한 조에서의 예선 순위를 "A조 1위" 형태 문구로 만든다 (대진표 카드 라벨용, admin.js와 동일한 규칙) */
-function teamGroupRankLabel(teamId) {
-  const t = teams.find((tt) => tt.id === teamId);
-  if (!t) return "";
-  const g = groups.find((gg) => gg.id === t.groupId);
-  if (!g) return "";
-  const groupTeams = teams.filter((tt) => tt.groupId === g.id);
-  const groupMatches = prelimMatches.filter((m) => m.groupId === g.id);
+function teamName(id, state = divisionData()) {
+  const team = state.teams.find((item) => item.id === id);
+  return team ? displayTeamName(team.name) : "?";
+}
+
+function teamGroupRankLabel(teamId, state = divisionData()) {
+  const team = state.teams.find((item) => item.id === teamId);
+  if (!team) return "";
+  const group = state.groups.find((item) => item.id === team.groupId);
+  if (!group) return "";
+  const groupTeams = state.teams.filter((item) => item.groupId === group.id);
+  const groupMatches = state.prelimMatches.filter((match) => match.groupId === group.id);
   const standings = computeGroupStandings(groupTeams, groupMatches);
-  const s = standings.find((ss) => ss.teamId === teamId);
-  return s ? `${g.name} ${s.rank}위` : g.name;
+  const standing = standings.find((item) => item.teamId === teamId);
+  return standing ? `${group.name} ${standing.rank}위` : group.name;
 }
 
 function escapeHtml(str) {
-  return String(str ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(str ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
 }

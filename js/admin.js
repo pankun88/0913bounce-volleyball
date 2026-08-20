@@ -2,8 +2,8 @@ import { isFirebaseConfigured } from "./firebase-init.js";
 import { watchAuthState, login, logout, requestPasswordReset, changePassword, describeAuthError } from "./auth-service.js";
 import {
   saveTournamentInfo, subscribeTournamentInfo,
-  addGroup, deleteGroup, deleteAllGroups, subscribeGroups,
-  addTeam, deleteTeam, updateTeam, deleteAllTeams, subscribeTeams,
+  addGroup, reorderGroups, deleteGroup, deleteAllGroups, subscribeGroups,
+  addTeam, deleteTeam, moveAndReorderTeam, deleteAllTeams, subscribeTeams,
   generatePrelimMatchesForGroup, updatePrelimMatchSets, subscribePrelimMatches, reorderPrelimMatches, clearAllPrelimMatches,
   setGroupMatchMode, setGroupRingOrder, clearPrelimMatchesForGroup, generateRingMatchesForGroup, resetAllRingOrders,
   publishFinalBracket, subscribeFinalMatches, clearFinalBracket,
@@ -17,6 +17,11 @@ import { normalizeRingOrder, getRingMatchPairs, renderRingDiagram } from "./ring
 
 // ---------------- 상태 ----------------
 let tournamentInfo = {};
+let activeDivision = "men";
+document.body.dataset.division = activeDivision;
+let allGroups = [];
+let allTeams = [];
+let allPrelimMatches = [];
 let groups = [];
 let teams = [];
 let prelimMatches = [];
@@ -25,11 +30,41 @@ let seedSelection = []; // 본선 진출팀 id 순서 (시드순)
 let seedAutoMode = true; // true면 예선 순위 기준 추천 진출팀을 매 렌더마다 자동으로 채움 (체크박스/화살표를 직접 조작하면 false로 바뀜)
 let pendingAutoSelectGroupName = null; // 방금 추가한 조 이름 — 팀 등록 select에 자동 선택용
 let ringSelection = null; // 링크제 클릭배치 중 선택 상태: { type:'pool'|'vertex', teamId|index, groupId }
+let isAddingGroup = false; // 저장 응답 전 중복 클릭/Enter로 같은 조가 두 번 생성되는 것을 막는다
+let isAddingTeam = false; // 저장 응답 전 중복 클릭/Enter로 같은 팀이 두 번 생성되는 것을 막는다
 // 대진표 자리 드래그/부전승 배치는 누를 때마다 바로 관객 화면(대시보드)에 공개되면
 // 관객이 "아직 정해지지 않은" 자리 이동을 결과로 오해할 수 있다. 그래서 이 조정들은
 // 일단 화면(로컬)에서만 반영해두고, 관리자가 "관객 화면에 공개" 버튼을 눌러야만
 // Firestore에 저장돼 대시보드에 실제로 공유된다.
 let bracketPublishPending = false;
+let unsubscribeFinalMatches = null;
+
+const DIVISION_LABELS = { men: "남자부", women: "여자부" };
+const divisionLabel = () => DIVISION_LABELS[activeDivision];
+
+function refreshActiveDivisionData() {
+  groups = allGroups.filter((group) => group.division === activeDivision);
+  teams = allTeams.filter((team) => team.division === activeDivision);
+  prelimMatches = allPrelimMatches.filter((match) => match.division === activeDivision);
+  document.getElementById("teamCount").textContent = teams.length;
+  renderGroupList();
+  renderTeamGroupSelect();
+  renderGroupTeamLists();
+  renderPrelimGroups();
+  renderFinalTeamPicker();
+}
+
+function rebindFinalMatches() {
+  unsubscribeFinalMatches?.();
+  finalMatches = [];
+  renderFinalBracket();
+  renderFinalTeamPicker();
+  unsubscribeFinalMatches = subscribeFinalMatches(activeDivision, (data) => {
+    finalMatches = data;
+    renderFinalBracket();
+    renderFinalTeamPicker();
+  });
+}
 
 // 공개하지 않은 대진 조정이 남은 채로 탭을 닫거나 새로고침하면 그 조정은 그대로 사라지므로
 // (다시 열면 Firestore에 저장된 마지막 공개 상태로 돌아감), 미리 경고한다.
@@ -58,41 +93,32 @@ subscribeTournamentInfo((info) => {
   if (nameInput && !nameInput.value) nameInput.value = tournamentInfo.name || "";
   const qualifyInput = document.getElementById("qualifyPerGroupInput");
   if (qualifyInput && document.activeElement !== qualifyInput) {
-    qualifyInput.value = tournamentInfo.qualifyPerGroup || 2;
+    qualifyInput.value = tournamentInfo.qualifyPerGroup?.[activeDivision] || 2;
   }
+  const venueDisplay = tournamentInfo.venueDisplay || {};
+  document.getElementById("venueDisplayMode").value = venueDisplay.mode || "auto";
+  document.getElementById("venueDisplayInterval").value = venueDisplay.intervalSeconds || 15;
   const bracketTitle = document.getElementById("bracketTitle");
-  if (bracketTitle) bracketTitle.textContent = (tournamentInfo.name || "바운스발리볼") + " 본선 대진표";
+  if (bracketTitle) bracketTitle.textContent = `${tournamentInfo.name || "바운스발리볼"} ${divisionLabel()} 본선 대진표`;
   renderFinalTeamPicker();
 });
 
 subscribeGroups((data) => {
-  groups = data;
-  renderGroupList();
-  renderTeamGroupSelect();
-  renderGroupTeamLists();
-  renderPrelimGroups();
-  renderFinalTeamPicker();
+  allGroups = data;
+  refreshActiveDivisionData();
 });
 
 subscribeTeams((data) => {
-  teams = data;
-  document.getElementById("teamCount").textContent = teams.length;
-  renderGroupTeamLists();
-  renderPrelimGroups();
-  renderFinalTeamPicker();
+  allTeams = data;
+  refreshActiveDivisionData();
 });
 
 subscribePrelimMatches((data) => {
-  prelimMatches = data;
-  renderPrelimGroups();
-  renderFinalTeamPicker(); // 예선 결과가 바뀌면 본선 진출팀 추천도 최신 순위를 따라가야 함
+  allPrelimMatches = data;
+  refreshActiveDivisionData();
 });
 
-subscribeFinalMatches((data) => {
-  finalMatches = data;
-  renderFinalBracket();
-  renderFinalTeamPicker(); // 대진표 생성/초기화 여부에 따라 진출팀 선택 UI도 함께 갱신
-});
+rebindFinalMatches();
 
 // ---------------- 연결 상태 감시 ----------------
 
@@ -322,6 +348,26 @@ function initTabs() {
 // ---------------- 대회설정: 대회명 ----------------
 
 function bindStaticHandlers() {
+  document.querySelectorAll("[data-division]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextDivision = button.dataset.division;
+      if (nextDivision === activeDivision) return;
+      if (bracketPublishPending && !confirm(`${divisionLabel()}의 공개하지 않은 본선 대진 변경사항을 버리고 ${DIVISION_LABELS[nextDivision]}로 전환할까요?`)) return;
+      activeDivision = nextDivision;
+      document.body.dataset.division = activeDivision;
+      bracketPublishPending = false;
+      seedSelection = [];
+      seedAutoMode = true;
+      ringSelection = null;
+      document.querySelectorAll("[data-division]").forEach((item) => item.classList.toggle("active", item === button));
+      refreshActiveDivisionData();
+      rebindFinalMatches();
+      document.getElementById("qualifyPerGroupInput").value = tournamentInfo.qualifyPerGroup?.[activeDivision] || 2;
+      document.getElementById("bracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${divisionLabel()} 본선 대진표`;
+      showToast(`${divisionLabel()}로 전환했습니다`);
+    });
+  });
+
   document.getElementById("saveTournamentNameBtn").addEventListener("click", async () => {
     const name = document.getElementById("tournamentNameInput").value.trim();
     if (!name) return showToast("대회명을 입력하세요");
@@ -336,9 +382,9 @@ function bindStaticHandlers() {
   document.getElementById("saveQualifyPerGroupBtn").addEventListener("click", async () => {
     const qualifyPerGroup = Math.max(1, Number(document.getElementById("qualifyPerGroupInput").value) || 2);
     try {
-      await saveTournamentInfo({ qualifyPerGroup });
+      await saveTournamentInfo({ qualifyPerGroup: { ...(tournamentInfo.qualifyPerGroup || {}), [activeDivision]: qualifyPerGroup } });
       seedAutoMode = true; // 진출 팀 수 설정을 바꿨으니 추천 진출팀을 다시 계산해서 보여준다
-      showToast("저장되었습니다");
+      showToast(`${divisionLabel()} 조별 진출 팀 수를 저장했습니다`);
     } catch (err) {
       reportError("조별 진출 팀 수 저장", err);
     }
@@ -350,10 +396,10 @@ function bindStaticHandlers() {
   });
   document.getElementById("resetGroupsBtn").addEventListener("click", async () => {
     if (!groups.length) return showToast("이미 등록된 조가 없습니다");
-    if (!confirm("등록된 모든 조를 삭제할까요? 소속 팀은 모두 미배정 상태가 되고, 해당 조의 예선 대진/결과도 함께 삭제됩니다.")) return;
+    if (!confirm(`${divisionLabel()}의 모든 조를 삭제할까요? 소속 팀은 모두 미배정 상태가 되고, 해당 조의 예선 대진/결과도 함께 삭제됩니다.`)) return;
     try {
-      await deleteAllGroups();
-      showToast("조를 모두 초기화했습니다");
+      await deleteAllGroups(activeDivision);
+      showToast(`${divisionLabel()} 조를 모두 초기화했습니다`);
     } catch (err) {
       reportError("조 초기화", err);
     }
@@ -366,10 +412,10 @@ function bindStaticHandlers() {
   document.getElementById("teamGroupSelect").addEventListener("change", updateTeamNameInputContext);
   document.getElementById("resetTeamsBtn").addEventListener("click", async () => {
     if (!teams.length) return showToast("이미 등록된 팀이 없습니다");
-    if (!confirm("등록된 모든 팀을 삭제할까요? 예선·본선 경기 기록도 함께 삭제됩니다.")) return;
+    if (!confirm(`${divisionLabel()}의 모든 팀을 삭제할까요? 예선·본선 경기 기록도 함께 삭제됩니다.`)) return;
     try {
-      await deleteAllTeams();
-      showToast("팀을 모두 초기화했습니다");
+      await deleteAllTeams(activeDivision);
+      showToast(`${divisionLabel()} 팀을 모두 초기화했습니다`);
     } catch (err) {
       reportError("팀 초기화", err);
     }
@@ -378,12 +424,12 @@ function bindStaticHandlers() {
   document.getElementById("resetPrelimBtn").addEventListener("click", async () => {
     const hasRingPlacement = groups.some((g) => (g.ringOrder || []).some(Boolean));
     if (!prelimMatches.length && !hasRingPlacement) return showToast("초기화할 예선 경기가 없습니다");
-    if (!confirm("모든 조의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?")) return;
+    if (!confirm(`${divisionLabel()} 모든 조의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
     try {
-      await clearAllPrelimMatches();
-      await resetAllRingOrders();
+      await clearAllPrelimMatches(activeDivision);
+      await resetAllRingOrders(activeDivision);
       ringSelection = null;
-      showToast("예선을 초기화했습니다");
+      showToast(`${divisionLabel()} 예선을 초기화했습니다`);
     } catch (err) {
       reportError("예선 초기화", err);
     }
@@ -392,11 +438,11 @@ function bindStaticHandlers() {
   document.getElementById("generateBracketBtn").addEventListener("click", onGenerateBracket);
   document.getElementById("publishBracketBtn").addEventListener("click", handlePublishBracket);
   document.getElementById("clearBracketBtn").addEventListener("click", async () => {
-    if (!confirm("본선 대진표를 초기화할까요? 입력된 점수도 모두 사라집니다.")) return;
+    if (!confirm(`${divisionLabel()} 본선 대진표를 초기화할까요? 입력된 점수도 모두 사라집니다.`)) return;
     try {
-      await clearFinalBracket();
+      await clearFinalBracket(activeDivision);
       bracketPublishPending = false;
-      showToast("대진표를 초기화했습니다");
+      showToast(`${divisionLabel()} 대진표를 초기화했습니다`);
     } catch (err) {
       reportError("대진표 초기화", err);
     }
@@ -404,11 +450,22 @@ function bindStaticHandlers() {
 
   document.getElementById("exportCsvBtn").addEventListener("click", () => {
     const csv = buildFullResultsCsv({
-      tournamentName: tournamentInfo.name,
+      tournamentName: `${tournamentInfo.name || "바운스발리볼"} ${divisionLabel()}`,
       groups, teams, prelimMatches, finalMatches,
     });
-    const fname = `${(tournamentInfo.name || "바운스발리볼").replace(/\s+/g, "_")}_결과_${dateStamp()}.csv`;
+    const fname = `${(tournamentInfo.name || "바운스발리볼").replace(/\s+/g, "_")}_${divisionLabel()}_결과_${dateStamp()}.csv`;
     downloadCsv(fname, csv);
+  });
+
+  document.getElementById("saveVenueDisplayBtn").addEventListener("click", async () => {
+    const mode = document.getElementById("venueDisplayMode").value;
+    const intervalSeconds = Number(document.getElementById("venueDisplayInterval").value);
+    try {
+      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds, cycleStartedAt: Date.now() } });
+      showToast("경기장 송출 설정을 저장했습니다");
+    } catch (err) {
+      reportError("경기장 송출 설정 저장", err);
+    }
   });
 
   // 데이터 백업/복원 — 다음 학기에 이어서 쓰거나, 실수로 초기화했을 때 되돌리기 위함
@@ -466,35 +523,68 @@ function dateStamp() {
 
 // ---------------- 대회설정: 조 / 팀 ----------------
 
+function normalizeEntryName(name) {
+  return String(name || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("ko-KR");
+}
+
 /** 조 추가 — 성공하면 방금 만든 조 이름을 기억해서 팀 등록 select에 자동으로 선택되게 한다 */
 async function addGroupFromForm() {
+  if (isAddingGroup) return;
   const input = document.getElementById("groupNameInput");
+  const addBtn = document.getElementById("addGroupBtn");
   const name = input.value.trim();
   if (!name) return showToast("조 이름을 입력하세요");
+  if (groups.some((group) => normalizeEntryName(group.name) === normalizeEntryName(name))) {
+    return showToast("이미 등록된 조 이름입니다");
+  }
+  isAddingGroup = true;
+  addBtn.disabled = true;
+  const originalLabel = addBtn.textContent;
+  addBtn.textContent = "추가 중…";
   try {
-    await addGroup(name);
+    await addGroup(name, activeDivision);
     input.value = "";
     pendingAutoSelectGroupName = name;
     input.focus();
   } catch (err) {
     reportError("조 추가", err);
+  } finally {
+    isAddingGroup = false;
+    addBtn.disabled = false;
+    addBtn.textContent = originalLabel;
   }
 }
 
 /** 팀 추가 — 조를 먼저 선택해야만 추가할 수 있다 (미배정 팀이 새로 생기지 않도록).
  *  추가 후에도 선택된 조는 그대로 유지하고 입력칸에 다시 포커스해서 연속 입력이 쉽게 한다 */
 async function addTeamFromForm() {
+  if (isAddingTeam) return;
   const nameInput = document.getElementById("teamNameInput");
   const groupSelect = document.getElementById("teamGroupSelect");
+  const addBtn = document.getElementById("addTeamBtn");
   if (!groupSelect.value) return showToast("먼저 조를 선택하세요");
   const name = nameInput.value.trim();
   if (!name) return showToast("팀 이름을 입력하세요");
+  if (teams.some((team) => (
+    team.groupId === groupSelect.value &&
+    normalizeEntryName(team.name) === normalizeEntryName(name)
+  ))) {
+    return showToast("이 조에 이미 등록된 팀 이름입니다");
+  }
+  isAddingTeam = true;
+  addBtn.disabled = true;
+  const originalLabel = addBtn.textContent;
+  addBtn.textContent = "추가 중…";
   try {
-    await addTeam(name, groupSelect.value);
+    await addTeam(name, groupSelect.value, activeDivision);
     nameInput.value = "";
     nameInput.focus();
   } catch (err) {
     reportError("팀 추가", err);
+  } finally {
+    isAddingTeam = false;
+    addBtn.disabled = !groupSelect.value;
+    addBtn.textContent = originalLabel;
   }
 }
 
@@ -521,14 +611,46 @@ function renderGroupList() {
   el.innerHTML = "";
   groups.forEach((g) => {
     const pill = document.createElement("span");
-    pill.className = "team-pill";
+    pill.className = "team-pill reorder-pill";
+    pill.draggable = true;
     pill.innerHTML = `${escapeHtml(g.name)} <button title="삭제">✕</button>`;
     pill.querySelector("button").addEventListener("click", async () => {
-      if (!confirm(`'${g.name}' 조를 삭제할까요? (소속 팀은 무소속이 됩니다)`)) return;
+      if (!confirm(`${divisionLabel()} '${g.name}' 조를 삭제할까요? (소속 팀은 무소속이 됩니다)`)) return;
       try {
         await deleteGroup(g.id);
       } catch (err) {
         reportError("조 삭제", err);
+      }
+    });
+    pill.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("application/x-bounce-group", g.id);
+      e.dataTransfer.effectAllowed = "move";
+      pill.classList.add("dragging");
+    });
+    pill.addEventListener("dragend", () => {
+      pill.classList.remove("dragging");
+      clearReorderIndicators(el);
+    });
+    pill.addEventListener("dragover", (e) => {
+      if (!hasDragType(e, "application/x-bounce-group")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      showReorderIndicator(pill, e.clientX);
+    });
+    pill.addEventListener("dragleave", () => clearReorderIndicator(pill));
+    pill.addEventListener("drop", async (e) => {
+      const draggedId = e.dataTransfer.getData("application/x-bounce-group");
+      if (!draggedId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const insertAfter = pill.classList.contains("drop-after");
+      clearReorderIndicators(el);
+      const orderedIds = buildReorderedIds(groups.map((group) => group.id), draggedId, g.id, insertAfter);
+      if (!orderedIds) return;
+      try {
+        await reorderGroups(orderedIds);
+      } catch (err) {
+        reportError("조 순서 변경", err);
       }
     });
     el.appendChild(pill);
@@ -577,7 +699,7 @@ function renderGroupTeamLists() {
     if (!groupTeams.length) {
       list.innerHTML = '<span class="empty-hint">팀 없음 (다른 조의 팀을 여기로 드래그해서 옮길 수 있어요)</span>';
     } else {
-      groupTeams.forEach((t) => list.appendChild(createTeamPill(t)));
+      groupTeams.forEach((t) => list.appendChild(createTeamPill(t, g.id)));
     }
     attachDropZone(list, g.id);
     box.appendChild(list);
@@ -592,21 +714,21 @@ function renderGroupTeamLists() {
     box.innerHTML = `<h3>미배정 <span style="color:var(--muted); font-weight:400;">(${noGroupTeams.length}팀)</span></h3>`;
     const list = document.createElement("div");
     list.className = "row team-dropzone";
-    noGroupTeams.forEach((t) => list.appendChild(createTeamPill(t)));
+    noGroupTeams.forEach((t) => list.appendChild(createTeamPill(t, null)));
     attachDropZone(list, null);
     box.appendChild(list);
     el.appendChild(box);
   }
 }
 
-/** 팀 하나를 드래그 가능한 pill로 만든다 (✕ 버튼으로 삭제, 드래그로 다른 조에 이동) */
-function createTeamPill(t) {
+/** 팀 하나를 드래그 가능한 pill로 만든다 (✕ 버튼으로 삭제, 드래그로 조 이동/순서 변경) */
+function createTeamPill(t, groupId) {
   const pill = document.createElement("span");
-  pill.className = "team-pill";
+  pill.className = "team-pill reorder-pill";
   pill.draggable = true;
   pill.innerHTML = `${escapeHtml(t.name)} <button title="삭제">✕</button>`;
   pill.querySelector("button").addEventListener("click", async () => {
-    if (!confirm(`'${t.name}' 팀을 삭제할까요?`)) return;
+    if (!confirm(`${divisionLabel()} '${t.name}' 팀을 삭제할까요?`)) return;
     try {
       await deleteTeam(t.id);
     } catch (err) {
@@ -614,12 +736,29 @@ function createTeamPill(t) {
     }
   });
   pill.addEventListener("dragstart", (e) => {
-    e.dataTransfer.setData("text/plain", t.id);
+    e.dataTransfer.setData("application/x-bounce-team", t.id);
     e.dataTransfer.effectAllowed = "move";
     pill.classList.add("dragging");
   });
   pill.addEventListener("dragend", () => {
     pill.classList.remove("dragging");
+    document.querySelectorAll(".team-dropzone").forEach(clearReorderIndicators);
+  });
+  pill.addEventListener("dragover", (e) => {
+    if (!hasDragType(e, "application/x-bounce-team")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    showReorderIndicator(pill, e.clientX);
+  });
+  pill.addEventListener("dragleave", () => clearReorderIndicator(pill));
+  pill.addEventListener("drop", async (e) => {
+    const draggedId = e.dataTransfer.getData("application/x-bounce-team");
+    if (!draggedId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const insertAfter = pill.classList.contains("drop-after");
+    clearReorderIndicators(pill.parentElement);
+    await persistTeamDrop(draggedId, groupId, t.id, insertAfter);
   });
   return pill;
 }
@@ -627,6 +766,7 @@ function createTeamPill(t) {
 /** 조 박스(또는 미배정 박스)를 드롭 영역으로 만든다. targetGroupId가 null이면 미배정으로 이동시킨다. */
 function attachDropZone(list, targetGroupId) {
   list.addEventListener("dragover", (e) => {
+    if (!hasDragType(e, "application/x-bounce-team")) return;
     e.preventDefault();
     list.classList.add("drag-over");
   });
@@ -634,16 +774,63 @@ function attachDropZone(list, targetGroupId) {
     list.classList.remove("drag-over");
   });
   list.addEventListener("drop", async (e) => {
+    const teamId = e.dataTransfer.getData("application/x-bounce-team");
+    if (!teamId) return;
     e.preventDefault();
     list.classList.remove("drag-over");
-    const teamId = e.dataTransfer.getData("text/plain");
-    if (!teamId) return;
-    try {
-      await updateTeam(teamId, { groupId: targetGroupId });
-    } catch (err) {
-      reportError("팀 조 이동", err);
-    }
+    clearReorderIndicators(list);
+    await persistTeamDrop(teamId, targetGroupId);
   });
+}
+
+function hasDragType(event, type) {
+  return Array.from(event.dataTransfer?.types || []).includes(type);
+}
+
+function showReorderIndicator(element, clientX) {
+  const insertAfter = clientX >= element.getBoundingClientRect().left + element.offsetWidth / 2;
+  element.classList.toggle("drop-before", !insertAfter);
+  element.classList.toggle("drop-after", insertAfter);
+}
+
+function clearReorderIndicator(element) {
+  element.classList.remove("drop-before", "drop-after");
+}
+
+function clearReorderIndicators(container) {
+  container.querySelectorAll(".drop-before, .drop-after").forEach(clearReorderIndicator);
+}
+
+/** draggedId를 targetId의 앞/뒤로 옮긴 새 id 배열을 만든다. 순서가 같으면 null을 반환한다. */
+function buildReorderedIds(currentIds, draggedId, targetId, insertAfter) {
+  if (!currentIds.includes(draggedId) || !currentIds.includes(targetId) || draggedId === targetId) return null;
+  const orderedIds = currentIds.filter((id) => id !== draggedId);
+  const targetIndex = orderedIds.indexOf(targetId);
+  orderedIds.splice(targetIndex + (insertAfter ? 1 : 0), 0, draggedId);
+  return orderedIds.every((id, index) => id === currentIds[index]) ? null : orderedIds;
+}
+
+async function persistTeamDrop(draggedId, targetGroupId, targetId = null, insertAfter = true) {
+  const targetIds = teams
+    .filter((team) => team.groupId === targetGroupId && team.id !== draggedId)
+    .map((team) => team.id);
+  let insertIndex = targetIds.length;
+  if (targetId && targetId !== draggedId) {
+    const targetIndex = targetIds.indexOf(targetId);
+    if (targetIndex >= 0) insertIndex = targetIndex + (insertAfter ? 1 : 0);
+  }
+  targetIds.splice(insertIndex, 0, draggedId);
+
+  const draggedTeam = teams.find((team) => team.id === draggedId);
+  if (!draggedTeam) return;
+  const sameGroup = draggedTeam.groupId === targetGroupId;
+  const currentIds = teams.filter((team) => team.groupId === targetGroupId).map((team) => team.id);
+  if (sameGroup && targetIds.every((id, index) => id === currentIds[index])) return;
+  try {
+    await moveAndReorderTeam(draggedId, targetGroupId, targetIds);
+  } catch (err) {
+    reportError("팀 순서 변경", err);
+  }
 }
 
 // ---------------- 예선 ----------------
@@ -661,7 +848,7 @@ function groupHasScoredMatches(groupId) {
 /** 방식 전환/재배치로 기존 결과가 사라질 수 있을 때 확인을 구한다. 결과가 없으면 그냥 통과. */
 function confirmIfResultsWillReset(groupId, groupName, message) {
   if (!groupHasScoredMatches(groupId)) return true;
-  return confirm(message || `'${groupName}'의 기존 경기 결과가 초기화됩니다. 계속할까요?`);
+  return confirm(`${divisionLabel()} ${message || `'${groupName}'의 기존 경기 결과가 초기화됩니다. 계속할까요?`}`);
 }
 
 /** 한 조의 예선 대진/결과와 링크제 도형 배치를 모두 초기화한다 (조별 '초기화' 버튼용) */
@@ -669,7 +856,7 @@ async function handleResetGroupPrelim(group) {
   const hasMatches = groupHasPrelimMatches(group.id);
   const hasRingPlacement = (group.ringOrder || []).some(Boolean);
   if (!hasMatches && !hasRingPlacement) return showToast(`${group.name}에 초기화할 내용이 없습니다`);
-  if (!confirm(`'${group.name}'의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
+  if (!confirm(`${divisionLabel()} '${group.name}'의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
   try {
     await clearPrelimMatchesForGroup(group.id);
     await setGroupRingOrder(group.id, []);
@@ -1079,7 +1266,7 @@ function fmtSigned(n) {
  * (buildCrossGroupSeedOrder, bracket.js)
  */
 function computeRecommendedSeeds() {
-  const n = Math.max(1, Number(tournamentInfo.qualifyPerGroup) || 2);
+  const n = Math.max(1, Number(tournamentInfo.qualifyPerGroup?.[activeDivision]) || 2);
   const standingsByGroup = groups
     .map((g) => {
       const groupTeams = teams.filter((t) => t.groupId === g.id);
@@ -1226,14 +1413,14 @@ function teamGroupRankLabel(teamId) {
 async function onGenerateBracket() {
   if (seedSelection.length < 2) return showToast("본선 진출팀을 2팀 이상 선택하세요");
   if (seedSelection.length > 32) return showToast("본선 진출팀은 최대 32팀까지 지원합니다");
-  if (!confirm(`${seedSelection.length}팀으로 본선 대진표를 생성할까요? 기존 대진표는 초기화됩니다.`)) return;
+  if (!confirm(`${divisionLabel()} ${seedSelection.length}팀으로 본선 대진표를 생성할까요? 기존 대진표는 초기화됩니다.`)) return;
   const teamsInSeedOrder = seedSelection.map((id) => ({ id, name: teamName(id) }));
   const { matches } = generateBracket(teamsInSeedOrder);
   finalMatches = matches;
   bracketPublishPending = true;
   renderFinalBracket();
   renderFinalTeamPicker();
-  showToast("본선 대진표를 생성했습니다 (아직 공개 안 됨). 부전승 배치·자리 조정까지 마친 뒤 '관객 화면에 공개'를 눌러주세요.");
+  showToast(`${divisionLabel()} 본선 대진표를 생성했습니다 (아직 공개 안 됨). 부전승 배치·자리 조정까지 마친 뒤 '관객 화면에 공개'를 눌러주세요.`);
 }
 
 function renderFinalBracket() {
@@ -1281,10 +1468,10 @@ async function handlePublishBracket() {
   try {
     // 대진표를 새로 생성했다면 경기 수/아이디 구성이 이전 공개분과 달라질 수 있으므로
     // (단순 덮어쓰기가 아니라) 더 이상 없는 경기는 지우고 전부 교체하는 publishFinalBracket을 쓴다.
-    await publishFinalBracket(finalMatches);
+    await publishFinalBracket(activeDivision, finalMatches);
     bracketPublishPending = false;
     updateBracketPublishBar();
-    showToast("관객 화면에 공개했습니다");
+    showToast(`${divisionLabel()} 대진표를 관객 화면에 공개했습니다`);
   } catch (err) {
     reportError("관객 화면 공개", err);
   }

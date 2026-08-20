@@ -8,35 +8,27 @@
 <link rel="stylesheet" href="css/bracket.css" />
 </head>
 <body>
-<div class="app-shell">
+<div class="app-shell" id="dashboardShell">
 
   <div class="top-bar">
-    <div class="brand"><span class="emoji">🏐</span> <span id="dashTitle">바운스발리볼</span></div>
+    <div class="brand"><span class="emoji">🏐</span> <span id="dashTitle">바운스발리볼</span> <span id="dashDivisionBadge" class="division-badge">남자부</span></div>
     <span class="live-dot">실시간 중계중</span>
   </div>
 
   <div id="errorBanner" class="error-banner"></div>
 
+  <div class="division-switch" id="dashDivisionSwitch" role="group" aria-label="경기 부문 선택">
+    <button type="button" class="division-btn active" data-division="men">남자부</button>
+    <button type="button" class="division-btn" data-division="women">여자부</button>
+  </div>
+
   <div class="tabs">
-    <button class="tab-btn active" data-tab="setup">대회설정</button>
-    <button class="tab-btn" data-tab="prelim">예선</button>
+    <button class="tab-btn active" data-tab="prelim">예선</button>
     <button class="tab-btn" data-tab="final">본선</button>
   </div>
 
-  <!-- 대회설정 -->
-  <section class="tab-panel active" id="tab-setup">
-    <div class="card">
-      <h2>🏷️ 대회 안내</h2>
-      <p id="dashIntro" style="margin:0; color:var(--muted); font-size:14px; line-height:1.7;">대회 정보를 불러오는 중입니다…</p>
-    </div>
-    <div class="card">
-      <h2>📁 조 편성</h2>
-      <div id="dashGroupOverview" class="grid-auto"></div>
-    </div>
-  </section>
-
   <!-- 예선 -->
-  <section class="tab-panel" id="tab-prelim">
+  <section class="tab-panel active" id="tab-prelim">
     <div id="dashPrelim" class="grid-auto"></div>
   </section>
 
@@ -52,6 +44,18 @@
   </section>
 
   <p class="footer-note">바운스발리볼 · 실시간 경기 결과 대시보드</p>
+
+  <div id="venueStatusHome"></div>
+  <section id="venueSwitcher" class="venue-switcher" hidden aria-label="경기 부문 자동 전환 상태">
+    <div class="venue-switcher-line">
+      <strong id="venueCurrentDivision">남자부</strong>
+      <span id="venueNextDivision"></span>
+      <time id="venueCountdown"></time>
+    </div>
+    <div id="venueProgressTrack" class="venue-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+      <div id="venueProgressBar" class="venue-progress-bar"></div>
+    </div>
+  </section>
 </div>
 
 <script type="module" src="js/dashboard.js"></script>
