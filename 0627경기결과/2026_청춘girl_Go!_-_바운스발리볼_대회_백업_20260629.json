@@ -1,0 +1,735 @@
+{
+  "app": "bounce-volleyball",
+  "type": "backup",
+  "version": 1,
+  "exportedAt": "2026-06-28T23:54:52.731Z",
+  "tournamentId": "main",
+  "info": {
+    "name": "2026 청춘girl Go! - 바운스발리볼 대회",
+    "qualifyPerGroup": 2
+  },
+  "groups": [
+    {
+      "id": "X1ctj0QJ7XsVV2v3P8Kx",
+      "data": {
+        "name": "B조",
+        "ringOrder": [
+          "8Jxiry6VDinuCPN7yPuR",
+          "SG6GSvnKOgP2w6ClEL1e",
+          "IWJNs5fC2fVKarBEPqSv",
+          "fmsGjawbVjPvJG53s20C"
+        ],
+        "matchMode": "roundrobin",
+        "order": 1782193935768
+      }
+    },
+    {
+      "id": "adycIGlONsjkUM72Z8es",
+      "data": {
+        "matchMode": "roundrobin",
+        "ringOrder": [
+          "QBgJdE8krwH4utNd6WVG",
+          "dV0gNMUIVbgFvFTuDGCT",
+          "TZXo2tc37LvSoO7bWNJi",
+          "tk1DokGOcp2VFdPGZm1T"
+        ],
+        "order": 1782193931469,
+        "name": "A조"
+      }
+    },
+    {
+      "id": "ttCtjK19PGodGPha6ZVm",
+      "data": {
+        "ringOrder": [
+          "LJetUusXoAV8dY5hly9z",
+          "uWNYxoDDCV2ZYpKqpyYp",
+          "FCcyCLnH9KbHdNpiX90N"
+        ],
+        "matchMode": "roundrobin",
+        "order": 1782195453204,
+        "name": "C조"
+      }
+    }
+  ],
+  "teams": [
+    {
+      "id": "0XD96uJPfwOKQk5dcA7n",
+      "data": {
+        "advanced": false,
+        "order": 1782283030645,
+        "name": "삼화초A(A1)",
+        "groupId": "adycIGlONsjkUM72Z8es"
+      }
+    },
+    {
+      "id": "0tBAVI0Xd5Y58YOt5p0H",
+      "data": {
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "name": "외도초B(B4)",
+        "order": 1782283078338,
+        "advanced": false
+      }
+    },
+    {
+      "id": "9gbcir7E9LnHB6Vgv7Gx",
+      "data": {
+        "groupId": "ttCtjK19PGodGPha6ZVm",
+        "name": "신산초(C1)",
+        "order": 1782283088352,
+        "advanced": false
+      }
+    },
+    {
+      "id": "C57m2sRagp4DbXzIpLzZ",
+      "data": {
+        "name": "추자초(B2)",
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "advanced": false,
+        "order": 1782283062192
+      }
+    },
+    {
+      "id": "FEvT3ArGCZitMrNNYr2d",
+      "data": {
+        "order": 1782283073334,
+        "advanced": false,
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "name": "외도초A(B3)"
+      }
+    },
+    {
+      "id": "IOVBjKakZERSvD3PhoT7",
+      "data": {
+        "order": 1782283051185,
+        "advanced": false,
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "name": "삼화초B(A4)"
+      }
+    },
+    {
+      "id": "OLXZFUw1X8SVRg6QGwj8",
+      "data": {
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "name": "서귀포초A(A3)",
+        "order": 1782283042714,
+        "advanced": false
+      }
+    },
+    {
+      "id": "dljbP05b02geFBFO5oOi",
+      "data": {
+        "advanced": false,
+        "order": 1782283034922,
+        "name": "제주동초(A2)",
+        "groupId": "adycIGlONsjkUM72Z8es"
+      }
+    },
+    {
+      "id": "fHNV7hjzKz59zNKSqz1m",
+      "data": {
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "name": "서귀포초B(B1)",
+        "order": 1782283058062,
+        "advanced": false
+      }
+    },
+    {
+      "id": "rQjRWp6iAnB5r6pqdk7l",
+      "data": {
+        "advanced": false,
+        "order": 1782283108682,
+        "name": "이도초B(C3)",
+        "groupId": "ttCtjK19PGodGPha6ZVm"
+      }
+    },
+    {
+      "id": "wIp9P1rYO9X1xWcNkkfc",
+      "data": {
+        "name": "이도초A(C2)",
+        "groupId": "ttCtjK19PGodGPha6ZVm",
+        "advanced": false,
+        "order": 1782283098337
+      }
+    }
+  ],
+  "prelimMatches": [
+    {
+      "id": "34AzkLgs5lrzLinmtE76",
+      "data": {
+        "createdAt": 1782516844972,
+        "status": "done",
+        "setsWonA": 1,
+        "setsWonB": 1,
+        "teamA": "fHNV7hjzKz59zNKSqz1m",
+        "result": "draw",
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "sets": [
+          {
+            "a": 10,
+            "b": 4
+          },
+          {
+            "a": 8,
+            "b": 10
+          }
+        ],
+        "pointsForA": 18,
+        "pointsForB": 14,
+        "round": 3,
+        "teamB": "FEvT3ArGCZitMrNNYr2d"
+      }
+    },
+    {
+      "id": "5oxOkdD3bNC4PruAnGyB",
+      "data": {
+        "result": "draw",
+        "teamA": "fHNV7hjzKz59zNKSqz1m",
+        "teamB": "0tBAVI0Xd5Y58YOt5p0H",
+        "round": 1,
+        "pointsForA": 16,
+        "pointsForB": 16,
+        "sets": [
+          {
+            "b": 10,
+            "a": 6
+          },
+          {
+            "b": 6,
+            "a": 10
+          }
+        ],
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "status": "done",
+        "createdAt": 1782516844971,
+        "setsWonB": 1,
+        "setsWonA": 1
+      }
+    },
+    {
+      "id": "D7z3CcCqMpQD85aNA5SC",
+      "data": {
+        "setsWonA": 0,
+        "setsWonB": 2,
+        "createdAt": 1782283184284,
+        "status": "done",
+        "groupId": "ttCtjK19PGodGPha6ZVm",
+        "sets": [
+          {
+            "a": 4,
+            "b": 10
+          },
+          {
+            "a": 2,
+            "b": 10
+          }
+        ],
+        "teamB": "wIp9P1rYO9X1xWcNkkfc",
+        "round": 1,
+        "pointsForA": 6,
+        "pointsForB": 20,
+        "teamA": "9gbcir7E9LnHB6Vgv7Gx",
+        "result": "B"
+      }
+    },
+    {
+      "id": "DbJT5kDfIXSg7BsRxDCZ",
+      "data": {
+        "teamB": "FEvT3ArGCZitMrNNYr2d",
+        "round": 1,
+        "pointsForA": 22,
+        "pointsForB": 13,
+        "sets": [
+          {
+            "a": 12,
+            "b": 10
+          },
+          {
+            "a": 10,
+            "b": 3
+          }
+        ],
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "result": "A",
+        "teamA": "C57m2sRagp4DbXzIpLzZ",
+        "setsWonB": 0,
+        "setsWonA": 2,
+        "status": "done",
+        "createdAt": 1782516844972
+      }
+    },
+    {
+      "id": "HHZVG0B9hcvYHncrXbiv",
+      "data": {
+        "createdAt": 1782283125775,
+        "status": "done",
+        "setsWonB": 2,
+        "setsWonA": 0,
+        "teamA": "dljbP05b02geFBFO5oOi",
+        "result": "B",
+        "sets": [
+          {
+            "b": 10,
+            "a": 8
+          },
+          {
+            "a": 5,
+            "b": 10
+          }
+        ],
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "pointsForB": 20,
+        "pointsForA": 13,
+        "round": 6,
+        "teamB": "OLXZFUw1X8SVRg6QGwj8"
+      }
+    },
+    {
+      "id": "HaKoF1XusFvJf09gAUe1",
+      "data": {
+        "teamA": "wIp9P1rYO9X1xWcNkkfc",
+        "result": "draw",
+        "sets": [
+          {
+            "a": 10,
+            "b": 7
+          },
+          {
+            "a": 4,
+            "b": 10
+          }
+        ],
+        "groupId": "ttCtjK19PGodGPha6ZVm",
+        "teamB": "rQjRWp6iAnB5r6pqdk7l",
+        "round": 3,
+        "pointsForA": 14,
+        "pointsForB": 17,
+        "createdAt": 1782283184283,
+        "status": "done",
+        "setsWonB": 1,
+        "setsWonA": 1
+      }
+    },
+    {
+      "id": "HrRFrvOwKVjr9zynviDu",
+      "data": {
+        "pointsForB": 20,
+        "pointsForA": 6,
+        "round": 4,
+        "teamB": "dljbP05b02geFBFO5oOi",
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "sets": [
+          {
+            "b": 10,
+            "a": 4
+          },
+          {
+            "a": 2,
+            "b": 10
+          }
+        ],
+        "result": "B",
+        "teamA": "IOVBjKakZERSvD3PhoT7",
+        "setsWonA": 0,
+        "setsWonB": 2,
+        "status": "done",
+        "createdAt": 1782283125775
+      }
+    },
+    {
+      "id": "JGkrX38HZtZUP59yt6y4",
+      "data": {
+        "status": "done",
+        "createdAt": 1782283125775,
+        "setsWonA": 2,
+        "setsWonB": 0,
+        "result": "A",
+        "teamA": "0XD96uJPfwOKQk5dcA7n",
+        "teamB": "OLXZFUw1X8SVRg6QGwj8",
+        "round": 3,
+        "pointsForA": 20,
+        "pointsForB": 8,
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "sets": [
+          {
+            "b": 3,
+            "a": 10
+          },
+          {
+            "b": 5,
+            "a": 10
+          }
+        ]
+      }
+    },
+    {
+      "id": "M24lsSJ7kYuLIDyeypcU",
+      "data": {
+        "teamA": "fHNV7hjzKz59zNKSqz1m",
+        "result": "draw",
+        "sets": [
+          {
+            "a": 5,
+            "b": 10
+          },
+          {
+            "a": 10,
+            "b": 1
+          }
+        ],
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "pointsForB": 11,
+        "pointsForA": 15,
+        "round": 2,
+        "teamB": "C57m2sRagp4DbXzIpLzZ",
+        "createdAt": 1782516844972,
+        "status": "done",
+        "setsWonB": 1,
+        "setsWonA": 1
+      }
+    },
+    {
+      "id": "TY4jZW5jGSNaBoMHAILQ",
+      "data": {
+        "setsWonB": 1,
+        "setsWonA": 1,
+        "status": "done",
+        "createdAt": 1782283125775,
+        "pointsForA": 17,
+        "pointsForB": 18,
+        "round": 5,
+        "teamB": "IOVBjKakZERSvD3PhoT7",
+        "sets": [
+          {
+            "b": 10,
+            "a": 7
+          },
+          {
+            "b": 8,
+            "a": 10
+          }
+        ],
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "result": "draw",
+        "teamA": "0XD96uJPfwOKQk5dcA7n"
+      }
+    },
+    {
+      "id": "UKslJaiOaACNi5s5jqeE",
+      "data": {
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "sets": [
+          {
+            "b": 6,
+            "a": 10
+          },
+          {
+            "b": 5,
+            "a": 10
+          }
+        ],
+        "pointsForA": 20,
+        "pointsForB": 11,
+        "round": 1,
+        "teamB": "dljbP05b02geFBFO5oOi",
+        "teamA": "0XD96uJPfwOKQk5dcA7n",
+        "result": "A",
+        "setsWonA": 2,
+        "setsWonB": 0,
+        "createdAt": 1782283125775,
+        "status": "done"
+      }
+    },
+    {
+      "id": "bLvJD8zb4UXPx7o34Vz9",
+      "data": {
+        "teamA": "OLXZFUw1X8SVRg6QGwj8",
+        "result": "A",
+        "groupId": "adycIGlONsjkUM72Z8es",
+        "sets": [
+          {
+            "b": 2,
+            "a": 10
+          },
+          {
+            "a": 10,
+            "b": 0
+          }
+        ],
+        "pointsForA": 20,
+        "pointsForB": 2,
+        "round": 2,
+        "teamB": "IOVBjKakZERSvD3PhoT7",
+        "createdAt": 1782283125775,
+        "status": "done",
+        "setsWonA": 2,
+        "setsWonB": 0
+      }
+    },
+    {
+      "id": "jlHA77FOc8O9tiC8ljfp",
+      "data": {
+        "setsWonA": 1,
+        "setsWonB": 1,
+        "status": "done",
+        "createdAt": 1782516844972,
+        "pointsForB": 16,
+        "pointsForA": 20,
+        "round": 2,
+        "teamB": "0tBAVI0Xd5Y58YOt5p0H",
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "sets": [
+          {
+            "b": 4,
+            "a": 10
+          },
+          {
+            "b": 12,
+            "a": 10
+          }
+        ],
+        "result": "draw",
+        "teamA": "FEvT3ArGCZitMrNNYr2d"
+      }
+    },
+    {
+      "id": "meqHZt71lgdoF9fZuRKI",
+      "data": {
+        "setsWonA": 1,
+        "setsWonB": 1,
+        "createdAt": 1782283184284,
+        "status": "done",
+        "groupId": "ttCtjK19PGodGPha6ZVm",
+        "sets": [
+          {
+            "a": 14,
+            "b": 12
+          },
+          {
+            "a": 8,
+            "b": 10
+          }
+        ],
+        "pointsForB": 22,
+        "pointsForA": 22,
+        "round": 2,
+        "teamB": "rQjRWp6iAnB5r6pqdk7l",
+        "teamA": "9gbcir7E9LnHB6Vgv7Gx",
+        "result": "draw"
+      }
+    },
+    {
+      "id": "yCc4y4eNyugsTHlrMMpM",
+      "data": {
+        "teamA": "0tBAVI0Xd5Y58YOt5p0H",
+        "result": "draw",
+        "sets": [
+          {
+            "b": 8,
+            "a": 10
+          },
+          {
+            "b": 10,
+            "a": 6
+          }
+        ],
+        "groupId": "X1ctj0QJ7XsVV2v3P8Kx",
+        "pointsForB": 18,
+        "pointsForA": 16,
+        "round": 3,
+        "teamB": "C57m2sRagp4DbXzIpLzZ",
+        "createdAt": 1782516844972,
+        "status": "done",
+        "setsWonB": 1,
+        "setsWonA": 1
+      }
+    }
+  ],
+  "finalMatches": [
+    {
+      "id": "m_r1_0",
+      "data": {
+        "nextSlot": "A",
+        "teamA": {
+          "id": "0XD96uJPfwOKQk5dcA7n",
+          "name": "삼화초A(A1)"
+        },
+        "nextMatchId": "m_r2_0",
+        "teamB": null,
+        "round": 1,
+        "roundLabel": "6강",
+        "status": "bye",
+        "winnerTeam": {
+          "name": "삼화초A(A1)",
+          "id": "0XD96uJPfwOKQk5dcA7n"
+        },
+        "byeCandidate": null,
+        "winnerSide": "A",
+        "id": "m_r1_0",
+        "index": 0,
+        "sets": []
+      }
+    },
+    {
+      "id": "m_r1_1",
+      "data": {
+        "teamA": {
+          "id": "rQjRWp6iAnB5r6pqdk7l",
+          "name": "이도초B(C3)"
+        },
+        "nextMatchId": "m_r2_0",
+        "teamB": {
+          "id": "fHNV7hjzKz59zNKSqz1m",
+          "name": "서귀포초B(B1)"
+        },
+        "round": 1,
+        "roundLabel": "6강",
+        "nextSlot": "B",
+        "id": "m_r1_1",
+        "index": 1,
+        "sets": [
+          {
+            "b": 10,
+            "a": 6
+          },
+          {
+            "b": 10,
+            "a": 3
+          }
+        ],
+        "winnerTeam": {
+          "id": "fHNV7hjzKz59zNKSqz1m",
+          "name": "서귀포초B(B1)"
+        },
+        "status": "done",
+        "byeCandidate": null,
+        "winnerSide": "B"
+      }
+    },
+    {
+      "id": "m_r1_2",
+      "data": {
+        "nextSlot": "A",
+        "roundLabel": "6강",
+        "nextMatchId": "m_r2_1",
+        "teamB": null,
+        "round": 1,
+        "teamA": {
+          "id": "C57m2sRagp4DbXzIpLzZ",
+          "name": "추자초(B2)"
+        },
+        "winnerSide": "A",
+        "byeCandidate": null,
+        "winnerTeam": {
+          "id": "C57m2sRagp4DbXzIpLzZ",
+          "name": "추자초(B2)"
+        },
+        "status": "bye",
+        "index": 2,
+        "sets": [],
+        "id": "m_r1_2"
+      }
+    },
+    {
+      "id": "m_r1_3",
+      "data": {
+        "roundLabel": "6강",
+        "round": 1,
+        "nextMatchId": "m_r2_1",
+        "teamB": {
+          "id": "OLXZFUw1X8SVRg6QGwj8",
+          "name": "서귀포초A(A3)"
+        },
+        "teamA": {
+          "id": "wIp9P1rYO9X1xWcNkkfc",
+          "name": "이도초A(C2)"
+        },
+        "nextSlot": "B",
+        "sets": [
+          {
+            "b": 10,
+            "a": 3
+          },
+          {
+            "a": 6,
+            "b": 10
+          }
+        ],
+        "index": 3,
+        "id": "m_r1_3",
+        "winnerSide": "B",
+        "byeCandidate": null,
+        "winnerTeam": {
+          "name": "서귀포초A(A3)",
+          "id": "OLXZFUw1X8SVRg6QGwj8"
+        },
+        "status": "done"
+      }
+    },
+    {
+      "id": "m_r2_0",
+      "data": {
+        "winnerTeam": null,
+        "status": "pending",
+        "byeCandidate": null,
+        "winnerSide": null,
+        "id": "m_r2_0",
+        "index": 0,
+        "sets": [],
+        "nextSlot": "A",
+        "teamA": {
+          "id": "0XD96uJPfwOKQk5dcA7n",
+          "name": "삼화초A(A1)"
+        },
+        "nextMatchId": "m_r3_0",
+        "teamB": {
+          "id": "fHNV7hjzKz59zNKSqz1m",
+          "name": "서귀포초B(B1)"
+        },
+        "round": 2,
+        "roundLabel": "준결승"
+      }
+    },
+    {
+      "id": "m_r2_1",
+      "data": {
+        "nextSlot": "B",
+        "teamA": {
+          "id": "C57m2sRagp4DbXzIpLzZ",
+          "name": "추자초(B2)"
+        },
+        "roundLabel": "준결승",
+        "nextMatchId": "m_r3_0",
+        "teamB": {
+          "name": "서귀포초A(A3)",
+          "id": "OLXZFUw1X8SVRg6QGwj8"
+        },
+        "round": 2,
+        "status": "pending",
+        "winnerTeam": null,
+        "winnerSide": null,
+        "byeCandidate": null,
+        "id": "m_r2_1",
+        "index": 1,
+        "sets": []
+      }
+    },
+    {
+      "id": "m_r3_0",
+      "data": {
+        "teamA": null,
+        "roundLabel": "결승",
+        "round": 3,
+        "teamB": null,
+        "nextMatchId": null,
+        "nextSlot": "A",
+        "id": "m_r3_0",
+        "index": 0,
+        "sets": [],
+        "status": "waiting",
+        "winnerTeam": null,
+        "winnerSide": null,
+        "byeCandidate": null
+      }
+    }
+  ]
+}

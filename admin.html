@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>바운스발리볼 관리자</title>
+<link rel="stylesheet" href="css/style.css" />
+<link rel="stylesheet" href="css/bracket.css" />
+</head>
+<body>
+<div id="loginScreen" class="login-screen">
+  <div class="login-card">
+    <div class="brand" style="justify-content:center; margin-bottom:4px;"><span class="emoji">🏐</span> 바운스발리볼 관리자</div>
+    <p class="empty-hint" style="margin:0 0 18px; text-align:center;">관리자 계정으로 로그인하세요.</p>
+    <div id="loginError" class="error-banner"></div>
+    <input type="email" id="loginEmail" placeholder="이메일" autocomplete="username" style="width:100%; margin-bottom:10px;" />
+    <input type="password" id="loginPassword" placeholder="비밀번호" autocomplete="current-password" style="width:100%; margin-bottom:14px;" />
+    <button class="btn primary" id="loginBtn" style="width:100%;">로그인</button>
+    <button class="btn ghost small" id="forgotPasswordBtn" style="width:100%; margin-top:10px; background:transparent; color:var(--muted);">비밀번호를 잊으셨나요?</button>
+  </div>
+</div>
+<div class="app-shell" id="appShell" style="display:none;">
+
+  <div class="top-bar">
+    <div class="brand"><span class="emoji">🏐</span> 바운스발리볼 관리자 페이지</div>
+    <div class="row">
+      <span id="connStatus" class="live-dot">동기화중</span>
+      <button class="btn ghost small" id="exportCsvBtn" title="예선·본선 전체 결과를 CSV 파일로 다운로드">⬇️ CSV</button>
+      <button class="btn ghost small" id="changePasswordBtn" title="비밀번호 변경">🔑 비밀번호 변경</button>
+      <button class="btn ghost small" id="logoutBtn" title="로그아웃">🚪 로그아웃</button>
+      <a class="btn ghost small" href="dashboard.html" target="_blank">대시보드 열기 ↗</a>
+    </div>
+  </div>
+
+  <div id="errorBanner" class="error-banner"></div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="setup">대회설정</button>
+    <button class="tab-btn" data-tab="prelim">예선</button>
+    <button class="tab-btn" data-tab="final">본선</button>
+  </div>
+
+  <!-- 대회설정 -->
+  <section class="tab-panel active" id="tab-setup">
+    <div class="card">
+      <h2>🏷️ 대회 정보</h2>
+      <div class="row">
+        <input type="text" id="tournamentNameInput" placeholder="대회명 (예: 2026 바운스발리볼)" style="flex:1; min-width:240px;" />
+        <button class="btn primary" id="saveTournamentNameBtn">저장</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>💾 데이터 백업 / 복원</h2>
+      <p class="empty-hint" style="margin:0 0 12px;">현재 전체 데이터(팀·조·예선·본선 결과·대진표)를 파일 하나로 저장하거나, 백업 파일로 되돌립니다. 다음 학기에 이어서 쓰려면 지금 <b>백업 파일 저장</b>을 눌러 안전한 곳(예: 구글 드라이브)에 보관해 두세요.</p>
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <button class="btn primary" id="backupBtn">⬇️ 백업 파일 저장</button>
+        <button class="btn" id="restoreBtn">⬆️ 백업 파일에서 복원</button>
+        <input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none;" />
+      </div>
+      <p class="empty-hint" style="margin:10px 0 0; color:#c0392b;">⚠️ 복원하면 현재 입력된 데이터가 백업 파일 내용으로 <b>전부 대체</b>됩니다.</p>
+    </div>
+
+    <div class="card">
+      <h2>📁 조 편성 <button class="btn danger small" id="resetGroupsBtn" style="margin-left:auto;" title="등록된 모든 조를 삭제합니다">초기화</button></h2>
+      <div class="row" style="margin-bottom:12px;">
+        <input type="text" id="groupNameInput" placeholder="조 이름 (예: 1조)" />
+        <button class="btn" id="addGroupBtn">조 추가</button>
+      </div>
+      <div id="groupList" class="row"></div>
+    </div>
+
+    <div class="card">
+      <h2>🙋 참가팀 등록 <span style="font-weight:400; color:var(--muted); font-size:13px;">(총 <span id="teamCount">0</span>팀)</span><button class="btn danger small" id="resetTeamsBtn" style="margin-left:auto;" title="등록된 모든 팀을 삭제합니다">초기화</button></h2>
+      <div class="row" style="margin-bottom:14px;">
+        <select id="teamGroupSelect"><option value="">① 조 선택</option></select>
+        <input type="text" id="teamNameInput" placeholder="먼저 조를 선택하세요" style="flex:1; min-width:160px;" disabled />
+        <button class="btn" id="addTeamBtn" disabled>팀 추가</button>
+      </div>
+      <div id="groupTeamLists" class="grid-auto"></div>
+      <p class="empty-hint" style="margin:8px 0 0;">팀을 드래그해서 다른 조로 옮길 수 있어요.</p>
+    </div>
+  </section>
+
+  <!-- 예선 -->
+  <section class="tab-panel" id="tab-prelim">
+    <div class="card">
+      <h2>📋 예선 대진 설정 <button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="모든 조의 예선 대진과 결과를 삭제합니다">초기화</button></h2>
+      <p class="empty-hint" style="margin:0;">조마다 <b>라운드로빈</b>(모든 팀이 한 번씩 대결) 또는 <b>링크제</b>(도형 꼭짓점에 배치해 인접한 팀끼리만 대결) 방식을 선택하세요. 방식과 대진 생성은 아래 각 조 카드에서 진행합니다.</p>
+    </div>
+    <div id="prelimGroups"></div>
+  </section>
+
+  <!-- 본선 -->
+  <section class="tab-panel" id="tab-final">
+    <div class="card">
+      <h2>🏆 본선 진출팀 선택 &amp; 시드 배정</h2>
+      <div class="settings-box row" style="margin-bottom:12px; align-items:center; justify-content:space-between;">
+        <label style="font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px;">
+          ⚙️ 조별 본선 진출 팀 수
+          <input type="number" id="qualifyPerGroupInput" min="1" max="16" value="2" style="width:64px;" />
+          팀
+        </label>
+        <button class="btn primary small" id="saveQualifyPerGroupBtn" title="저장해야 적용돼요">저장</button>
+      </div>
+      <p class="empty-hint" style="margin:0 0 12px;">예선 순위(승점→세트득실→득실차→승자승) 기준으로 자동 체크됩니다. 체크박스로 직접 바꾸거나 화살표로 시드 순서를 조정하세요.</p>
+      <div id="finalTeamPicker"></div>
+      <div class="row" style="margin-top:14px;">
+        <button class="btn primary" id="generateBracketBtn">대진표 생성</button>
+        <button class="btn danger" id="clearBracketBtn">대진표 초기화</button>
+      </div>
+    </div>
+
+    <div class="card" id="byeUnassignedCard" style="display:none;">
+      <h3 style="margin:0 0 8px;">⏳ 미배정 팀 (부전승 대상)</h3>
+      <p class="empty-hint" style="margin:0 0 10px; padding:0;">상대가 없어 대진표에는 보이지 않는 자리입니다. 부전승으로 진출시킬 팀을 직접 선택해서 배치하세요.</p>
+      <div id="byeUnassignedList"></div>
+    </div>
+
+    <div class="card">
+      <div class="bracket-header">
+        <div class="bracket-banner"><span>🏆</span> <span id="bracketTitle">본선 대진표</span></div>
+      </div>
+      <div class="bracket-publish-bar" id="bracketPublishBar" style="display:none;">
+        <span id="bracketPublishMsg">✅ 모든 변경사항이 관객 화면에 공개되어 있습니다.</span>
+        <button type="button" class="btn primary small" id="publishBracketBtn">관객 화면에 공개</button>
+      </div>
+      <div class="bracket-wrap" id="finalBracketContainer"></div>
+    </div>
+
+  </section>
+
+  <p class="footer-note">바운스발리볼 · 관리자 페이지는 URL을 외부에 공유하지 마세요</p>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot" class="toast"></div>
+
+<script type="module" src="js/admin.js"></script>
+</body>
+</html>

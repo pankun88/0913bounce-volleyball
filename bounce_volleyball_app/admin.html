@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>바운스발리볼 관리자</title>
+<link rel="stylesheet" href="css/style.css" />
+<link rel="stylesheet" href="css/bracket.css" />
+</head>
+<body>
+<div class="app-shell">
+
+  <div class="top-bar">
+    <div class="brand"><span class="emoji">🏐</span> 바운스발리볼 관리자 페이지</div>
+    <div class="row">
+      <span id="connStatus" class="live-dot">동기화중</span>
+      <a class="btn ghost small" href="dashboard.html" target="_blank">대시보드 열기 ↗</a>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="setup">대회설정</button>
+    <button class="tab-btn" data-tab="prelim">예선</button>
+    <button class="tab-btn" data-tab="final">본선</button>
+  </div>
+
+  <!-- 대회설정 -->
+  <section class="tab-panel active" id="tab-setup">
+    <div class="card">
+      <h2>🏷️ 대회 정보</h2>
+      <div class="row">
+        <input type="text" id="tournamentNameInput" placeholder="대회명 (예: 2026 바운스발리볼)" style="flex:1; min-width:240px;" />
+        <button class="btn primary" id="saveTournamentNameBtn">저장</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📁 조 편성</h2>
+      <div class="row" style="margin-bottom:12px;">
+        <input type="text" id="groupNameInput" placeholder="조 이름 (예: 1조)" />
+        <button class="btn" id="addGroupBtn">조 추가</button>
+      </div>
+      <div id="groupList" class="row"></div>
+    </div>
+
+    <div class="card">
+      <h2>🙋 참가팀 등록 <span style="font-weight:400; color:var(--muted); font-size:13px;">(총 <span id="teamCount">0</span>팀)</span></h2>
+      <div class="row" style="margin-bottom:14px;">
+        <input type="text" id="teamNameInput" placeholder="팀 이름" />
+        <select id="teamGroupSelect"><option value="">조 선택</option></select>
+        <button class="btn" id="addTeamBtn">팀 추가</button>
+      </div>
+      <div id="groupTeamLists" class="grid-auto"></div>
+    </div>
+  </section>
+
+  <!-- 예선 -->
+  <section class="tab-panel" id="tab-prelim">
+    <div class="card">
+      <h2>📋 예선 일정 생성</h2>
+      <p class="empty-hint" style="margin:0 0 10px;">조별로 모든 팀이 한 번씩 맞붙는 라운드로빈 일정을 자동 생성합니다. 다시 생성하면 해당 조의 기존 경기 결과는 초기화됩니다.</p>
+      <div id="prelimGenerateButtons" class="row"></div>
+    </div>
+    <div id="prelimGroups"></div>
+  </section>
+
+  <!-- 본선 -->
+  <section class="tab-panel" id="tab-final">
+    <div class="card">
+      <h2>🏆 본선 진출팀 선택 &amp; 시드 배정</h2>
+      <p class="empty-hint" style="margin:0 0 10px;">예선 순위를 참고하여 본선에 진출할 팀을 선택하세요. 목록의 순서가 시드 순서(1번 시드부터)가 됩니다. 화살표로 순서를 조정할 수 있습니다.</p>
+      <div id="finalTeamPicker" class="grid-2"></div>
+      <div class="row" style="margin-top:14px;">
+        <button class="btn primary" id="generateBracketBtn">대진표 생성</button>
+        <button class="btn danger" id="clearBracketBtn">대진표 초기화</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="bracket-header">
+        <div class="bracket-banner"><span>🏆</span> <span id="bracketTitle">본선 대진표</span></div>
+      </div>
+      <div class="bracket-wrap" id="finalBracketContainer"></div>
+    </div>
+  </section>
+
+  <div class="card">
+    <h2>⬇️ 결과 내보내기</h2>
+    <button class="btn" id="exportCsvBtn">전체 결과 CSV 다운로드</button>
+  </div>
+
+  <p class="footer-note">바운스발리볼 · 관리자 페이지는 URL을 외부에 공유하지 마세요</p>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot" class="toast"></div>
+
+<script type="module" src="js/admin.js"></script>
+</body>
+</html>

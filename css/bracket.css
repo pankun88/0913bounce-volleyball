@@ -1,0 +1,606 @@
+.bracket-banner {
+  background: var(--red);
+  color: var(--white);
+  border-radius: 999px;
+  padding: 10px 28px;
+  font-weight: 800;
+  font-size: 17px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  box-shadow: var(--shadow);
+}
+
+.bracket-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 26px;
+  position: relative;
+}
+
+.bracket-trophy { font-size: 38px; }
+
+/* 관리자가 대진표 자리를 드래그로 조정/부전승 배치하는 동안에는 곧바로 관객 화면에
+   반영하지 않고, 이 막대를 보여줘서 "공개" 버튼을 눌러야만 공유되게 한다. */
+.bracket-publish-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 14px;
+  padding: 10px 16px;
+  margin-bottom: 18px;
+  font-size: 13px;
+  font-weight: 700;
+  /* 기본(공개 완료) 상태: 차분한 초록 */
+  background: #eef7ee;
+  border: 2px solid #bcdcbc;
+  color: #2f6b34;
+}
+/* 공개하지 않은 변경/기록이 남아 있을 때: 주황 경고 */
+.bracket-publish-bar.is-pending {
+  background: #fff4e0;
+  border-color: var(--orange);
+  color: var(--red-dark);
+}
+
+.bracket-fullscreen-btn {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--white);
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 18px;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--red-dark);
+  cursor: pointer;
+}
+.bracket-fullscreen-btn:hover { border-color: var(--orange); }
+
+.bracket-wrap {
+  background: var(--cream);
+  border-radius: 22px;
+  padding: 30px 24px 36px;
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  position: relative; /* 우승 세레모니 오버레이(.champion-celebrate-layer)의 기준 */
+}
+
+/* 전체화면 모드: 체육관 모니터에 화면 꽉 채워 송출할 때 쓴다.
+   제목 섹션을 별도로 두지 않고 완전히 숨겨서, bracket-wrap(트리)이 카드 전체(=화면 전체)를
+   그대로 차지하게 한다. 종료 버튼만 화면 흐름에서 빼서(position:absolute) 우상단에 작고
+   옅게 띄워두므로, 트리가 차지할 수 있는 가로/세로 공간은 거의 줄어들지 않는다. */
+#dashBracketCard.is-fullscreen,
+#dashBracketCard:fullscreen,
+#dashBracketCard:-webkit-full-screen {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  margin: 0;
+  padding: 0;
+  border-radius: 0;
+  background: var(--cream);
+  box-sizing: border-box;
+}
+#dashBracketCard.is-fullscreen .bracket-banner,
+#dashBracketCard:fullscreen .bracket-banner,
+#dashBracketCard:-webkit-full-screen .bracket-banner {
+  display: none;
+}
+#dashBracketCard.is-fullscreen .bracket-header,
+#dashBracketCard:fullscreen .bracket-header,
+#dashBracketCard:-webkit-full-screen .bracket-header {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  left: auto;
+  width: auto;
+  margin: 0;
+  z-index: 5;
+}
+#dashBracketCard.is-fullscreen .bracket-fullscreen-btn,
+#dashBracketCard:fullscreen .bracket-fullscreen-btn,
+#dashBracketCard:-webkit-full-screen .bracket-fullscreen-btn {
+  position: static;
+  transform: none;
+  opacity: 0.5;
+  font-size: 12px;
+  padding: 6px 14px;
+}
+#dashBracketCard.is-fullscreen .bracket-fullscreen-btn:hover,
+#dashBracketCard:fullscreen .bracket-fullscreen-btn:hover,
+#dashBracketCard:-webkit-full-screen .bracket-fullscreen-btn:hover {
+  opacity: 1;
+}
+#dashBracketCard.is-fullscreen .bracket-wrap,
+#dashBracketCard:fullscreen .bracket-wrap,
+#dashBracketCard:-webkit-full-screen .bracket-wrap {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  border-radius: 0;
+  padding: 18px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: auto;
+}
+
+/* iOS Safari나 카카오톡 인앱 브라우저처럼 임의 요소의 전체화면 API(requestFullscreen)를
+   지원하지 않거나 막아두는 모바일 환경을 위한 대체("의사 전체화면") 모드. 브라우저 자체
+   전체화면 대신, 카드를 화면에 고정해 덮어씌워서 같은 효과를 낸다. 위 .is-fullscreen 규칙과
+   함께 적용되므로 카드 내부(헤더/트리) 스타일은 그대로 재사용되고, 위치만 fixed로 바뀐다. */
+#dashBracketCard.is-fullscreen-fallback {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9999;
+}
+html.bracket-fallback-lock-scroll,
+html.bracket-fallback-lock-scroll body {
+  overflow: hidden;
+}
+
+/* root는 "스케일된 트리"가 차지할 실제 크기의 박스다. 크기(width/height)는 JS(redraw)에서
+   스케일 배율에 맞춰 직접 지정하며, 가로로는 margin:auto로 가운데 정렬된다. */
+.bracket-root { position: relative; min-height: 40px; margin: 0 auto; }
+
+.bracket-track {
+  /* root 안에 absolute로 띄워서, transform: scale로 줄여도 부모 레이아웃을 밀어내지 않게 한다.
+     (root가 스케일된 크기를 갖고, track은 그 안에서 좌상단 기준으로 축소되어 딱 맞게 들어간다.) */
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column-reverse; /* 결승이 맨 위, 준결승 이전 라운드가 아래로 쌓이도록 */
+  align-items: center;
+  gap: 40px;
+  padding-top: 10px;
+}
+
+.bracket-lines {
+  position: absolute;
+  top: 0; left: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.bracket-line {
+  fill: none;
+  stroke: var(--orange);
+  stroke-width: 2.5;
+}
+
+.bracket-round {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.bracket-round-title {
+  text-align: center;
+  font-weight: 800;
+  font-size: 13px;
+  color: var(--red-dark);
+  background: var(--white);
+  border-radius: 999px;
+  padding: 5px 0;
+  margin-bottom: 14px;
+}
+
+.bracket-round-matches {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-around;
+  /* center가 아니라 flex-start로 둔다: 같은 라운드 안 카드 높이는 항상 같아야 하지만(이름표
+     유무 등으로 미세하게 달라질 수 있음), 혹시 달라지더라도 카드 "윗변"만큼은 항상 가로로
+     나란히 맞춰 둬야 연결선이 카드 윗변 기준으로 계산되어도 어긋나지 않는다. */
+  align-items: flex-start;
+  gap: var(--bracket-card-gap, 56px);
+}
+
+.bracket-slot { display: flex; }
+
+.match-card-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.match-card {
+  position: relative;
+  background: var(--white);
+  border: 2px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  width: var(--bracket-card-width, 178px);
+  font-size: 13px;
+  z-index: 2;
+}
+.match-card.is-done { border-color: var(--orange); }
+
+/* 대진(A : B)을 가로 한 줄로 보여주는 영역 */
+.match-vs {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.match-vs-side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+}
+.match-vs-name {
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 72px;
+}
+.match-vs-name.is-winner { color: var(--red-dark); font-weight: 800; }
+.match-vs-sep { color: var(--muted); font-weight: 700; font-size: 13px; }
+
+/* 팀명 아래, 어느 조 몇 위로 올라왔는지 항상 보이는 작은 라벨 - 대진표 자리 교체(드래그앤드랍) 시
+   카드만 보고는 조/순위를 알 수 없어 헷갈리는 문제를 해결하기 위함 (호버 불필요) */
+.match-vs-group {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  margin-top: 1px;
+}
+/* 라벨이 없는 카드(미배정 등)도 이 줄의 자리를 똑같이 차지해야, 라벨이 있는 카드와
+   높이가 같아져서 연결선이 카드마다 다른 높이에서 출발하는 일이 없다. */
+.match-vs-group.is-empty { visibility: hidden; }
+
+/* 부전승 경기: 콜론 없이 "팀명(부전승)"을 가로 한 줄로 보여주고, 그 아래에 조/순위 라벨을 쌓는다
+   (이름+태그 한 줄 자체가 늘어나면 연결선이 흐트러지므로, 그 줄만은 한 줄로 유지한다) */
+.match-vs-bye-inline {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.match-vs-bye-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+}
+.match-vs-bye-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* 확정 대기 중인 부전승: 아직 관리자가 확정하지 않았다는 것을 색으로도 구분해준다 */
+.match-vs-bye-tag.is-pending {
+  color: var(--orange);
+}
+
+/* 1라운드 대진 자리바꿈 드래그앤드랍 (경기 시작 전에만 활성화됨) */
+.match-vs-side.slot-draggable,
+.match-vs-bye-inline.slot-draggable {
+  cursor: grab;
+  border-radius: 8px;
+  padding: 2px 0;
+  transition: background 0.12s ease, box-shadow 0.12s ease;
+}
+.match-vs-side.slot-draggable.dragging,
+.match-vs-bye-inline.slot-draggable.dragging { opacity: 0.4; }
+.match-vs-side.slot-draggable.slot-drag-over,
+.match-vs-bye-inline.slot-draggable.slot-drag-over {
+  background: rgba(192, 57, 43, 0.08);
+  box-shadow: inset 0 0 0 2px var(--red);
+}
+.bracket-swap-hint {
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+/* 팀명 바로 아래, 이긴 세트 수를 "2:1" 형태(가운데 한 줄)로 작게 보여준다 */
+.match-vs-score {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-height: 16px;
+}
+.match-vs-score-num.is-winner { color: var(--win); font-weight: 800; }
+.match-vs-score-sep { color: var(--muted); }
+
+.match-edit-btn {
+  margin-top: 10px;
+  width: 100%;
+  border: none;
+  background: var(--red);
+  color: var(--white);
+  font-size: 11.5px;
+  font-weight: 700;
+  border-radius: 8px;
+  padding: 5px 0;
+}
+/* 부전승/대기중: 누를 수 없는 자리채움용 버튼 (높이만 동일하게 차지) */
+.match-edit-btn.is-disabled {
+  background: var(--cream);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+/* 부전승 확정 버튼: 관리자의 명시적인 동작이 필요하다는 것을 강조하기 위해 별도 색을 쓴다 */
+.match-confirm-bye-btn {
+  background: var(--orange);
+}
+
+/* 박스 아래, 세트별 득점 상황을 보여주는 작은 가로 테이블 */
+.match-set-table {
+  margin-top: 6px;
+  border-collapse: collapse;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.match-set-table th,
+.match-set-table td {
+  padding: 2px 7px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.match-set-table th { font-weight: 700; color: var(--muted); }
+.match-set-table-name {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink);
+  max-width: 60px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.match-set-table-name.is-winner { color: var(--red-dark); font-weight: 800; }
+
+/* 결승: 다른 라운드와 똑같이 평범해 보이지 않도록, 크기·굵기·광 효과를 확실히 키워서
+   "이게 바로 우승전이다!"가 한눈에 느껴지게 한다. */
+.bracket-round-title.is-final-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #fff3d6, #ffd76a);
+  border: 2px solid #d4a017;
+  color: #6b4500;
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 0.3px;
+  padding: 10px 28px;
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(212, 160, 23, 0.55);
+  animation: bracket-final-glow 2.4s ease-in-out infinite;
+}
+.bracket-final-title-icon {
+  font-size: 30px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 3px rgba(150, 95, 0, 0.45));
+}
+.bracket-final-title-label { font-size: 20px; }
+
+@keyframes bracket-final-glow {
+  0%, 100% { box-shadow: 0 4px 16px rgba(212, 160, 23, 0.5); }
+  50% { box-shadow: 0 4px 22px rgba(212, 160, 23, 0.85); }
+}
+
+.match-card.is-final {
+  border-color: #d4a017;
+  border-width: 2.5px;
+  background: linear-gradient(180deg, #fffaf0, var(--white));
+  box-shadow: 0 0 0 3px rgba(212, 160, 23, 0.16), 0 8px 18px rgba(212, 160, 23, 0.28);
+}
+
+/* 결승전이 끝나 우승팀이 결정되면, 별도 배너를 새로 끼워넣는 대신 "결승" 타이틀 자리의
+   문구를 그대로 우승팀 발표로 바꾼다(레이아웃이 밀리지 않도록). 우승이 강조되어 보이도록
+   기존 결승 타이틀보다 한층 더 진하고 화려한 금색으로 바꿔준다. */
+.bracket-round-title.is-champion-title {
+  background: linear-gradient(135deg, #ffe28a, #d4a017);
+  border-color: #b3850f;
+  color: #4a3000;
+  box-shadow: 0 6px 18px rgba(212, 160, 23, 0.65);
+}
+
+/* ===== PC 전체화면(체육관 모니터 송출)용 강조 이펙트 =====
+   일반 대시보드/관리자 화면에는 적용되지 않고, #dashBracketCard.is-fullscreen 일 때만 보인다. */
+
+/* 이긴 팀 이름 위에, 그 경기의 승리(🔥 불꽃)를 뜻하는 작은 아이템이 통통 튀며 반복 움직인다(움짤처럼).
+   왕관은 우승 1팀을 떠올리게 해서, 각 라운드 경기 승리에는 불꽃(🔥)을 쓴다.
+   이름(.match-vs-name)은 말줄임(ellipsis)을 위해 overflow:hidden이라 위쪽 아이템이 잘리므로,
+   잘리지 않는 바깥 컬럼(.match-vs-side)에 :has()로 붙인다. */
+#dashBracketCard.is-fullscreen .match-vs-side:has(.match-vs-name.is-winner) {
+  position: relative;
+}
+#dashBracketCard.is-fullscreen .match-vs-side:has(.match-vs-name.is-winner)::before {
+  content: "🔥";
+  position: absolute;
+  left: 50%;
+  top: -1.25em;
+  font-size: 0.95em;
+  line-height: 1;
+  pointer-events: none;
+  z-index: 3;
+  filter: drop-shadow(0 1px 1px rgba(150, 95, 0, 0.5));
+  animation: winner-char-bounce 1.1s ease-in-out infinite;
+}
+@keyframes winner-char-bounce {
+  0%   { transform: translateX(-50%) translateY(0)    rotate(-9deg); }
+  25%  { transform: translateX(-50%) translateY(-5px) rotate(7deg); }
+  50%  { transform: translateX(-50%) translateY(-7px) rotate(-4deg); }
+  75%  { transform: translateX(-50%) translateY(-3px) rotate(6deg); }
+  100% { transform: translateX(-50%) translateY(0)    rotate(-9deg); }
+}
+
+/* 결승 트로피: 웅장하게 3D로 빙글 돌고, 금빛 광채가 강하게 맥동한다. */
+#dashBracketCard.is-fullscreen .bracket-final-title-icon {
+  display: inline-block;
+  transform-style: preserve-3d;
+  animation: trophy-spin 3.2s linear infinite, trophy-glow 1.6s ease-in-out infinite;
+}
+@keyframes trophy-spin {
+  0%   { transform: perspective(320px) rotateY(0deg)   scale(1); }
+  50%  { transform: perspective(320px) rotateY(180deg) scale(1.18); }
+  100% { transform: perspective(320px) rotateY(360deg) scale(1); }
+}
+@keyframes trophy-glow {
+  0%, 100% { filter: drop-shadow(0 2px 3px rgba(150, 95, 0, 0.45)) drop-shadow(0 0 4px rgba(255, 210, 80, 0.6)); }
+  50%      { filter: drop-shadow(0 2px 6px rgba(150, 95, 0, 0.6)) drop-shadow(0 0 16px rgba(255, 225, 120, 0.95)); }
+}
+/* 우승이 확정되면 트로피를 더 크고 더 빠르고 강렬하게. */
+#dashBracketCard.is-fullscreen .is-champion-title .bracket-final-title-icon {
+  font-size: 40px;
+  animation-duration: 2.2s, 1.0s;
+}
+
+/* 접근성: 움직임을 줄이기로 설정한 사용자에게는 애니메이션을 끈다. */
+@media (prefers-reduced-motion: reduce) {
+  #dashBracketCard.is-fullscreen .match-vs-name.is-winner::before,
+  #dashBracketCard.is-fullscreen .bracket-final-title-icon { animation: none; }
+}
+
+/* ===================== 우승 세레모니 =====================
+   우승팀의 첫 라운드 팀명을 클릭하면, 연결선을 타고 불꽃이 결승까지 올라가며 우승 이펙트가 터진다. */
+
+/* 클릭 가능한 우승팀 첫 라운드 팀명 - 은은하게 깜빡여 클릭을 유도 */
+.match-vs-name.champion-trigger {
+  cursor: pointer;
+  border-radius: 6px;
+  animation: champion-trigger-pulse 1.5s ease-in-out infinite;
+}
+@keyframes champion-trigger-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(240, 138, 60, 0); }
+  50%      { box-shadow: 0 0 10px 2px rgba(240, 138, 60, 0.7); }
+}
+
+/* 연결선을 타고 올라가는 불꽃 선 */
+.bracket-fire-line {
+  fill: none;
+  stroke: url(#championFireGradient);
+  stroke-width: 6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: url(#championFireGlow);
+  animation: fire-line-flicker 0.1s steps(2, end) infinite;
+}
+@keyframes fire-line-flicker {
+  0%   { opacity: 1; }
+  100% { opacity: 0.8; }
+}
+
+/* 우승팀 학교명에 붙는 불꽃 강조 */
+.match-vs-name.champion-aflame {
+  color: #d4380a !important;
+  animation: champion-name-flare 0.45s ease-in-out infinite alternate;
+}
+@keyframes champion-name-flare {
+  from { text-shadow: 0 0 6px rgba(255, 170, 0, 0.9), 0 0 12px rgba(255, 80, 0, 0.6); }
+  to   { text-shadow: 0 0 12px rgba(255, 200, 0, 1), 0 0 24px rgba(255, 60, 0, 0.92); }
+}
+
+/* 세레모니 오버레이(섬광·불티·배너) */
+.champion-celebrate-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 30;
+}
+.champion-flash {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% 58%, rgba(255, 215, 130, 0.6), rgba(255, 140, 0, 0) 62%);
+  opacity: 0;
+  animation: champion-flash 1s ease-out forwards;
+}
+@keyframes champion-flash {
+  0%   { opacity: 0; }
+  18%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+.champion-ember {
+  position: absolute;
+  bottom: -12px;
+  line-height: 1;
+  will-change: transform, opacity;
+  animation: champion-ember-rise var(--dur, 1.6s) ease-out forwards;
+}
+@keyframes champion-ember-rise {
+  0%   { transform: translateY(0) translateX(0) scale(0.5) rotate(0deg); opacity: 0; }
+  12%  { opacity: 1; }
+  100% { transform: translateY(calc(-1 * var(--rise, 300px))) translateX(var(--drift, 0px)) scale(1.15) rotate(var(--rot, 90deg)); opacity: 0; }
+}
+.champion-burst {
+  position: absolute;
+  left: 50%;
+  top: 44%;
+  transform: translate(-50%, -50%) scale(0.3);
+  font-size: clamp(28px, 6vw, 52px);
+  font-weight: 900;
+  color: #d4380a;
+  white-space: nowrap;
+  text-shadow: 0 2px 0 rgba(255, 255, 255, 0.35), 0 0 18px rgba(255, 140, 0, 0.95), 0 0 34px rgba(255, 70, 0, 0.7);
+  opacity: 0;
+  animation: champion-burst-pop 2.8s ease-out forwards;
+}
+@keyframes champion-burst-pop {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.3); }
+  16%  { opacity: 1; transform: translate(-50%, -50%) scale(1.14); }
+  28%  { transform: translate(-50%, -50%) scale(1); }
+  84%  { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.06); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .match-vs-name.champion-trigger,
+  .bracket-fire-line,
+  .match-vs-name.champion-aflame,
+  .champion-ember,
+  .champion-burst,
+  .champion-flash { animation: none; }
+}
+
+@media (max-width: 720px) {
+  .bracket-wrap { padding: 18px 10px 24px; }
+
+  /* 모바일은 'QR로 각자 휴대폰에서 실시간 확인'이 목적이라, 전체를 작게 욱여넣는 전체화면이
+     의미가 없다. 그래서 모바일에서는 전체화면 버튼을 숨기고(겹침 문제도 함께 해결),
+     트리는 자연 크기 + 좌우 스크롤로 보게 한다. (전체화면 송출은 PC 전용 기능) */
+  .bracket-fullscreen-btn { display: none; }
+
+  /* 모바일은 전체 대진표를 화면 폭에 맞춰 한눈에 보여주므로, 자세히 볼 때는 손가락으로
+     확대(핀치 줌)·스크롤하라고 안내한다. 전체화면(.is-fullscreen)일 땐 숨긴다. */
+  #dashBracketCard:not(.is-fullscreen) .bracket-header::after {
+    content: "👉 두 손가락으로 확대하거나 스크롤해서 자세히 보세요";
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+}

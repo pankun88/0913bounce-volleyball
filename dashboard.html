@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>바운스발리볼 실시간 대시보드</title>
+<link rel="stylesheet" href="css/style.css" />
+<link rel="stylesheet" href="css/bracket.css" />
+</head>
+<body>
+<div class="app-shell">
+
+  <div class="top-bar">
+    <div class="brand"><span class="emoji">🏐</span> <span id="dashTitle">바운스발리볼</span></div>
+    <span class="live-dot">실시간 중계중</span>
+  </div>
+
+  <div id="errorBanner" class="error-banner"></div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="setup">대회설정</button>
+    <button class="tab-btn" data-tab="prelim">예선</button>
+    <button class="tab-btn" data-tab="final">본선</button>
+  </div>
+
+  <!-- 대회설정 -->
+  <section class="tab-panel active" id="tab-setup">
+    <div class="card">
+      <h2>🏷️ 대회 안내</h2>
+      <p id="dashIntro" style="margin:0; color:var(--muted); font-size:14px; line-height:1.7;">대회 정보를 불러오는 중입니다…</p>
+    </div>
+    <div class="card">
+      <h2>📁 조 편성</h2>
+      <div id="dashGroupOverview" class="grid-auto"></div>
+    </div>
+  </section>
+
+  <!-- 예선 -->
+  <section class="tab-panel" id="tab-prelim">
+    <div id="dashPrelim" class="grid-auto"></div>
+  </section>
+
+  <!-- 본선 -->
+  <section class="tab-panel" id="tab-final">
+    <div class="card" id="dashBracketCard">
+      <div class="bracket-header">
+        <div class="bracket-banner"><span>🏆</span> <span id="dashBracketTitle">본선 대진표</span></div>
+        <button type="button" class="bracket-fullscreen-btn" id="dashBracketFullscreenBtn">⛶ 전체화면</button>
+      </div>
+      <div class="bracket-wrap" id="dashBracketContainer"></div>
+    </div>
+  </section>
+
+  <p class="footer-note">바운스발리볼 · 실시간 경기 결과 대시보드</p>
+</div>
+
+<script type="module" src="js/dashboard.js"></script>
+</body>
+</html>
