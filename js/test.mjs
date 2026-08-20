@@ -50,18 +50,20 @@ check('-1:5 target10 -> rejected (음수)', validateSetScore(-1, 5, 10).ok === f
 check('9.5:5 target10 -> rejected (정수 아님)', validateSetScore(9.5, 5, 10).ok === false);
 check('10:0 target10 -> ok (정상 종료)', validateSetScore(10, 0, 10).ok === true);
 check('10:8 target10 -> ok (정상 종료, 2점차)', validateSetScore(10, 8, 10).ok === true);
-check('5:3 target10 -> ok (진행중, 목표 미달)', validateSetScore(5, 3, 10).ok === true);
-check('10:9 target10 -> ok (듀스 진행중, 1점차)', validateSetScore(10, 9, 10).ok === true);
-check('10:10 target10 -> ok (듀스 진행중, 동점)', validateSetScore(10, 10, 10).ok === true);
+check('0:0 target10 -> ok (아직 입력 안 한 세트)', validateSetScore(0, 0, 10).ok === true);
+check('0:0 target7 -> ok (아직 입력 안 한 3세트)', validateSetScore(0, 0, 7).ok === true);
+check('5:3 target10 -> rejected (목표 미달, 아직 안 끝난 세트)', validateSetScore(5, 3, 10).ok === false);
+check('10:9 target10 -> rejected (듀스 1점차, 아직 안 끝남)', validateSetScore(10, 9, 10).ok === false);
+check('10:10 target10 -> rejected (듀스 동점, 아직 안 끝남)', validateSetScore(10, 10, 10).ok === false);
 check('11:9 target10 -> ok (듀스 후 2점차로 종료)', validateSetScore(11, 9, 10).ok === true);
 check('12:9 target10 -> rejected (3점차로 끝남, 2점차여야 함)', validateSetScore(12, 9, 10).ok === false);
-check('14:13 target10 -> ok (듀스 진행중, 1점차, 상한 전)', validateSetScore(14, 13, 10).ok === true);
+check('14:13 target10 -> rejected (듀스 1점차 상한 전, 아직 안 끝남)', validateSetScore(14, 13, 10).ok === false);
 check('15:13 target10 -> ok (상한에서 2점차 종료)', validateSetScore(15, 13, 10).ok === true);
 check('15:14 target10 -> ok (상한에서 1점차 종료)', validateSetScore(15, 14, 10).ok === true);
 check('15:15 target10 -> rejected (상한에서 동점)', validateSetScore(15, 15, 10).ok === false);
 check('15:12 target10 -> rejected (상한인데 3점차)', validateSetScore(15, 12, 10).ok === false);
 check('7:0 target7 -> ok (3세트 정상 종료)', validateSetScore(7, 0, 7).ok === true);
-check('6:5 target7 -> ok (3세트 진행중)', validateSetScore(6, 5, 7).ok === true);
+check('6:5 target7 -> rejected (3세트 목표 미달, 아직 안 끝남)', validateSetScore(6, 5, 7).ok === false);
 check('10:7 target7 -> rejected (3세트, 2점차 아님)', validateSetScore(10, 7, 7).ok === false);
 check('15:13 target7 -> ok (3세트도 상한 15는 동일)', validateSetScore(15, 13, 7).ok === true);
 
