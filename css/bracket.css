@@ -608,9 +608,9 @@ html.bracket-fallback-lock-scroll body {
 /* Claymorphism surface treatment for the tournament view */
 .bracket-banner {
   border: 1px solid rgba(255, 255, 255, 0.52);
-  background: linear-gradient(145deg, #ad92ee, #8265cf);
+  background: linear-gradient(145deg, var(--theme-primary-soft), var(--theme-primary));
   box-shadow:
-    5px 6px 12px rgba(98, 75, 157, 0.24),
+    5px 6px 12px var(--theme-glow),
     -4px -4px 10px rgba(255, 255, 255, 0.76),
     inset 1px 2px 2px rgba(255, 255, 255, 0.38);
 }
@@ -618,45 +618,45 @@ html.bracket-fallback-lock-scroll body {
 .bracket-wrap {
   border: 1px solid rgba(255, 255, 255, 0.6);
   background:
-    radial-gradient(circle at 12% 16%, rgba(255, 203, 177, 0.42), transparent 18rem),
-    linear-gradient(145deg, rgba(244, 234, 225, 0.92), rgba(239, 232, 240, 0.92));
+    radial-gradient(circle at 12% 16%, var(--theme-page-a), transparent 18rem),
+    linear-gradient(145deg, var(--theme-control), var(--theme-page-b));
   box-shadow: var(--shadow-inset);
 }
 
 .bracket-round-title {
   color: var(--red-dark);
   border: 1px solid rgba(255, 255, 255, 0.72);
-  background: linear-gradient(145deg, #fffaf6, #e9ddd4);
+  background: linear-gradient(145deg, var(--theme-raised-a), var(--theme-raised-b));
   box-shadow: var(--shadow-soft);
 }
 
 .match-card {
   border-color: rgba(255, 255, 255, 0.75);
-  background: linear-gradient(145deg, #fffaf6, #eadfd7);
+  background: linear-gradient(145deg, var(--theme-raised-a), var(--theme-raised-b));
   box-shadow:
-    5px 6px 12px rgba(143, 112, 91, 0.17),
+    5px 6px 12px var(--theme-shadow-color),
     -4px -4px 10px rgba(255, 255, 255, 0.86),
     inset 1px 1px 1px rgba(255, 255, 255, 0.75);
 }
 .match-card.is-done {
-  border-color: rgba(73, 169, 142, 0.6);
-  background: linear-gradient(145deg, #f7fff9, #dceee7);
+  border-color: var(--theme-primary-soft);
+  background: linear-gradient(145deg, var(--theme-raised-a), var(--theme-control-strong));
 }
 
 .bracket-line {
-  stroke: #d88468;
-  filter: drop-shadow(1px 2px 1px rgba(137, 89, 71, 0.18));
+  stroke: var(--theme-primary);
+  filter: drop-shadow(1px 2px 1px var(--theme-glow));
 }
 
 .bracket-fullscreen-btn {
   border-color: rgba(255, 255, 255, 0.72);
-  background: linear-gradient(145deg, #fffaf6, #e9ddd4);
+  background: linear-gradient(145deg, var(--theme-raised-a), var(--theme-raised-b));
   box-shadow: var(--shadow-soft);
 }
 
 .bracket-publish-bar {
-  border-color: rgba(73, 169, 142, 0.38);
-  background: linear-gradient(145deg, #f1fff8, #d9ece4);
+  border-color: var(--theme-line);
+  background: linear-gradient(145deg, var(--theme-raised-a), var(--theme-raised-b));
   box-shadow: var(--shadow-soft);
 }
 .bracket-publish-bar.is-pending {
