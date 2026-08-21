@@ -31,6 +31,15 @@ check('legacy backup migrates to women division', migratedBackup.teams[0].data.d
 check('legacy final matches migrate to women bracket', migratedBackup.finalMatches.men.length === 0 && migratedBackup.finalMatches.women.length === 1);
 check('legacy qualify count becomes division-specific', migratedBackup.info.qualifyPerGroup.women === 2);
 
+const legacyMenBackup = {
+  ...legacyBackup,
+  info: { name: '기존 남자부', qualifyPerGroup: 3 },
+};
+const migratedMenBackup = normalizeBackupData(legacyMenBackup);
+check('legacy backup migrates to men division', migratedMenBackup.teams[0].data.division === 'men');
+check('legacy final matches migrate to men bracket', migratedMenBackup.finalMatches.men.length === 1 && migratedMenBackup.finalMatches.women.length === 0);
+check('legacy men qualify count becomes division-specific', migratedMenBackup.info.qualifyPerGroup.men === 3);
+
 // ---- getSetWinner ----
 check('10:0 -> A', getSetWinner(10, 0, 10) === 'A');
 check('9:10 -> not yet (need 10 reached, 10>=10 ok, diff1 -> not decided)', getSetWinner(9, 10, 10) === null);

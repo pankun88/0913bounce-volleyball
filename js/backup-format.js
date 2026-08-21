@@ -22,7 +22,7 @@ export function normalizeBackupData(data) {
     });
     const info = data.info ? { ...data.info } : data.info;
     if (info && typeof info.qualifyPerGroup === "number") {
-      info.qualifyPerGroup = { women: info.qualifyPerGroup };
+      info.qualifyPerGroup = { [division]: info.qualifyPerGroup };
     }
 
     return {
