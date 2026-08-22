@@ -34,12 +34,66 @@ export async function runFunctionsSuite() {
     await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: created.code }), /Invalid access code/);
     assert.deepEqual(await call(functions, 'revokeRecorderAccessCode', data), { revoked: true }, 'access-code-revoke');
 
-    await call(functions, 'setupCourtWorkflow', { ...data, court: { id: 'callable-court' }, assignments: [
-      { matchKey: 'C1', matchType: 'prelim', matchId: 'C1', courtOrder: 1, nextCourtMatchKey: 'C2' },
-      { matchKey: 'C2', matchType: 'prelim', matchId: 'C2', courtOrder: 2, nextCourtMatchKey: null },
-    ] });
-    const queue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'callable-court'))));
-    assert.equal(queue.data().currentMatchKey, 'C1', 'setup-queue');
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      courts: [{ id: 'callable-court', name: 'A코트' }],
+      assignmentsByCourt: {
+        'callable-court': [
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+        ],
+      },
+    });
+    const reorderedQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'callable-court'))));
+    assert.equal(reorderedQueue.data().currentMatchKey, 'M2', 'replace-court-workflows-current');
+    assert.equal(reorderedQueue.data().nextMatchKey, 'M1', 'replace-court-workflows-next');
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('scoreWorkflows', 'M1')), {
+        draftState: 'approved',
+        officialRevision: 1,
+      }, { merge: true });
+      await setDoc(doc(db, path('courtAssignments', 'M1')), {
+        publicStatus: 'completed',
+        attemptCount: 1,
+      }, { merge: true });
+      await setDoc(doc(db, path('courtQueues', 'callable-court')), {
+        ...reorderedQueue.data(),
+        nextMatchKey: null,
+        queueRevision: reorderedQueue.data().queueRevision + 1,
+      });
+    });
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      courts: [{ id: 'callable-court', name: 'A코트 이름 변경' }],
+      assignmentsByCourt: {
+        'callable-court': [
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+        ],
+      },
+    });
+    const preservedQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'callable-court'))));
+    assert.equal(preservedQueue.data().nextMatchKey, null, 'started-queue-name-change-preserves-pointers');
+    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      courts: [{ id: 'callable-court', name: 'A코트' }],
+      assignmentsByCourt: {
+        'callable-court': [
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+        ],
+      },
+    }), /대회가 시작된 뒤에는/);
+    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      courts: [{ id: 'callable-court', name: 'A코트' }],
+      assignmentsByCourt: {
+        'callable-court': [
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+        ],
+      },
+    }), /Duplicate or invalid match assignment/);
 
     // Queue planning is the same pure core used by callable review/recovery handlers.
     const assignments = { C1: { publicStatus: 'under_review', courtOrder: 1, nextCourtMatchKey: 'C2' }, C2: { publicStatus: 'scheduled', courtOrder: 2, nextCourtMatchKey: null }, R1: { publicStatus: 'replay_required', courtOrder: 3, nextCourtMatchKey: null } };

@@ -132,14 +132,30 @@
       <pre id="recorderCodeOutput" class="empty-hint" style="display:none; margin-top:10px;"></pre>
     </div>
     <div class="card">
-      <h2>🏟️ 코트·경기 순서 설정</h2>
-      <div class="row" style="gap:8px; flex-wrap:wrap;">
-        <input id="workflowCourtId" placeholder="코트 ID (예: court-1)" />
-        <input id="workflowCourtName" placeholder="표시명 (예: 1코트)" />
-        <button class="btn primary" id="setupWorkflowBtn">workflow 설정 적용</button>
+      <h2>🏟️ 코트 관리 및 전체 순서 확인</h2>
+      <p class="empty-hint workflow-guide">
+        경기 카드에서 코트를 배정한 뒤, 여기서 코트별 실제 진행 순서를 확인·정렬하세요. 기록관은 Google 로그인과 공용 접근 코드 후 현장에서 담당 코트를 선택합니다.
+      </p>
+      <div class="workflow-court-toolbar">
+        <div id="workflowCourtTabs" class="workflow-court-tabs"></div>
+        <button type="button" class="btn small" id="workflowNewCourtBtn">+ 새 코트</button>
       </div>
-      <p class="empty-hint">경기 키를 한 줄에 하나씩 입력하세요. 예선은 경기 ID, 본선은 본선 경기 ID입니다.</p>
-      <textarea id="workflowAssignments" rows="5" style="width:100%;" placeholder="예:&#10;prelimMatchId&#10;finalMatchId"></textarea>
+      <label class="workflow-field-label" for="workflowCourtName">코트 이름</label>
+      <input id="workflowCourtName" class="workflow-court-name" placeholder="예: A코트, 1코트" />
+
+      <div class="workflow-planner">
+        <section class="workflow-pane workflow-schedule-pane" aria-labelledby="courtScheduleTitle">
+          <div class="workflow-pane-header">
+            <h3 id="courtScheduleTitle">이 코트의 경기 순서</h3>
+            <span id="workflowScheduleCount" class="workflow-count">0경기</span>
+          </div>
+          <div id="workflowScheduleList" class="workflow-match-list"></div>
+        </section>
+      </div>
+      <div class="workflow-save-row">
+        <span id="workflowPlannerHint" class="empty-hint">변경한 코트 배정과 순서를 저장하세요.</span>
+        <button class="btn primary" id="setupWorkflowBtn">코트 배정·순서 저장</button>
+      </div>
     </div>
     <div class="card">
       <h2>📝 제출 결과 검수</h2>
@@ -163,6 +179,7 @@
     <div class="card">
       <h2>📋 예선 대진 설정 <button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="모든 조의 예선 대진과 결과를 삭제합니다">초기화</button></h2>
       <p class="empty-hint" style="margin:0;">조마다 <b>라운드로빈</b>(모든 팀이 한 번씩 대결) 또는 <b>링크제</b>(도형 꼭짓점에 배치해 인접한 팀끼리만 대결) 방식을 선택하세요. 방식과 대진 생성은 아래 각 조 카드에서 진행합니다.</p>
+      <div id="prelimCourtFilters" class="court-filter-bar" aria-label="예선 경기 코트 필터"></div>
     </div>
     <div id="prelimGroups"></div>
   </section>
@@ -171,6 +188,7 @@
   <section class="tab-panel" id="tab-final">
     <div class="card">
       <h2>🏆 본선 진출팀 선택 &amp; 시드 배정</h2>
+      <div id="finalCourtFilters" class="court-filter-bar" aria-label="본선 경기 코트 필터"></div>
       <div class="settings-box row" style="margin-bottom:12px; align-items:center; justify-content:space-between;">
         <label style="font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px;">
           ⚙️ 조별 본선 진출 팀 수

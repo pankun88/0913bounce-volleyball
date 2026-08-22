@@ -591,6 +591,84 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   box-shadow: inset 0 2px 0 var(--red);
 }
 
+.court-filter-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.court-filter-chip,
+.workflow-court-tab {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--white);
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 7px 12px;
+}
+.court-filter-chip.active,
+.workflow-court-tab.active {
+  background: var(--red);
+  border-color: var(--red);
+  color: var(--white);
+}
+.court-filter-chip.attention { border-color: var(--orange); color: var(--red-dark); }
+.match-court-select {
+  min-width: 112px;
+  max-width: 150px;
+  font-size: 12px;
+  padding: 6px 8px;
+}
+.workflow-court-toolbar,
+.workflow-save-row,
+.workflow-pane-header,
+.workflow-match-item,
+.workflow-order-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.workflow-court-toolbar {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.workflow-court-tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.workflow-field-label { display: block; margin: 8px 0 5px; font-size: 13px; font-weight: 700; }
+.workflow-court-name { width: min(100%, 320px); }
+.workflow-planner { margin-top: 14px; }
+.workflow-pane { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+.workflow-pane-header { justify-content: space-between; margin-bottom: 8px; }
+.workflow-pane-header h3 { margin: 0; }
+.workflow-match-item { padding: 9px 0; border-top: 1px solid var(--line); }
+.workflow-match-info { flex: 1; min-width: 0; }
+.workflow-match-info b,
+.workflow-match-info span { display: block; }
+.workflow-match-info span { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.workflow-order { width: 24px; text-align: center; font-weight: 800; color: var(--red-dark); }
+.workflow-order-controls { margin-left: auto; }
+.workflow-icon-btn {
+  min-width: 30px;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--white);
+  color: var(--ink);
+  cursor: pointer;
+}
+.workflow-icon-btn:disabled { cursor: default; opacity: .45; }
+.workflow-empty { color: var(--muted); margin: 0; padding: 8px 0; }
+.workflow-save-row { justify-content: space-between; flex-wrap: wrap; margin-top: 12px; }
+.match-court-control { padding: 7px 4px 0; }
+@media (max-width: 620px) {
+  .match-court-select { width: 100%; max-width: none; }
+  .match-court-control { padding-top: 9px; }
+  .workflow-save-row .btn { width: 100%; }
+}
+
 /* ---- Claymorphism theme ---- */
 :root {
   --cream: #f3e8dc;

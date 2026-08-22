@@ -47,6 +47,9 @@ function matchRef(assignment) {
   if (assignment.matchType === 'final') return root().collection('divisions').doc(assignment.divisionId).collection('finalMatches').doc(assignment.matchId || assignment.matchKey);
   bad('Assignment has no official match selector.');
 }
+function finalAssignmentKey(divisionId, matchId) {
+  return `final:${divisionId}:${matchId}`;
+}
 function setWinner(a, b, target) { if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < 0 || a > 15 || b > 15) return null; const hi = Math.max(a,b); const margin=Math.abs(a-b); if (hi < target || a === b || (hi === 15 && margin > 2) || (hi > target && hi < 15 && margin !== 2) || (hi === target && margin < 2)) return null; return a > b ? 'A' : 'B'; }
 function evaluate(assignment, sets) {
   const final = assignment.matchType === 'final'; const max = final ? 3 : 2; const targets = final ? [10, 10, 7] : [10, 10]; const source = Array.isArray(sets) ? sets.slice(0, max) : [];
@@ -68,68 +71,186 @@ export async function createRecorderAccessCode(request) {
 }
 export async function rotateRecorderAccessCode(request) { const uid=await admin(request,request.data); const code=randomCode(); const salt=crypto.randomBytes(24).toString('base64url'); let version; await db().runTransaction(async(tx)=>{const snap=await tx.get(ref('recorderAccess','config')); if(!snap.exists) bad('Access code does not exist.'); version=(snap.data().version||0)+1; tx.update(snap.ref,{enabled:true,version,salt,codeHash:hash(code,salt),hashVersion:1,updatedBy:uid,updatedAt:FieldValue.serverTimestamp()}); tx.set(ref('recorderAccessChallenge','current'),{enabled:true,version});}); return {version,code}; }
 export async function revokeRecorderAccessCode(request) { const uid=await admin(request,request.data); await db().runTransaction(async(tx)=>{const snap=await tx.get(ref('recorderAccess','config')); if(!snap.exists) bad('Access code does not exist.'); const version=(snap.data().version||0)+1; tx.update(snap.ref,{enabled:false,version,updatedBy:uid,updatedAt:FieldValue.serverTimestamp()}); tx.set(ref('recorderAccessChallenge','current'),{enabled:false,version});}); return {revoked:true}; }
-export async function exchangeRecorderAccessCode(request) { requireMain(request.data); const uid=request.auth?.uid; if(!uid) throw new HttpsError('unauthenticated','Authentication required.'); const code=request.data?.code; if(typeof code !== 'string' || !code.trim()) throw new HttpsError('invalid-argument','Code required.'); return db().runTransaction(async(tx)=>{const config=await tx.get(ref('recorderAccess','config')); if(!config.exists || !config.data().enabled || !crypto.timingSafeEqual(Buffer.from(hash(code.trim(),config.data().salt)),Buffer.from(config.data().codeHash))) throw new HttpsError('permission-denied','Invalid access code.'); const version=config.data().version; tx.set(ref('recorderGrants',uid),{uid,version,proofHash:config.data().codeHash,issuedAt:FieldValue.serverTimestamp()}); return {tournamentId:TOURNAMENT_ID,grantVersion:version};}); }
-export async function setupCourtWorkflow(request) {
-  const uid = await admin(request, request.data);
-  const { court, assignments = [] } = request.data;
-  if (!court?.id) throw new HttpsError('invalid-argument', 'Court id required.');
-  const normalized = assignments.map((item, index) => {
-    if (!item.matchKey) bad('Assignment matchKey required.');
-    return {
-      ...bounded(item),
-      courtId: court.id,
-      courtOrder: item.courtOrder ?? item.order ?? index + 1,
-      nextCourtMatchKey: item.nextCourtMatchKey ?? assignments[index + 1]?.matchKey ?? null,
-      publicStatus: item.publicStatus || 'scheduled',
-      dependencyReady: item.dependencyReady !== false,
-      attemptCount: item.attemptCount || 0,
-    };
-  });
-  await db().runTransaction(async (tx) => {
-    const queueRef = ref('courtQueues', court.id);
-    const existingQueue = await tx.get(queueRef);
-    const existingWorkflows = await Promise.all(
-      normalized.map((item) => tx.get(ref('scoreWorkflows', item.matchKey))),
+export async function exchangeRecorderAccessCode(request) {
+  requireMain(request.data);
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Authentication required.');
+  const code = request.data?.code;
+  if (typeof code !== 'string' || !code.trim()) {
+    throw new HttpsError('invalid-argument', 'Code required.');
+  }
+  return db().runTransaction(async (tx) => {
+    const config = await tx.get(ref('recorderAccess', 'config'));
+    const data = config.data();
+    const suppliedHash = data ? hash(code.trim(), data.salt) : '';
+    const validHash = Boolean(
+      config.exists
+      && data.enabled
+      && suppliedHash.length === data.codeHash?.length
+      && crypto.timingSafeEqual(Buffer.from(suppliedHash), Buffer.from(data.codeHash)),
     );
-    if (existingWorkflows.some((snap) => snap.exists && (
-      snap.data().lock
-      || snap.data().draftState !== 'idle'
-      || (snap.data().submissionVersion || 0) > 0
-      || (snap.data().officialRevision || 0) > 0
-    ))) {
-      bad('Started workflows must be resolved before reordering a court.');
-    }
-    const queueRevision = existingQueue.exists ? (existingQueue.data().queueRevision || 0) + 1 : 0;
-    const setupTransitionId = `setup:${court.id}:${queueRevision}`;
-    tx.set(ref('courts', court.id), bounded(court), { merge: true });
-    const normalCursorMatchKey = normalized[0]?.matchKey || null;
-    const nextMatchKey = normalized[1]?.matchKey || null;
-    tx.set(queueRef, {
-      courtId: court.id,
-      currentMatchKey: normalCursorMatchKey,
-      nextMatchKey,
-      normalCursorMatchKey,
-      priorityEntries: [],
-      nextPrioritySequence: 0,
-      queueRevision,
-      lastTransitionId: setupTransitionId,
+    if (!validHash) throw new HttpsError('permission-denied', 'Invalid access code.');
+    const version = data.version;
+    tx.set(ref('recorderGrants', uid), {
+      uid,
+      version,
+      proofHash: data.codeHash,
+      issuedAt: FieldValue.serverTimestamp(),
     });
-    for (const item of normalized) {
-      tx.set(ref('courtAssignments', item.matchKey), item);
-      tx.set(ref('scoreWorkflows', item.matchKey), {
-        draftState: 'idle',
-        draftRevision: 0,
-        submissionVersion: 0,
-        officialRevision: 0,
-        lock: null,
+    return { tournamentId: TOURNAMENT_ID, grantVersion: version };
+  });
+}
+function startedWorkflow(workflow, assignment) {
+  return Boolean(
+    workflow?.lock
+    || ['editing', 'submitted', 'rejected', 'approved'].includes(workflow?.draftState)
+    || (workflow?.submissionVersion || 0) > 0
+    || (workflow?.officialRevision || 0) > 0
+    || (workflow?.attemptCount || 0) > 0
+    || (assignment?.attemptCount || 0) > 0,
+  );
+}
+
+export async function replaceCourtWorkflows(request) {
+  const uid = await admin(request, request.data);
+  const { courts, assignmentsByCourt } = request.data || {};
+  if (!Array.isArray(courts) || !assignmentsByCourt || typeof assignmentsByCourt !== 'object' || Array.isArray(assignmentsByCourt)) {
+    throw new HttpsError('invalid-argument', 'courts and assignmentsByCourt are required.');
+  }
+  const courtIds = new Set();
+  const normalizedCourts = courts.map((court) => {
+    if (!court?.id || typeof court.name !== 'string' || !court.name.trim() || courtIds.has(court.id)) bad('Every court needs a unique id and display name.');
+    courtIds.add(court.id);
+    return { id: String(court.id), name: court.name.trim() };
+  });
+  const desired = new Map();
+  for (const [courtId, list] of Object.entries(assignmentsByCourt)) {
+    if (!courtIds.has(courtId) || !Array.isArray(list)) bad('Assignments must belong to a registered court.');
+    list.forEach((item, index) => {
+      if (!item?.matchKey || desired.has(item.matchKey) || !['prelim', 'final'].includes(item.matchType)) bad('Duplicate or invalid match assignment.');
+      if (item.matchType === 'prelim' && !item.division) bad('Prelim assignments require division.');
+      if (item.matchType === 'final' && !item.divisionId) bad('Final assignments require divisionId.');
+      desired.set(item.matchKey, {
+        ...bounded(item),
+        matchKey: item.matchKey,
+        matchId: item.matchId || item.matchKey,
+        courtId,
+        courtOrder: index + 1,
+        nextCourtMatchKey: list[index + 1]?.matchKey || null,
+        publicStatus: item.publicStatus || 'scheduled',
+        dependencyReady: item.dependencyReady !== false,
+        attemptCount: item.attemptCount || 0,
+      });
+    });
+  }
+  await db().runTransaction(async (tx) => {
+    const [assignmentSnap, workflowSnap, queueSnap, courtSnap] = await Promise.all([
+      tx.get(root().collection('courtAssignments')),
+      tx.get(root().collection('scoreWorkflows')),
+      tx.get(root().collection('courtQueues')),
+      tx.get(root().collection('courts')),
+    ]);
+    const existingAssignments = new Map(assignmentSnap.docs.map((snap) => [snap.id, snap.data()]));
+    const existingWorkflows = new Map(workflowSnap.docs.map((snap) => [snap.id, snap.data()]));
+    const hasStartedMatches = [...existingAssignments].some(([matchKey, assignment]) => (
+      startedWorkflow(existingWorkflows.get(matchKey), assignment)
+    ));
+    if (hasStartedMatches) {
+      const assignmentLayoutUnchanged = existingAssignments.size === desired.size
+        && [...existingAssignments].every(([matchKey, assignment]) => {
+          const next = desired.get(matchKey);
+          return next
+            && next.courtId === assignment.courtId
+            && next.courtOrder === assignment.courtOrder
+            && next.nextCourtMatchKey === (assignment.nextCourtMatchKey || null);
+        });
+      const existingCourtIds = new Set(courtSnap.docs.map((snap) => snap.id));
+      const courtSetUnchanged = existingCourtIds.size === courtIds.size
+        && [...existingCourtIds].every((courtId) => courtIds.has(courtId));
+      if (!assignmentLayoutUnchanged || !courtSetUnchanged) {
+        throw new HttpsError(
+          'aborted',
+          '대회가 시작된 뒤에는 코트 배정이나 경기 순서를 변경할 수 없습니다. 진행 전 설정에서만 변경하세요.',
+        );
+      }
+      const transition = `court_names_updated:${crypto.randomUUID()}`;
+      for (const court of normalizedCourts) tx.set(ref('courts', court.id), court, { merge: true });
+      audit(tx, transition, 'court_names_updated', 'courts', uid, {
+        courts: courtSnap.docs.map((snap) => ({ id: snap.id, name: snap.data().name || snap.id })),
+      }, {
+        courts: normalizedCourts,
+      });
+      return;
+    }
+    for (const [matchKey, item] of desired) {
+      const official = await tx.get(matchRef(item));
+      if (!official.exists) bad(`Official match not found: ${matchKey}.`);
+      const officialData = official.data();
+      const hasOfficialHistory = (officialData.officialRevision || 0) > 0
+        || Boolean(officialData.result || officialData.winner || officialData.winnerTeam)
+        || ['done', 'completed'].includes(officialData.status)
+        || (Array.isArray(officialData.sets)
+          && officialData.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0));
+      if (!existingAssignments.has(matchKey) && hasOfficialHistory) {
+        throw new HttpsError(
+          'failed-precondition',
+          '이미 결과가 기록된 경기는 새 기록관 대기열에 배정할 수 없습니다. 새 대진을 생성하거나 기존 결과를 초기화하세요.',
+        );
+    }
+    }
+    const transition = `court_workflows_replaced:${crypto.randomUUID()}`;
+    for (const [matchKey, assignment] of existingAssignments) {
+      if (desired.has(matchKey)) continue;
+      tx.delete(ref('courtAssignments', matchKey));
+      tx.delete(ref('scoreWorkflows', matchKey));
+    }
+    for (const court of normalizedCourts) tx.set(ref('courts', court.id), court);
+    for (const existing of courtSnap.docs) {
+      if (!courtIds.has(existing.id)) tx.delete(existing.ref);
+    }
+    for (const queue of queueSnap.docs) {
+      if (!courtIds.has(queue.id)) tx.delete(queue.ref);
+    }
+    for (const [matchKey, item] of desired) {
+      const oldWorkflow = existingWorkflows.get(matchKey);
+      const oldAssignment = existingAssignments.get(matchKey);
+      const storedItem = oldAssignment ? {
+        ...item,
+        publicStatus: oldAssignment.publicStatus,
+        attemptCount: oldAssignment.attemptCount || 0,
+        officialRevision: oldAssignment.officialRevision || 0,
+        lastTransitionId: oldAssignment.lastTransitionId || null,
+      } : item;
+      tx.set(ref('courtAssignments', matchKey), storedItem);
+      if (!startedWorkflow(oldWorkflow, existingAssignments.get(matchKey))) {
+        tx.set(ref('scoreWorkflows', matchKey), {
+          draftState: 'idle', draftRevision: 0, submissionVersion: 0, officialRevision: 0, lock: null,
+        });
+      }
+    }
+    for (const court of normalizedCourts) {
+      const entries = [...desired.values()].filter((item) => item.courtId === court.id).sort((a, b) => a.courtOrder - b.courtOrder);
+      const previous = queueSnap.docs.find((snap) => snap.id === court.id)?.data();
+      tx.set(ref('courtQueues', court.id), {
+        courtId: court.id,
+        currentMatchKey: entries[0]?.matchKey || null,
+        nextMatchKey: entries[1]?.matchKey || null,
+        normalCursorMatchKey: entries[0]?.matchKey || null,
+        priorityEntries: [],
+        nextPrioritySequence: 0,
+        queueRevision: (previous?.queueRevision || 0) + 1,
+        lastTransitionId: transition,
       });
     }
-    audit(tx, setupTransitionId, 'court_setup', court.id, uid, null, {
-      courtId: court.id,
-      assignments: normalized.map((item) => item.matchKey),
+    audit(tx, transition, 'court_workflows_replaced', 'courts', uid, {
+      courts: courtSnap.docs.map((snap) => snap.id),
+      matchKeys: assignmentSnap.docs.map((snap) => snap.id),
+    }, {
+      courts: normalizedCourts.map((court) => court.id),
+      assignmentsByCourt: Object.fromEntries(normalizedCourts.map((court) => [court.id, [...desired.values()].filter((item) => item.courtId === court.id).map((item) => item.matchKey)])),
     });
   });
-  return { courtId: court.id };
+  return { replaced: true };
 }
 export async function publishFinalStructure(request) {
   const uid = await admin(request, request.data);
@@ -208,6 +329,7 @@ async function approve(request, direct = false) {
       official.winnerTeam = evaluated.winner === 'A' ? officialMatch.teamA : officialMatch.teamB;
       const nextMatchId = assignment.nextMatchId || officialMatch.nextMatchId;
       if (nextMatchId) {
+        const nextMatchKey = finalAssignmentKey(assignment.divisionId, nextMatchId);
         const nextRef = root().collection('divisions').doc(assignment.divisionId).collection('finalMatches').doc(nextMatchId);
         const nextSnap = await tx.get(nextRef);
         if (!nextSnap.exists) bad('Downstream final match not found.');
@@ -221,13 +343,13 @@ async function approve(request, direct = false) {
         };
         downstream = {
           ref: nextRef,
-          matchKey: nextMatchId,
+          matchKey: nextMatchKey,
           teamField,
           sourceField,
           team: official.winnerTeam,
           source: { type: 'upstream', matchKey },
         };
-        const downstreamAssignmentSnap = await tx.get(ref('courtAssignments', nextMatchId));
+        const downstreamAssignmentSnap = await tx.get(ref('courtAssignments', nextMatchKey));
         const allDependenciesReady = Boolean(postDownstreamMatch.teamA && postDownstreamMatch.teamB);
         if (downstreamAssignmentSnap.exists
             && allDependenciesReady
@@ -236,7 +358,7 @@ async function approve(request, direct = false) {
           const downstreamState = await courtState(tx, downstreamAssignment.courtId);
           const assignments = {
             ...downstreamState.assignments,
-            [nextMatchId]: { ...downstreamAssignment, dependencyReady: true },
+            [nextMatchKey]: { ...downstreamAssignment, dependencyReady: true },
           };
           const queue = activateDependencyEntries(
             {
@@ -245,7 +367,7 @@ async function approve(request, direct = false) {
             },
             assignments,
             downstreamState.workflows,
-            [nextMatchId],
+            [nextMatchKey],
           );
           dependencyActivation = {
             assignmentRef: downstreamAssignmentSnap.ref,
