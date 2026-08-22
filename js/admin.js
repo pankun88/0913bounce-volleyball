@@ -47,6 +47,7 @@ let reviewWorkflows = new Map();
 let reviewQueues = new Map();
 let reviewAudits = new Map();
 let correctionPreview = null;
+let unsubscribeWorkflowReviews = [];
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
@@ -128,7 +129,6 @@ subscribePrelimMatches((data) => {
 });
 
 rebindFinalMatches();
-subscribeWorkflowReviews();
 
 // ---------------- 연결 상태 감시 ----------------
 
@@ -198,7 +198,14 @@ function initAuthGate() {
     if (user) {
       loginScreen.style.display = "none";
       appShell.style.display = "";
+      if (!unsubscribeWorkflowReviews.length) subscribeWorkflowReviews();
     } else {
+      unsubscribeWorkflowReviews.forEach((unsubscribe) => unsubscribe());
+      unsubscribeWorkflowReviews = [];
+      reviewAssignments = [];
+      reviewWorkflows = new Map();
+      reviewQueues = new Map();
+      reviewAudits = new Map();
       loginScreen.style.display = "flex";
       appShell.style.display = "none";
       if (passwordInput) passwordInput.value = "";
@@ -357,24 +364,26 @@ function initTabs() {
 
 function subscribeWorkflowReviews() {
   const root = ["tournaments", TOURNAMENT_ID];
-  onSnapshot(collection(db, ...root, "courtAssignments"), (snap) => {
-    reviewAssignments = snap.docs.map((item) => ({ id: item.id, ...item.data() }));
-    renderScoreReviews();
-  }, (err) => reportError("검수 목록 구독", err));
-  onSnapshot(collection(db, ...root, "scoreWorkflows"), (snap) => {
-    reviewWorkflows = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
-    renderScoreReviews();
-  }, (err) => reportError("워크플로 구독", err));
-  onSnapshot(collection(db, ...root, "courtQueues"), (snap) => {
-    reviewQueues = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
-  }, (err) => reportError("코트 대기열 구독", err));
-  onSnapshot(collection(db, ...root, "auditEvents"), (snap) => {
-    reviewAudits = new Map(snap.docs
-      .map((item) => ({ id: item.id, ...item.data() }))
-      .filter((item) => item.eventType === "submission_complete")
-      .map((item) => [item.matchKey, item]));
-    renderScoreReviews();
-  }, (err) => reportError("검수 감사 로그 구독", err));
+  unsubscribeWorkflowReviews = [
+    onSnapshot(collection(db, ...root, "courtAssignments"), (snap) => {
+      reviewAssignments = snap.docs.map((item) => ({ id: item.id, ...item.data() }));
+      renderScoreReviews();
+    }, (err) => reportError("검수 목록 구독", err)),
+    onSnapshot(collection(db, ...root, "scoreWorkflows"), (snap) => {
+      reviewWorkflows = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      renderScoreReviews();
+    }, (err) => reportError("워크플로 구독", err)),
+    onSnapshot(collection(db, ...root, "courtQueues"), (snap) => {
+      reviewQueues = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+    }, (err) => reportError("코트 대기열 구독", err)),
+    onSnapshot(collection(db, ...root, "auditEvents"), (snap) => {
+      reviewAudits = new Map(snap.docs
+        .map((item) => ({ id: item.id, ...item.data() }))
+        .filter((item) => item.eventType === "submission_complete")
+        .map((item) => [item.matchKey, item]));
+      renderScoreReviews();
+    }, (err) => reportError("검수 감사 로그 구독", err)),
+  ];
 }
 
 async function runWorkflowButton(button, label, action) {

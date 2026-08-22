@@ -263,12 +263,13 @@ service cloud.firestore {
         // A current-grant recorder can fetch the single current workflow to
         // claim it, then only its owned workflow. Queries remain closed.
         allow get: if isMain(tournamentId)
-          && hasCurrentRecorderGrant(tournamentId)
-          && isCurrentMatch(tournamentId, matchKey)
-          && ((resource.data.lock == null
-                && resource.data.draftState in ['idle', 'rejected'])
-              || resource.data.lock.uid == request.auth.uid);
-        allow list: if false;
+          && (isAdmin()
+            || (hasCurrentRecorderGrant(tournamentId)
+              && isCurrentMatch(tournamentId, matchKey)
+              && ((resource.data.lock == null
+                    && resource.data.draftState in ['idle', 'rejected'])
+                  || resource.data.lock.uid == request.auth.uid)));
+        allow list: if isMain(tournamentId) && isAdmin();
         allow update: if isMain(tournamentId)
           && hasCurrentRecorderGrant(tournamentId)
           && isCurrentMatch(tournamentId, matchKey)
@@ -283,7 +284,8 @@ service cloud.firestore {
         allow create, delete: if false;
       }
       match /auditEvents/{transitionId} {
-        allow read, update, delete: if false;
+        allow read: if isMain(tournamentId) && isAdmin();
+        allow update, delete: if false;
         allow create: if isMain(tournamentId)
           && request.auth != null
           && request.resource.data.transitionId == transitionId
