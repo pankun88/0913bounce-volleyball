@@ -7,5 +7,5 @@ import { firebaseConfig } from "./firebase-config.js";
 export const firebaseApp = initializeApp(firebaseConfig);
 export const db = getFirestore(firebaseApp);
 export const auth = getAuth(firebaseApp);
-export const functions = getFunctions(firebaseApp);
+export const functions = getFunctions(firebaseApp, "asia-northeast3");
 export const isFirebaseConfigured = firebaseConfig.apiKey !== "YOUR_API_KEY";
