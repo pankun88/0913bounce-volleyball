@@ -4,8 +4,13 @@
     "ignore": [
       "firebase.json",
       "firestore.rules",
+      "firestore.indexes.json",
       ".firebaserc",
       "README.md",
+      "package.json",
+      "package-lock.json",
+      "functions/**",
+      "test/**",
       "**/.*",
       "**/node_modules/**",
       "js/test.mjs"
@@ -20,6 +25,30 @@
     ]
   },
   "firestore": {
-    "rules": "firestore.rules"
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions"
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "functions": {
+      "port": 5001
+    },
+    "hub": {
+      "port": 4400
+    },
+    "logging": {
+      "port": 4500
+    },
+    "ui": {
+      "enabled": false
+    }
   }
 }

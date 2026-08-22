@@ -22,6 +22,61 @@ export function seedOrder(n) {
 }
 
 /**
+ * Public scores are authoritative only after the approval transaction assigns an
+ * official revision. Keep this check independent from private score workflows:
+ * callers receive public match documents only.
+ */
+export function hasApprovedOfficialResult(match) {
+  return Number.isInteger(match?.officialRevision) && match.officialRevision > 0;
+}
+
+/** Return only score/result fields that may be shown to spectators or exported. */
+export function officialResultFields(match) {
+  if (!hasApprovedOfficialResult(match)) {
+    return {
+      sets: [],
+      result: null,
+      winner: null,
+      winnerSide: null,
+      winnerTeam: null,
+      setsWonA: null,
+      setsWonB: null,
+      pointsForA: null,
+      pointsForB: null,
+    };
+  }
+  return {
+    sets: Array.isArray(match.sets) ? match.sets : [],
+    result: match.result === "A" || match.result === "B" || match.result === "draw" ? match.result : null,
+    winner: match.winner === "A" || match.winner === "B" ? match.winner : null,
+    winnerSide: match.winnerSide === "A" || match.winnerSide === "B" ? match.winnerSide : null,
+    winnerTeam: match.winnerTeam || null,
+    setsWonA: Number.isFinite(match.setsWonA) ? match.setsWonA : null,
+    setsWonB: Number.isFinite(match.setsWonB) ? match.setsWonB : null,
+    pointsForA: Number.isFinite(match.pointsForA) ? match.pointsForA : null,
+    pointsForB: Number.isFinite(match.pointsForB) ? match.pointsForB : null,
+  };
+}
+
+function fixedTeamSource(team) {
+  return { type: "fixedTeam", teamId: team?.id || null };
+}
+
+function seedSource(team) {
+  const source = team?.seedSource || team?.source;
+  if (source && typeof source === "object" && (
+    source.type === "fixedTeam" || source.type === "groupRank" || source.type === "upstream"
+  )) {
+    return { ...source };
+  }
+  return fixedTeamSource(team);
+}
+
+function upstreamSource(match) {
+  return { type: "upstream", sourceKey: match.id };
+}
+
+/**
  * @param {number} matchCountInRound 이 라운드의 경기 수(대진표 슬롯 기준) - 결승/준결승 여부를
  *   판단하는 데 쓴다. 이건 부전승이 있어도 항상 정확하다(부전승도 슬롯은 그대로 차지하므로).
  * @param {number} [realTeamCount] 이 라운드에 실제로 들어오는 팀 수. 1라운드처럼 부전승으로
@@ -163,7 +218,7 @@ export function generateBracket(teamsInSeedOrder) {
     const slotB = slots[i * 2 + 1] || null;
     const isBye = !slotA || !slotB;
     const byeCandidate = isBye
-      ? (slotA ? { team: slotA, side: 'A' } : (slotB ? { team: slotB, side: 'B' } : null))
+      ? (slotA ? { team: slotA, source: seedSource(slotA), side: 'A' } : (slotB ? { team: slotB, source: seedSource(slotB), side: 'B' } : null))
       : null;
     matches.push({
       id: `m_r1_${i}`,
@@ -172,6 +227,8 @@ export function generateBracket(teamsInSeedOrder) {
       index: i,
       teamA: isBye ? null : slotA,
       teamB: isBye ? null : slotB,
+      teamASource: isBye ? null : seedSource(slotA),
+      teamBSource: isBye ? null : seedSource(slotB),
       sets: [],
       status: byeCandidate ? 'empty' : (isBye ? 'waiting' : 'pending'),
       winnerSide: null,
@@ -193,6 +250,8 @@ export function generateBracket(teamsInSeedOrder) {
         index: i,
         teamA: null,
         teamB: null,
+        teamASource: null,
+        teamBSource: null,
         sets: [],
         status: 'waiting',
         winnerSide: null,
@@ -225,6 +284,8 @@ export function resetAndPropagateByes(matches) {
     if (m.round > 1) {
       m.teamA = null;
       m.teamB = null;
+      m.teamASource = null;
+      m.teamBSource = null;
       m.status = 'waiting';
       m.sets = [];
       m.winnerSide = null;
@@ -248,6 +309,8 @@ function pushWinnerForward(match, byId) {
     if (next) {
       if (match.nextSlot === 'A') next.teamA = match.winnerTeam;
       else next.teamB = match.winnerTeam;
+      if (match.nextSlot === 'A') next.teamASource = upstreamSource(match);
+      else next.teamBSource = upstreamSource(match);
       if (next.teamA && next.teamB && next.status === 'waiting') next.status = 'pending';
     }
   }
@@ -268,8 +331,14 @@ export function placeByeTeam(matches, matchId) {
   if (!match) return { ok: false, reason: 'NOT_FOUND' };
   if (match.status !== 'empty' || !match.byeCandidate) return { ok: false, reason: 'NOT_EMPTY' };
 
-  const { team, side } = match.byeCandidate;
-  if (side === 'A') match.teamA = team; else match.teamB = team;
+  const { team, source, side } = match.byeCandidate;
+  if (side === 'A') {
+    match.teamA = team;
+    match.teamASource = source || fixedTeamSource(team);
+  } else {
+    match.teamB = team;
+    match.teamBSource = source || fixedTeamSource(team);
+  }
   match.status = 'bye_pending';
   match.byeCandidate = null;
 
@@ -358,6 +427,7 @@ export function swapFinalSeedSlots(matches, slotA, slotB) {
 
   const getTeam = (m, side) => (side === 'A' ? m.teamA : m.teamB);
   const setTeam = (m, side, team) => { if (side === 'A') m.teamA = team; else m.teamB = team; };
+  const setSource = (m, side, source) => { if (side === 'A') m.teamASource = source; else m.teamBSource = source; };
   const otherSide = (side) => (side === 'A' ? 'B' : 'A');
 
   if (mA === mB) {
@@ -365,6 +435,8 @@ export function swapFinalSeedSlots(matches, slotA, slotB) {
     const tmp = mA.teamA;
     mA.teamA = mA.teamB;
     mA.teamB = tmp;
+    mA.teamASource = fixedTeamSource(mA.teamA);
+    mA.teamBSource = fixedTeamSource(mA.teamB);
   } else {
     const teamX = getTeam(mA, slotA.side);
     const teamY = getTeam(mB, slotB.side);
@@ -376,6 +448,8 @@ export function swapFinalSeedSlots(matches, slotA, slotB) {
 
     setTeam(mA, slotA.side, teamY);
     setTeam(mB, slotB.side, teamX);
+    setSource(mA, slotA.side, fixedTeamSource(teamY));
+    setSource(mB, slotB.side, fixedTeamSource(teamX));
   }
 
   [mA, mB].forEach((m) => {

@@ -1,19 +1,308 @@
 rules_version = '2';
 
-// 관리자 페이지(admin.html)는 Firebase Authentication 이메일/비밀번호 로그인으로
-// 보호됩니다. 로그인한 사용자만 쓰기(점수 입력, 팀/조 관리 등)가 가능합니다.
-// 대시보드는 누구나 볼 수 있어야 하므로 읽기는 계속 열어둡니다.
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /tournaments/{tournamentId} {
-      allow read: if true;
-      allow write: if request.auth != null;
+    function isMain(tournamentId) {
+      return tournamentId == 'main';
+    }
 
-      // 남자부/여자부 본선 대진표처럼 여러 단계 아래에 있는 문서까지 같은 정책을 적용한다.
-      match /{document=**} {
-        allow read: if true;
-        allow write: if request.auth != null;
+    function isAdmin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/tournaments/main/admins/$(request.auth.uid));
+    }
+
+    function tournament(tournamentId) {
+      return get(/databases/$(database)/documents/tournaments/$(tournamentId));
+    }
+
+    function accessConfig(tournamentId) {
+      return get(/databases/$(database)/documents/tournaments/$(tournamentId)/recorderAccess/config);
+    }
+
+    // This deliberately uses the canonical private config, rather than the
+    // public challenge projection. Rotating or revoking the code invalidates
+    // every older grant without a client-side migration.
+    function hasCurrentRecorderGrant(tournamentId) {
+      let root = tournament(tournamentId);
+      let config = accessConfig(tournamentId);
+      let grant = get(/databases/$(database)/documents/tournaments/$(tournamentId)/recorderGrants/$(request.auth.uid));
+      return request.auth != null
+        && root.data.maintenance.enabled != true
+        && root.data.recorderFeatureEnabled == true
+        && config.data.enabled == true
+        && grant.data.uid == request.auth.uid
+        && grant.data.version == config.data.version;
+    }
+
+    function assignment(tournamentId, matchKey) {
+      return get(/databases/$(database)/documents/tournaments/$(tournamentId)/courtAssignments/$(matchKey));
+    }
+
+    function queueFor(tournamentId, matchKey) {
+      let currentAssignment = assignment(tournamentId, matchKey);
+      return get(/databases/$(database)/documents/tournaments/$(tournamentId)/courtQueues/$(currentAssignment.data.courtId));
+    }
+
+    function auditAfter(tournamentId, transitionId) {
+      return getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/auditEvents/$(transitionId));
+    }
+
+    function hasTransitionAudit(tournamentId, matchKey, eventType, reason) {
+      let transitionId = request.resource.data.lastTransitionId;
+      let event = auditAfter(tournamentId, transitionId);
+      return transitionId is string
+        && event.data.transitionId == transitionId
+        && event.data.matchKey == matchKey
+        && event.data.eventType == eventType
+        && event.data.reason == reason
+        && event.data.actor.uid == request.auth.uid
+        && event.data.createdAt == request.time;
+    }
+
+    function auditHasExistingLock(tournamentId) {
+      let event = auditAfter(tournamentId, request.resource.data.lastTransitionId);
+      return event.data.before.lock.uid == resource.data.lock.uid
+        && event.data.before.lock.token == resource.data.lock.token;
+    }
+
+    function auditHasNewLock(tournamentId) {
+      let event = auditAfter(tournamentId, request.resource.data.lastTransitionId);
+      return event.data.after.lock.uid == request.resource.data.lock.uid
+        && event.data.after.lock.token == request.resource.data.lock.token;
+    }
+
+    function isCurrentMatch(tournamentId, matchKey) {
+      let currentAssignment = assignment(tournamentId, matchKey);
+      let queue = queueFor(tournamentId, matchKey);
+      return currentAssignment.data.matchType is string
+        && queue.data.currentMatchKey == matchKey;
+    }
+
+    function ownsNewLock() {
+      return request.resource.data.lock.uid == request.auth.uid
+        && request.resource.data.lock.token is string;
+    }
+
+    function ownsExistingLock() {
+      return resource.data.lock.uid == request.auth.uid
+        && resource.data.lock.token is string
+        && request.resource.data.lock.uid == resource.data.lock.uid
+        && request.resource.data.lock.token == resource.data.lock.token;
+    }
+
+    function assignmentAfter(tournamentId, matchKey, publicStatus) {
+      let nextAssignment = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/courtAssignments/$(matchKey));
+      return nextAssignment.data.publicStatus == publicStatus
+        && nextAssignment.data.lastTransitionId == request.resource.data.lastTransitionId;
+    }
+
+    function queueUnchanged(tournamentId, matchKey) {
+      let queue = queueFor(tournamentId, matchKey);
+      let nextQueue = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/courtQueues/$(assignment(tournamentId, matchKey).data.courtId));
+      return nextQueue.data.queueRevision == queue.data.queueRevision
+        && nextQueue.data.currentMatchKey == matchKey;
+    }
+
+    function queueAdvanced(tournamentId, matchKey) {
+      let queue = queueFor(tournamentId, matchKey);
+      let nextQueue = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/courtQueues/$(assignment(tournamentId, matchKey).data.courtId));
+      return nextQueue.data.queueRevision == queue.data.queueRevision + 1
+        && nextQueue.data.currentMatchKey != matchKey
+        && nextQueue.data.lastTransitionId == request.resource.data.lastTransitionId;
+    }
+
+    function queueRecomputed(tournamentId, matchKey) {
+      let queue = queueFor(tournamentId, matchKey);
+      let nextQueue = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/courtQueues/$(assignment(tournamentId, matchKey).data.courtId));
+      return nextQueue.data.queueRevision == queue.data.queueRevision + 1
+        && nextQueue.data.lastTransitionId == request.resource.data.lastTransitionId;
+    }
+
+    // The browser can only perform these bounded, match-local transitions.
+    // All graph changes, official writes, review, and recovery are Admin SDK
+    // operations in callable Functions and therefore bypass these Rules.
+    function validClaim(tournamentId, matchKey) {
+      return (resource.data.draftState == 'idle'
+              || resource.data.draftState == 'rejected')
+        && resource.data.lock == null
+        && request.resource.data.draftState == 'editing'
+        && ownsNewLock()
+        && auditHasNewLock(tournamentId)
+        && request.resource.data.draftRevision == resource.data.draftRevision
+        && request.resource.data.officialRevision == resource.data.officialRevision
+        && assignmentAfter(tournamentId, matchKey, 'in_progress')
+        && queueUnchanged(tournamentId, matchKey)
+        && hasTransitionAudit(
+          tournamentId, matchKey,
+          resource.data.draftState == 'rejected' ? 'rejected_reclaim' : 'recorder_start',
+          resource.data.draftState == 'rejected' ? 'rejected_reclaim' : 'recorder_start');
+    }
+
+    function validDraftSave(tournamentId, matchKey) {
+      return resource.data.draftState == 'editing'
+        && request.resource.data.draftState == 'editing'
+        && ownsExistingLock()
+        && auditHasExistingLock(tournamentId)
+        && request.resource.data.draftRevision == resource.data.draftRevision + 1
+        && request.resource.data.officialRevision == resource.data.officialRevision
+        && isCurrentMatch(tournamentId, matchKey)
+        && hasTransitionAudit(tournamentId, matchKey, 'draft_save', 'draft_save');
+    }
+
+    function validCancel(tournamentId, matchKey) {
+      return resource.data.draftState == 'editing'
+        && request.resource.data.draftState in ['idle', 'rejected']
+        && resource.data.lock.uid == request.auth.uid
+        && resource.data.lock.token is string
+        && auditHasExistingLock(tournamentId)
+        && request.resource.data.lock == null
+        && request.resource.data.draftRevision == resource.data.draftRevision
+        && assignmentAfter(
+          tournamentId, matchKey,
+          request.resource.data.draftState == 'rejected' ? 'replay_required' : 'scheduled')
+        && queueRecomputed(tournamentId, matchKey)
+        && hasTransitionAudit(tournamentId, matchKey, 'recorder_cancel', 'recorder_cancel');
+    }
+
+    function validSubmit(tournamentId, matchKey) {
+      return resource.data.draftState == 'editing'
+        && request.resource.data.draftState == 'submitted'
+        && resource.data.lock.uid == request.auth.uid
+        && resource.data.lock.token is string
+        && auditHasExistingLock(tournamentId)
+        && request.resource.data.lock == null
+        && request.resource.data.submissionVersion == resource.data.submissionVersion + 1
+        && request.resource.data.draftRevision == resource.data.draftRevision
+        && assignmentAfter(tournamentId, matchKey, 'under_review')
+        && queueAdvanced(tournamentId, matchKey)
+        && hasTransitionAudit(tournamentId, matchKey, 'submission_complete', 'submission_complete');
+    }
+
+    function assignmentMatchesWorkflow(tournamentId, matchKey) {
+      let workflow = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(matchKey));
+      return (workflow.data.draftState == 'editing'
+              && request.resource.data.publicStatus == 'in_progress')
+        || (workflow.data.draftState == 'idle'
+              && request.resource.data.publicStatus == 'scheduled')
+        || (workflow.data.draftState == 'rejected'
+              && request.resource.data.publicStatus == 'replay_required')
+        || (workflow.data.draftState == 'submitted'
+              && request.resource.data.publicStatus == 'under_review');
+    }
+
+    function queueMatchesWorkflow(tournamentId, courtId) {
+      let priorQueue = get(/databases/$(database)/documents/tournaments/$(tournamentId)/courtQueues/$(courtId));
+      let currentWorkflow = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(priorQueue.data.currentMatchKey));
+      return currentWorkflow.data.draftState in ['idle', 'rejected', 'submitted']
+        && request.resource.data.queueRevision == priorQueue.data.queueRevision + 1;
+    }
+
+    match /tournaments/{tournamentId} {
+      allow read: if isMain(tournamentId);
+      allow create, delete: if false;
+      allow update: if isMain(tournamentId) && isAdmin();
+
+      match /groups/{groupId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isAdmin();
       }
+      match /teams/{teamId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isAdmin();
+      }
+      match /prelimMatches/{matchId} {
+        allow read: if isMain(tournamentId);
+        allow create: if isMain(tournamentId)
+          && isAdmin()
+          && request.resource.data.sets.size() == 0
+          && request.resource.data.status == 'pending'
+          && request.resource.data.result == null;
+        allow delete: if isMain(tournamentId) && isAdmin();
+        allow update: if isMain(tournamentId)
+          && isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'round'
+          ]);
+      }
+      match /divisions/{divisionId}/finalMatches/{matchId} {
+        allow read: if isMain(tournamentId);
+        allow write: if false;
+      }
+      match /courts/{courtId} {
+        allow read: if isMain(tournamentId);
+        allow write: if false;
+      }
+      match /courtAssignments/{matchKey} {
+        allow read: if isMain(tournamentId);
+        allow update: if isMain(tournamentId)
+          && hasCurrentRecorderGrant(tournamentId)
+          && isCurrentMatch(tournamentId, matchKey)
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['publicStatus', 'attemptCount', 'lastTransitionId'])
+          && request.resource.data.lastTransitionId is string
+          && assignmentMatchesWorkflow(tournamentId, matchKey)
+          && getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(matchKey)).data.lastTransitionId
+              == request.resource.data.lastTransitionId;
+        allow create, delete: if false;
+      }
+      match /courtQueues/{courtId} {
+        allow read: if isMain(tournamentId);
+        allow create, update, delete: if false;
+      }
+
+      match /recorderAccessChallenge/current {
+        allow read: if isMain(tournamentId);
+        allow write: if false;
+      }
+      match /recorderGrants/{uid} {
+        allow get: if isMain(tournamentId) && request.auth != null && request.auth.uid == uid;
+        allow list: if false;
+        allow create, update, delete: if false;
+      }
+      match /scoreWorkflows/{matchKey} {
+        // A current-grant recorder can fetch the single current workflow to
+        // claim it, then only its owned workflow. Queries remain closed.
+        allow get: if isMain(tournamentId)
+          && hasCurrentRecorderGrant(tournamentId)
+          && isCurrentMatch(tournamentId, matchKey)
+          && ((resource.data.lock == null
+                && resource.data.draftState in ['idle', 'rejected'])
+              || resource.data.lock.uid == request.auth.uid);
+        allow list: if false;
+        allow update: if isMain(tournamentId)
+          && hasCurrentRecorderGrant(tournamentId)
+          && isCurrentMatch(tournamentId, matchKey)
+          && ((validClaim(tournamentId, matchKey)
+                && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                  'draftState', 'resumeDraftState', 'lock', 'lastTransitionId'
+                ]))
+              || (validDraftSave(tournamentId, matchKey)
+                && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                  'draft', 'draftRevision', 'lastTransitionId'
+                ])));
+        allow create, delete: if false;
+      }
+      match /auditEvents/{transitionId} {
+        allow read, update, delete: if false;
+        allow create: if isMain(tournamentId)
+          && request.auth != null
+          && request.resource.data.transitionId == transitionId
+          && request.resource.data.actor.uid == request.auth.uid
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.matchKey is string
+          && getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(request.resource.data.matchKey)).data.lastTransitionId
+              == transitionId;
+      }
+
+      // These collections are function-private, including for seeded admins.
+      match /admins/{uid} {
+        allow get: if isMain(tournamentId) && request.auth != null && request.auth.uid == uid;
+        allow list, write: if false;
+      }
+      match /recorderAccess/{document=**} { allow read, write: if false; }
+      match /migrationManifests/{manifestId} { allow read, write: if false; }
+      match /restoreManifests/{manifestId} { allow read, write: if false; }
+      match /{document=**} { allow read, write: if false; }
     }
   }
 }

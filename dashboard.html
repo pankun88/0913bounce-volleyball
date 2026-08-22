@@ -22,26 +22,41 @@
     <button type="button" class="division-btn" data-division="women">여자부</button>
   </div>
 
-  <div class="tabs">
-    <button class="tab-btn active" data-tab="prelim">예선</button>
-    <button class="tab-btn" data-tab="final">본선</button>
-  </div>
-
-  <!-- 예선 -->
-  <section class="tab-panel active" id="tab-prelim">
-    <div id="dashPrelim" class="grid-auto"></div>
+  <section id="maintenanceNotice" class="maintenance-notice" hidden role="status">
+    <h2>대회 시스템 점검 중</h2>
+    <p>점검이 끝난 뒤 경기 결과와 코트 현황을 다시 안내합니다.</p>
   </section>
 
-  <!-- 본선 -->
-  <section class="tab-panel" id="tab-final">
-    <div class="card" id="dashBracketCard">
-      <div class="bracket-header">
-        <div class="bracket-banner"><span>🏆</span> <span id="dashBracketTitle">본선 대진표</span></div>
-        <button type="button" class="bracket-fullscreen-btn" id="dashBracketFullscreenBtn">⛶ 전체화면</button>
+  <div id="dashboardLiveContent">
+    <section class="court-status-section" aria-labelledby="courtStatusTitle">
+      <div class="court-status-heading">
+        <h2 id="courtStatusTitle">코트 현황</h2>
+        <p id="courtStatusMessage" class="court-status-message" role="status">코트 현황을 불러오는 중입니다.</p>
       </div>
-      <div class="bracket-wrap" id="dashBracketContainer"></div>
+      <div id="courtStatusCards" class="court-status-grid" aria-live="polite"></div>
+    </section>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="prelim">예선</button>
+      <button class="tab-btn" data-tab="final">본선</button>
     </div>
-  </section>
+
+    <!-- 예선 -->
+    <section class="tab-panel active" id="tab-prelim">
+      <div id="dashPrelim" class="grid-auto"></div>
+    </section>
+
+    <!-- 본선 -->
+    <section class="tab-panel" id="tab-final">
+      <div class="card" id="dashBracketCard">
+        <div class="bracket-header">
+          <div class="bracket-banner"><span>🏆</span> <span id="dashBracketTitle">본선 대진표</span></div>
+          <button type="button" class="bracket-fullscreen-btn" id="dashBracketFullscreenBtn">⛶ 전체화면</button>
+        </div>
+        <div class="bracket-wrap" id="dashBracketContainer"></div>
+      </div>
+    </section>
+  </div>
 
   <p class="footer-note">바운스발리볼 · 실시간 경기 결과 대시보드</p>
 

@@ -2,9 +2,9 @@ import {
   collection, doc, setDoc, addDoc, updateDoc, deleteDoc, getDoc, getDocs,
   onSnapshot, query, orderBy, writeBatch, serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { db } from "./firebase-init.js";
+import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
+import { db, functions } from "./firebase-init.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
-import { evaluatePrelimMatch } from "./match-logic.js";
 import { generateRoundRobin } from "./schedule.js";
 import { normalizeBackupData } from "./backup-format.js";
 
@@ -269,19 +269,6 @@ export async function generateRingMatchesForGroup(groupId, pairs) {
   await batch.commit();
 }
 
-export async function updatePrelimMatchSets(matchId, sets) {
-  const evald = evaluatePrelimMatch(sets);
-  await updateDoc(doc(prelimCol(), matchId), {
-    sets,
-    status: evald.status,
-    result: evald.result,
-    setsWonA: evald.setsWonA,
-    setsWonB: evald.setsWonB,
-    pointsForA: evald.pointsForA,
-    pointsForB: evald.pointsForB,
-  });
-}
-
 /** 경기 순서(드래그로 재배열한 결과)를 저장한다 - matchIds를 새 순서대로 넘기면 round(1부터)를 다시 매긴다 */
 export async function reorderPrelimMatches(groupId, orderedMatchIds) {
   const batch = writeBatch(db);
@@ -312,16 +299,9 @@ export function subscribePrelimMatches(cb) {
  * 기존 문서는 지우고, 새 배열은 전부 덮어쓰는 "완전 교체" 방식으로 공개한다.
  */
 export async function publishFinalBracket(division, matches) {
-  const existing = await getDocs(finalCol(division));
-  const keepIds = new Set(matches.map((m) => m.id));
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => {
-    if (!keepIds.has(d.id)) batch.delete(d.ref);
-  });
-  matches.forEach((m) => {
-    batch.set(doc(finalCol(division), m.id), m);
-  });
-  await batch.commit();
+  const callable = httpsCallable(functions, "publishFinalStructure");
+  const result = await callable({ tournamentId: TID, division, matches });
+  return result.data;
 }
 
 export function subscribeFinalMatches(division, cb) {
@@ -351,13 +331,21 @@ export async function clearFinalBracket(division) {
  * 있는" 백업 파일을 만드는 용도다.
  */
 export async function exportAllData() {
-  const [infoSnap, groups, teams, prelim, menFinal, womenFinal] = await Promise.all([
+  const root = `tournaments/${TID}`;
+  const [infoSnap, groups, teams, prelim, menFinal, womenFinal, revisions, courts, assignments, queues, workflows, audits, restores] = await Promise.all([
     getDoc(tDoc()),
     getDocs(groupsCol()),
     getDocs(teamsCol()),
     getDocs(prelimCol()),
     getDocs(finalCol("men")),
     getDocs(finalCol("women")),
+    getDocs(collection(db, root, "officialRevisions")),
+    getDocs(collection(db, root, "courts")),
+    getDocs(collection(db, root, "courtAssignments")),
+    getDocs(collection(db, root, "courtQueues")),
+    getDocs(collection(db, root, "scoreWorkflows")),
+    getDocs(collection(db, root, "auditEvents")),
+    getDocs(collection(db, root, "restoreManifests")),
   ]);
   const toArr = (snap) => snap.docs.map((d) => ({ id: d.id, data: d.data() }));
 
@@ -368,7 +356,7 @@ export async function exportAllData() {
   return {
     app: "bounce-volleyball",
     type: "backup",
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     tournamentId: TID,
     info,
@@ -379,6 +367,14 @@ export async function exportAllData() {
       men: toArr(menFinal),
       women: toArr(womenFinal),
     },
+    officialRevisions: toArr(revisions),
+    courts: toArr(courts),
+    courtAssignments: toArr(assignments),
+    courtQueues: toArr(queues),
+    scoreWorkflows: toArr(workflows),
+    auditEvents: toArr(audits),
+    restoreManifests: toArr(restores),
+    maintenance: { enabled: Boolean(info?.maintenance?.enabled) },
   };
 }
 
@@ -389,43 +385,32 @@ export async function exportAllData() {
  */
 export async function importAllData(data) {
   data = normalizeBackupData(data);
-
-  const ops = [];
-  // 1) 백업에 없는 기존 데이터만 삭제한다. 같은 문서에 delete와 set을
-  // 함께 넣으면 Firestore 배치가 거부하므로, 기존 문서는 교체 대상이면
-  // set 한 번만 수행한다.
-  const cols = [groupsCol(), teamsCol(), prelimCol(), finalCol("men"), finalCol("women")];
-  const existing = await Promise.all(cols.map((c) => getDocs(c)));
-
-  const writeCol = (col, arr) =>
-    (arr || []).forEach((item) => {
-      if (item && item.id) ops.push({ kind: "set", ref: doc(col, item.id), data: item.data || {} });
-    });
-
-  const desiredFinalMatches = data.finalMatches;
-  const desiredByCollection = [data.groups, data.teams, data.prelimMatches, desiredFinalMatches.men, desiredFinalMatches.women]
-    .map((arr) => new Set((arr || []).filter((item) => item && item.id).map((item) => item.id)));
-  existing.forEach((snap, index) => snap.docs.forEach((d) => {
-    if (!desiredByCollection[index].has(d.id)) ops.push({ kind: "delete", ref: d.ref });
-  }));
-
-  // 2) 백업 데이터 기록 (문서 ID 그대로 유지)
-  writeCol(groupsCol(), data.groups);
-  writeCol(teamsCol(), data.teams);
-  writeCol(prelimCol(), data.prelimMatches);
-  writeCol(finalCol("men"), data.finalMatches.men);
-  writeCol(finalCol("women"), data.finalMatches.women);
-
-  // 3) 배치 한도(500)를 넘지 않게 청크로 커밋
-  for (let i = 0; i < ops.length; i += 450) {
-    const batch = writeBatch(db);
-    ops.slice(i, i + 450).forEach((op) => {
-      if (op.kind === "delete") batch.delete(op.ref);
-      else batch.set(op.ref, op.data);
-    });
-    await batch.commit();
+  if (data.version !== 3) throw new Error("v3 백업만 복원할 수 있습니다. 먼저 migration manifest를 생성하세요.");
+  const root = `tournaments/${TID}`;
+  const documents = [
+    { path: root, data: { ...(data.info || {}), maintenance: data.maintenance } },
+    ...data.groups.map((item) => ({ path: `${root}/groups/${item.id}`, data: item.data })),
+    ...data.teams.map((item) => ({ path: `${root}/teams/${item.id}`, data: item.data })),
+    ...data.prelimMatches.map((item) => ({ path: `${root}/prelimMatches/${item.id}`, data: item.data })),
+    ...data.finalMatches.men.map((item) => ({ path: `${root}/divisions/men/finalMatches/${item.id}`, data: item.data })),
+    ...data.finalMatches.women.map((item) => ({ path: `${root}/divisions/women/finalMatches/${item.id}`, data: item.data })),
+    ...data.officialRevisions.map((item) => ({ path: `${root}/officialRevisions/${item.id}`, data: item.data })),
+    ...data.courts.map((item) => ({ path: `${root}/courts/${item.id}`, data: item.data })),
+    ...data.courtAssignments.map((item) => ({ path: `${root}/courtAssignments/${item.id}`, data: item.data })),
+    ...data.courtQueues.map((item) => ({ path: `${root}/courtQueues/${item.id}`, data: item.data })),
+    ...data.scoreWorkflows.map((item) => ({ path: `${root}/scoreWorkflows/${item.id}`, data: item.data })),
+    ...data.auditEvents.map((item) => ({ path: `${root}/auditEvents/${item.id}`, data: item.data })),
+    ...data.restoreManifests.map((item) => ({ path: `${root}/restoreManifests/${item.id}`, data: item.data })),
+  ];
+  const chunks = [];
+  for (let i = 0; i < documents.length; i += 200) chunks.push({ documents: documents.slice(i, i + 200) });
+  const manifestId = `restore-${Date.now()}-${crypto.randomUUID()}`;
+  const call = (name, payload) => httpsCallable(functions, name)({ tournamentId: TID, ...payload });
+  await call("beginRestore", { manifestId, chunks });
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+    await call("resumeRestore", { manifestId, chunkIndex });
   }
-
-  // 4) 대회 정보 문서 기록
-  if (data.info) await setDoc(tDoc(), data.info, { merge: false });
+  await call("verifyRestore", { manifestId });
+  await call("promoteRestore", { manifestId });
+  return { manifestId };
 }

@@ -136,6 +136,89 @@ a { color: var(--red); text-decoration: none; }
    실제 카드들이 남는 공간을 나눠 가지므로 항상 가로폭을 꽉 채운다. */
 .grid-auto { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
 
+.court-status-section {
+  margin-bottom: 20px;
+}
+
+.court-status-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 10px;
+}
+
+.court-status-heading h2 {
+  margin: 0;
+  font-size: 18px;
+  color: var(--red-dark);
+}
+
+.court-status-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.court-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+}
+
+.court-status-card {
+  background: var(--white);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px;
+}
+
+.court-status-card h3 {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-size: 16px;
+}
+
+.court-match-slot {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.court-match-slot strong {
+  color: var(--red-dark);
+  font-size: 12px;
+}
+
+.court-match-detail {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.maintenance-notice {
+  background: #fff4df;
+  border: 1px solid #e5ae58;
+  border-radius: var(--radius);
+  color: #765016;
+  padding: 22px;
+  margin-bottom: 20px;
+  text-align: center;
+}
+
+.maintenance-notice h2 {
+  margin: 0 0 8px;
+  font-size: 19px;
+}
+
+.maintenance-notice p {
+  margin: 0;
+  font-size: 14px;
+}
+
 /* 진출팀 선택의 조 블럭들을 2열 그리드로 나눠서 배치한다. 조 수가 많아질수록 한 줄로
    길게 쌓이며 화면 오른쪽이 비어 보이던 문제를 해결한다. 조 블럭 사이에 세로 구분선을
    살짝 넣어 두 칸이 헷갈리지 않게 한다. */
@@ -149,6 +232,8 @@ a { color: var(--red); text-decoration: none; }
 @media (max-width: 720px) {
   .final-team-picker-groups { grid-template-columns: 1fr; }
   .final-team-picker-groups > div { border-left: none; padding-left: 0; }
+  .court-status-heading { display: block; }
+  .court-status-message { margin-top: 4px; text-align: left; }
 }
 
 input[type="text"], input[type="number"], select {

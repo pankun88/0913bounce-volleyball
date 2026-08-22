@@ -11,35 +11,67 @@ import {
   reauthenticateWithCredential,
   updatePassword,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { auth } from "./firebase-init.js";
+import {
+  doc,
+  getDoc,
+  onSnapshot,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { auth, db } from "./firebase-init.js";
 
-/** 로그인 상태가 바뀔 때마다 cb(user|null)를 호출한다. 같은 탭에서 새로고침해도
- *  로그인은 유지되지만, 브라우저(탭)를 완전히 닫으면 세션이 사라져 다시 로그인해야 한다. */
-export function watchAuthState(cb) {
-  return onAuthStateChanged(auth, (user) => {
-    migrateStaleLocalSession(user, cb);
-  });
+const TOURNAMENT_ID = "main";
+
+function adminMembershipRef(uid) {
+  return doc(db, "tournaments", TOURNAMENT_ID, "admins", uid);
 }
 
-const MIGRATION_FLAG = "authPersistenceMigratedV1";
+/** 로그인 상태가 바뀔 때마다 cb(user|null)를 호출한다. 같은 탭에서 새로고침해도
+ *  로그인은 유지되지만, 브라우저(탭)를 완전히 닫으면 세션이 사라져 다시 로그인해야 한다.
+ *  인증 사용자라도 seeded admins/{uid} membership이 없으면 null을 전달한다. */
+export function watchAuthState(cb) {
+  let stopMembership = () => {};
+  let active = true;
 
-/** sessionPersistence를 도입하기 전(localPersistence)에 로그인해 둔 기기는
- *  브라우저를 껐다 켜도 자동 로그인이 유지된다. 기기당 한 번만 강제 로그아웃시켜
- *  이후부터는 새 세션 정책(sessionPersistence)이 적용되도록 한다. */
-function migrateStaleLocalSession(user, cb) {
-  if (user && !localStorage.getItem(MIGRATION_FLAG)) {
-    localStorage.setItem(MIGRATION_FLAG, "1");
-    signOut(auth).then(() => cb(null));
-    return;
-  }
-  localStorage.setItem(MIGRATION_FLAG, "1");
-  cb(user);
+  const stopAuth = onAuthStateChanged(auth, (user) => {
+    stopMembership();
+    stopMembership = () => {};
+
+    if (!user) {
+      cb(null);
+      return;
+    }
+
+    const uid = user.uid;
+    stopMembership = onSnapshot(
+      adminMembershipRef(uid),
+      (membership) => {
+        if (!active || auth.currentUser?.uid !== uid) return;
+        cb(membership.exists() ? auth.currentUser : null);
+      },
+      () => {
+        if (!active || auth.currentUser?.uid !== uid) return;
+        cb(null);
+      },
+    );
+  });
+
+  return () => {
+    active = false;
+    stopMembership();
+    stopAuth();
+  };
 }
 
 export async function login(email, password) {
   // 브라우저를 닫으면 로그아웃되도록 세션 단위 persistence를 사용한다.
   await setPersistence(auth, browserSessionPersistence);
-  await signInWithEmailAndPassword(auth, email, password);
+  const credential = await signInWithEmailAndPassword(auth, email, password);
+  const membership = await getDoc(adminMembershipRef(credential.user.uid));
+  if (!membership.exists()) {
+    await signOut(auth);
+    const err = new Error("관리자 권한이 없는 계정입니다.");
+    err.code = "auth/not-admin";
+    throw err;
+  }
 }
 
 export async function logout() {
@@ -83,6 +115,9 @@ export function describeAuthError(err) {
   }
   if (code.includes("network-request-failed")) {
     return "네트워크 오류로 요청에 실패했어요. 인터넷 연결을 확인해주세요.";
+  }
+  if (code.includes("not-admin") || code.includes("permission-denied")) {
+    return "관리자 권한이 없는 계정입니다.";
   }
   return "처리 중 오류가 발생했습니다." + (code ? ` (${code})` : "");
 }

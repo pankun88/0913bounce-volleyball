@@ -1,0 +1,16 @@
+:root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f4f7fb; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, select { font: inherit; }
+button, select, input { min-height: 48px; }
+button { border: 0; border-radius: 10px; padding: 11px 16px; font-weight: 700; cursor: pointer; }
+button:disabled { cursor: wait; opacity: .55; }
+.recorder-shell { max-width: 620px; margin: auto; padding: max(18px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
+.app-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+h1, h2, p { margin-top: 0; } h1 { font-size: 1.55rem; margin-bottom: 0; } h2 { font-size: 1.15rem; } .eyebrow { color: #56627a; font-size: .72rem; font-weight: 800; letter-spacing: .08em; margin-bottom: 3px; }
+.panel { background: #fff; border: 1px solid #dbe2ef; border-radius: 14px; box-shadow: 0 2px 8px #1720330d; margin: 12px 0; padding: 18px; }
+.connection-status { min-height: 1.3em; color: #70520a; font-size: .9rem; font-weight: 600; }
+label { display: block; font-weight: 700; margin: 12px 0 6px; } input, select { border: 1px solid #aeb9cb; border-radius: 9px; padding: 9px 11px; width: 100%; background: #fff; }
+.primary-button { background: #1769d1; color: #fff; } .secondary-button { background: #e7eef9; color: #163f75; } .danger-button { background: #fce8e7; color: #a4221d; } .quiet-button { background: transparent; color: #31557f; padding: 8px; min-height: 40px; }
+#accessCodeForm .primary-button { margin-top: 12px; width: 100%; }.identity { color: #344561; font-weight: 700; }.match-summary { background: #f4f7fb; border-radius: 10px; line-height: 1.55; padding: 14px; white-space: pre-line; }.notice { border-left: 4px solid #d68b12; background: #fff7e7; margin: 12px 0; padding: 10px; }.rejection { border-color: #c7352d; background: #fff0ef; }.actions { display: grid; gap: 9px; grid-template-columns: 1fr; margin-top: 16px; } fieldset { border: 0; margin: 0; padding: 0; } legend { font-weight: 800; margin: 16px 0 5px; }.score-row { display: grid; grid-template-columns: 72px 1fr 18px 1fr; align-items: center; gap: 7px; margin: 10px 0; }.score-row label { margin: 0; font-size: .9rem; }.score-row input { text-align: center; }.error { color: #b3261e; font-weight: 600; min-height: 1.3em; margin: 12px 0 0; }.confirm-score { background: #f4f7fb; border-radius: 9px; font-size: 1.1rem; font-weight: 800; padding: 13px; }
+@media (min-width: 460px) { .actions { grid-template-columns: repeat(3, 1fr); } #confirmPanel .actions { grid-template-columns: 1fr 1fr; } }

@@ -1,4 +1,4 @@
-import { groupByRound } from "./bracket.js";
+import { groupByRound, officialResultFields } from "./bracket.js";
 import { evaluateFinalMatch } from "./match-logic.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -33,11 +33,15 @@ export function renderBracket(container, matches, options = {}) {
     return;
   }
 
-  const { rounds } = groupByRound(matches);
+  // A public match can carry progress metadata, but score/result fields are
+  // renderable only after an approval revision exists. Do not read workflow or
+  // submission data here; those documents are intentionally private.
+  const publicMatches = matches.map((match) => ({ ...match, ...officialResultFields(match) }));
+  const { rounds } = groupByRound(publicMatches);
 
   // 아무 경기도 시작되지 않았을 때만(=점수가 하나도 입력되지 않았을 때만) 1라운드 카드에서
   // 팀을 드래그해 자리를 바꿀 수 있게 한다. 점수가 들어간 뒤에는 대진을 되돌리기 까다로워지므로 막는다.
-  const locked = matches.some(
+  const locked = publicMatches.some(
     (m) => (m.sets && m.sets.length) || m.status === "done" || m.status === "in_progress" || m.status === "bye"
   );
   const canSwapSlots = Boolean(options.editable && options.onSwapSlot && !locked);
@@ -134,7 +138,7 @@ export function renderBracket(container, matches, options = {}) {
   // 클릭하면 불꽃 세레모니가 재생되도록 건다. (관리자 화면은 팀명 드래그 등과 겹치므로 제외)
   if (!options.editable && decidedFinalMatch) {
     const champ = decidedFinalMatch.winnerSide === "A" ? decidedFinalMatch.teamA : decidedFinalMatch.teamB;
-    if (champ) setupChampionCeremony(track, container, matches, champ, decidedFinalMatch);
+    if (champ) setupChampionCeremony(track, container, publicMatches, champ, decidedFinalMatch);
   }
 
   // 트리를 화면에 맞춰 비율 그대로 축소/확대한다. transform: scale()을 쓰는 이유는

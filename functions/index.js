@@ -1,0 +1,29 @@
+import { getApps, initializeApp } from 'firebase-admin/app';
+import { onCall } from 'firebase-functions/v2/https';
+import * as adminWorkflow from './admin-workflow.js';
+import * as migration from './migration.js';
+import * as restore from './restore.js';
+
+if (!getApps().length) initializeApp();
+const callable = (handler) => onCall({ region: 'asia-northeast3' }, handler);
+
+export const createRecorderAccessCode = callable(adminWorkflow.createRecorderAccessCode);
+export const rotateRecorderAccessCode = callable(adminWorkflow.rotateRecorderAccessCode);
+export const revokeRecorderAccessCode = callable(adminWorkflow.revokeRecorderAccessCode);
+export const exchangeRecorderAccessCode = callable(adminWorkflow.exchangeRecorderAccessCode);
+export const setupCourtWorkflow = callable(adminWorkflow.setupCourtWorkflow);
+export const publishFinalStructure = callable(adminWorkflow.publishFinalStructure);
+export const cancelRecorderDraft = callable(adminWorkflow.cancelRecorderDraft);
+export const submitRecorderDraft = callable(adminWorkflow.submitRecorderDraft);
+export const approveScoreReview = callable(adminWorkflow.approveScoreReview);
+export const rejectScoreReview = callable(adminWorkflow.rejectScoreReview);
+export const directEditOfficialScore = callable(adminWorkflow.directEditOfficialScore);
+export const forceReleaseWorkflow = callable(adminWorkflow.forceReleaseWorkflow);
+export const previewApprovedCorrection = callable(adminWorkflow.previewApprovedCorrection);
+export const applyApprovedCorrection = callable(adminWorkflow.applyApprovedCorrection);
+export const createMigrationManifest = callable(migration.createMigrationManifest);
+export const applyMigrationManifest = callable(migration.applyMigrationManifest);
+export const beginRestore = callable(restore.beginRestore);
+export const resumeRestore = callable(restore.resumeRestore);
+export const verifyRestore = callable(restore.verifyRestore);
+export const promoteRestore = callable(restore.promoteRestore);

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>기록관 입력</title>
+  <link rel="stylesheet" href="css/recorder.css">
+</head>
+<body>
+  <main class="recorder-shell">
+    <header class="app-header">
+      <div><p class="eyebrow">BOUNCE VOLLEYBALL</p><h1>기록관 입력</h1></div>
+      <button id="logoutButton" class="quiet-button" type="button" hidden>로그아웃</button>
+    </header>
+
+    <p id="connectionStatus" class="connection-status" role="status" aria-live="polite"></p>
+    <section id="authPanel" class="panel" aria-labelledby="authTitle">
+      <h2 id="authTitle">기록관 접근</h2>
+      <p id="authMessage" role="status" aria-live="polite">Google 로그인 후 대회 공용 코드를 입력하세요.</p>
+      <p id="identity" class="identity" hidden></p>
+      <button id="googleLoginButton" class="primary-button" type="button">Google로 로그인</button>
+      <form id="accessCodeForm" hidden>
+        <label for="accessCode">대회 공용 코드</label>
+        <input id="accessCode" name="accessCode" type="password" autocomplete="one-time-code" required>
+        <button id="accessCodeButton" class="primary-button" type="submit">접근 권한 확인</button>
+      </form>
+    </section>
+
+    <section id="courtPanel" class="panel" hidden aria-labelledby="courtTitle">
+      <h2 id="courtTitle">코트 선택</h2>
+      <label for="courtSelect">담당 코트</label>
+      <select id="courtSelect"><option value="">코트를 선택하세요</option></select>
+      <p id="courtMessage" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="workflowPanel" class="panel" hidden aria-labelledby="workflowTitle">
+      <h2 id="workflowTitle">현재 경기</h2>
+      <div id="matchSummary" class="match-summary" role="status" aria-live="polite">코트를 선택하세요.</div>
+      <aside id="rejectionNotice" class="notice rejection" hidden aria-live="polite"></aside>
+      <div id="lockNotice" class="notice" hidden aria-live="polite"></div>
+      <button id="claimButton" class="primary-button" type="button" hidden>경기 입력 시작</button>
+
+      <form id="scoreForm" hidden novalidate>
+        <fieldset id="scoreFields"><legend id="scoreLegend">세트 점수</legend></fieldset>
+        <p id="scoreError" class="error" role="alert"></p>
+        <div class="actions">
+          <button id="saveButton" class="secondary-button" type="submit">임시 저장</button>
+          <button id="reviewButton" class="primary-button" type="button">작성 완료 확인</button>
+          <button id="cancelButton" class="danger-button" type="button">입력 취소</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="confirmPanel" class="panel" hidden aria-labelledby="confirmTitle">
+      <h2 id="confirmTitle">제출 전 확인</h2>
+      <p>아래 점수로 제출하면 관리자 승인 대기 상태가 되며, 코트는 다음 경기로 진행됩니다.</p>
+      <p id="confirmScore" class="confirm-score"></p>
+      <div class="actions">
+        <button id="backToEditButton" class="secondary-button" type="button">수정</button>
+        <button id="submitButton" class="primary-button" type="button">제출</button>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="js/recorder.js"></script>
+</body>
+</html>

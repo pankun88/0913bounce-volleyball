@@ -44,6 +44,7 @@
 
   <div class="tabs">
     <button class="tab-btn active" data-tab="setup">대회설정</button>
+    <button class="tab-btn" data-tab="workflow">기록·검수</button>
     <button class="tab-btn" data-tab="prelim">예선</button>
     <button class="tab-btn" data-tab="final">본선</button>
   </div>
@@ -83,12 +84,18 @@
 
     <div class="card">
       <h2>💾 데이터 백업 / 복원</h2>
-      <p class="empty-hint" style="margin:0 0 12px;">현재 전체 데이터(팀·조·예선·본선 결과·대진표)를 파일 하나로 저장하거나, 백업 파일로 되돌립니다. 기존 v1 백업 파일도 자동 변환해 복원합니다. 다음 학기에 이어서 쓰려면 지금 <b>백업 파일 저장</b>을 눌러 안전한 곳(예: 구글 드라이브)에 보관해 두세요.</p>
+      <p class="empty-hint" style="margin:0 0 12px;">v3 백업에는 대진·코트 대기열·워크플로 manifest가 포함됩니다. 복원은 서버 manifest 검증 후 적용합니다.</p>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
         <button class="btn primary" id="backupBtn">⬇️ 백업 파일 저장</button>
         <button class="btn" id="restoreBtn">⬆️ 백업 파일에서 복원</button>
         <input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none;" />
       </div>
+      <div class="row" style="gap:8px; flex-wrap:wrap; margin-top:12px;">
+        <input id="migrationManifestId" placeholder="migration manifest ID" />
+        <button class="btn" id="createMigrationBtn">migration manifest 생성</button>
+        <button class="btn primary" id="applyMigrationBtn">manifest 적용</button>
+      </div>
+      <div id="workflowStatus" class="empty-hint" style="margin-top:8px;"></div>
       <p class="empty-hint" style="margin:10px 0 0; color:#c0392b;">⚠️ 복원하면 현재 입력된 데이터가 백업 파일 내용으로 <b>전부 대체</b>됩니다.</p>
     </div>
 
@@ -110,6 +117,44 @@
       </div>
       <div id="groupTeamLists" class="grid-auto"></div>
       <p class="empty-hint" style="margin:8px 0 0;">조·팀 카드를 드래그해 순서를 바꾸거나, 팀을 다른 조로 옮길 수 있어요.</p>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="tab-workflow">
+    <div class="card">
+      <h2>🔐 기록관 접근 코드</h2>
+      <p class="empty-hint">코드는 생성·교체 때만 표시됩니다. 안전한 방법으로 기록관에게 전달하세요.</p>
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <button class="btn primary" id="createRecorderCodeBtn">접근 코드 생성</button>
+        <button class="btn" id="rotateRecorderCodeBtn">접근 코드 교체</button>
+        <button class="btn danger" id="revokeRecorderCodeBtn">접근 코드 폐기</button>
+      </div>
+      <pre id="recorderCodeOutput" class="empty-hint" style="display:none; margin-top:10px;"></pre>
+    </div>
+    <div class="card">
+      <h2>🏟️ 코트·경기 순서 설정</h2>
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <input id="workflowCourtId" placeholder="코트 ID (예: court-1)" />
+        <input id="workflowCourtName" placeholder="표시명 (예: 1코트)" />
+        <button class="btn primary" id="setupWorkflowBtn">workflow 설정 적용</button>
+      </div>
+      <p class="empty-hint">경기 키를 한 줄에 하나씩 입력하세요. 예선은 경기 ID, 본선은 본선 경기 ID입니다.</p>
+      <textarea id="workflowAssignments" rows="5" style="width:100%;" placeholder="예:&#10;prelimMatchId&#10;finalMatchId"></textarea>
+    </div>
+    <div class="card">
+      <h2>📝 제출 결과 검수</h2>
+      <p class="empty-hint">제출 검수는 코트의 current/next와 독립적으로 표시됩니다.</p>
+      <div id="scoreReviewList"></div>
+    </div>
+    <div class="card">
+      <h2>🔁 승인 결과 정정</h2>
+      <p class="empty-hint">적용 전 replay와 대기열 변경을 미리 확인합니다. 활성 경기 충돌은 적용할 수 없습니다.</p>
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <input id="correctionMatchKeys" style="flex:1; min-width:240px;" placeholder="정정할 경기 키 (쉼표로 구분)" />
+        <button class="btn" id="previewCorrectionBtn">정정 미리보기</button>
+        <button class="btn danger" id="applyCorrectionBtn" disabled>명시적으로 적용</button>
+      </div>
+      <div id="correctionPreview" class="empty-hint" style="margin-top:10px;"></div>
     </div>
   </section>
 

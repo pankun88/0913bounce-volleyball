@@ -1,0 +1,63 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isMain(tournamentId) {
+      return tournamentId == 'main';
+    }
+
+    function isSeededAdmin(tournamentId) {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/tournaments/$(tournamentId)/admins/$(request.auth.uid));
+    }
+
+    match /tournaments/{tournamentId} {
+      allow read: if isMain(tournamentId);
+      allow update: if isMain(tournamentId)
+        && isSeededAdmin(tournamentId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['schemaVersion', 'activeGeneration', 'maintenance', 'recorderFeatureEnabled']);
+      allow create, delete: if false;
+
+      // Recovery is deliberately limited to the public tournament structure.
+      // It cannot restore credentials, drafts, workflows, or audit history.
+      match /groups/{groupId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+      match /teams/{teamId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+      match /prelimMatches/{matchId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+      match /divisions/{divisionId}/finalMatches/{matchId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+      match /courts/{courtId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+      match /courtAssignments/{matchKey} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+      match /courtQueues/{courtId} {
+        allow read: if isMain(tournamentId);
+        allow write: if isMain(tournamentId) && isSeededAdmin(tournamentId);
+      }
+
+      match /admins/{uid} { allow read, write: if false; }
+      match /recorderGrants/{uid} { allow read, write: if false; }
+      match /recorderAccess/{document=**} { allow read, write: if false; }
+      match /scoreWorkflows/{matchKey} { allow read, write: if false; }
+      match /auditEvents/{transitionId} { allow read, write: if false; }
+      match /migrationManifests/{manifestId} { allow read, write: if false; }
+      match /restoreManifests/{manifestId} { allow read, write: if false; }
+      match /{document=**} { allow read, write: if false; }
+    }
+  }
+}

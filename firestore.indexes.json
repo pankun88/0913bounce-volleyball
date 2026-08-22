@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "courtAssignments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "courtId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "courtOrder",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "scoreWorkflows",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "draftState",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "updatedAt",
+          "order": "DESCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
