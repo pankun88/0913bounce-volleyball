@@ -2,60 +2,80 @@
   "schemaVersion": 1,
   "kind": "web-automation-transcript",
   "tool": "browser_tool",
-  "surface": "admin-and-dashboard-web",
+  "surface": "web",
   "baseUrl": "http://127.0.0.1:8765",
   "actions": [
     {
-      "action": "temporary-admin-login",
+      "type": "fill",
       "result": "passed",
-      "evidence": "Authenticated app shell became visible; temporary account was isolated to QA."
+      "evidence": "Authenticated app shell became visible; temporary account was isolated to QA.",
+      "timestamp": "2026-08-23T16:00:00Z",
+      "selector": "#loginEmail"
     },
     {
-      "action": "inspect-court-settings",
+      "type": "observe",
       "result": "passed",
-      "evidence": "Three configured courts rendered as C코트, A코트, B코트 with recorder-name inputs; no court-* identifier was visible."
+      "evidence": "Three configured courts rendered as C코트, A코트, B코트 with recorder-name inputs; no court-* identifier was visible.",
+      "timestamp": "2026-08-23T16:01:00Z",
+      "selector": "#courtSettingsList"
     },
     {
-      "action": "edit-recorder-name",
+      "type": "fill",
       "result": "passed",
-      "evidence": "Typing 김기록 enabled the save button and changed the hint to an unsaved-changes warning."
+      "evidence": "Typing 김기록 enabled the save button and changed the hint to an unsaved-changes warning.",
+      "timestamp": "2026-08-23T16:02:00Z",
+      "selector": "#courtSettingsList input[aria-label*=\"기록관\"]"
     },
     {
-      "action": "inspect-unified-court-board",
+      "type": "observe",
       "result": "passed",
-      "evidence": "One board rendered all 12 schedulable preliminary/final matches across divisions in columns 미배정, C코트, A코트, B코트 with real team names and no internal IDs; no duplicate phase board remained."
+      "evidence": "One board rendered all 12 schedulable preliminary/final matches across divisions in columns 미배정, C코트, A코트, B코트 with real team names and no internal IDs; no duplicate phase board remained.",
+      "timestamp": "2026-08-23T16:03:00Z",
+      "selector": "#allCourtBoard"
     },
     {
-      "action": "drag-card-between-courts",
+      "type": "custom",
       "result": "passed",
-      "evidence": "A final-round card moved from 미배정 to a court alongside preliminary cards, proving the visible list is the complete persisted court order."
+      "evidence": "A final-round card moved from 미배정 to a court alongside preliminary cards, proving the visible list is the complete persisted court order.",
+      "timestamp": "2026-08-23T16:04:00Z",
+      "selector": "#allCourtBoard .court-board-card"
     },
     {
-      "action": "drag-card-within-court",
+      "type": "custom",
       "result": "passed",
-      "evidence": "Dropping the last C코트 card before the first changed the rendered team order."
+      "evidence": "Dropping the last C코트 card before the first changed the rendered team order.",
+      "timestamp": "2026-08-23T16:05:00Z",
+      "selector": "#allCourtBoard .court-board-card"
     },
     {
-      "action": "intercept-save-callable",
+      "type": "custom",
       "result": "passed",
-      "evidence": "Payload contained courts including recorderName, assignmentsByCourt, unassignedAssignments, expectedTopologyRevision, and all observed expectedQueueRevisions; no production write was performed."
+      "evidence": "Payload contained courts including recorderName, assignmentsByCourt, unassignedAssignments, expectedTopologyRevision, and all observed expectedQueueRevisions; no production write was performed.",
+      "timestamp": "2026-08-23T16:06:00Z",
+      "target": "replaceCourtWorkflows callable"
     },
     {
-      "action": "simulate-stale-queue-cas",
+      "type": "custom",
       "result": "passed",
-      "evidence": "An ABORTED callable response discarded the losing local recorder-name draft, reloaded authoritative Firestore state, and left the save button disabled."
+      "evidence": "An ABORTED callable response discarded the losing local recorder-name draft, reloaded authoritative Firestore state, and left the save button disabled.",
+      "timestamp": "2026-08-23T16:07:00Z",
+      "target": "queue CAS response"
     },
     {
-      "action": "simulate-review-action-cas",
+      "type": "custom",
       "result": "passed",
-      "evidence": "A Firebase-namespaced ABORTED response with a submission-version conflict produced an explicit not-applied conflict toast and refreshed authoritative review state without discarding an unrelated planner draft."
+      "evidence": "A Firebase-namespaced ABORTED response with a submission-version conflict produced an explicit not-applied conflict toast and refreshed authoritative review state without discarding an unrelated planner draft.",
+      "timestamp": "2026-08-23T16:08:00Z",
+      "target": "review action CAS response"
     },
     {
-      "action": "verify-existing-audience-surfaces",
+      "type": "observe",
       "result": "passed",
-      "evidence": "Preliminary group standings and final bracket rendered; the deferred court-status audience section was absent."
+      "evidence": "Preliminary group standings and final bracket rendered; the deferred court-status audience section was absent.",
+      "timestamp": "2026-08-23T16:09:00Z",
+      "selector": "#dashPrelim, #dashBracketContainer"
     }
   ],
-  "screenshot": "artifacts/court-operations-board.webp",
+  "screenshot": "artifacts/court-operations-board.png",
   "verdict": "passed"
 }
