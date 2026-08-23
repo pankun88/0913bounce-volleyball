@@ -130,7 +130,7 @@ function attachMatch(matchKey) {
 function attachCourt(courtId) {
   stopCourtSubscriptions(); selectedCourtId = courtId; ui.workflowPanel.hidden = !courtId;
   if (!courtId) return;
-  stopCourt = subscribeCourt(courtId, (court) => { ui.courtMessage.textContent = court ? `${court.name || court.label || court.id} 선택됨` : "코트 정보를 찾을 수 없습니다."; }, (error) => { setStatus(describeError(error)); });
+  stopCourt = subscribeCourt(courtId, (court) => { ui.courtMessage.textContent = court ? `${court.name || court.label || "이름 없는 코트"} 선택됨` : "코트 정보를 찾을 수 없습니다."; }, (error) => { setStatus(describeError(error)); });
   stopQueue = onSnapshot(doc(db, "tournaments", TOURNAMENT_ID, "courtQueues", courtId), (snapshot) => { queue = snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null; if (queue?.currentMatchKey) attachMatch(queue.currentMatchKey); else { stopMatchSubscriptions(); renderWorkflow(); } }, (error) => { queue = null; setStatus(describeError(error)); renderWorkflow(); });
 }
 function startReadySubscriptions() {
@@ -146,7 +146,7 @@ function startReadySubscriptions() {
   stopCourts();
   stopCourts = onSnapshot(collection(db, "tournaments", TOURNAMENT_ID, "courts"), (snapshot) => {
     courts = snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id), "ko"));
-    ui.courtSelect.replaceChildren(new Option("코트를 선택하세요", ""), ...courts.map((court) => new Option(court.name || court.label || court.id, court.id)));
+    ui.courtSelect.replaceChildren(new Option("코트를 선택하세요", ""), ...courts.map((court) => new Option(court.name || court.label || "이름 없는 코트", court.id)));
     ui.courtSelect.value = selectedCourtId; ui.courtMessage.textContent = courts.length ? "담당 코트를 선택하세요." : "사용 가능한 코트가 없습니다.";
   }, (error) => { setStatus(describeError(error)); });
 }

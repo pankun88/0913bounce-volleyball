@@ -16,7 +16,7 @@ import { renderBracket } from "./bracket-render.js";
 import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
 import { normalizeRingOrder, getRingMatchPairs, renderRingDiagram } from "./ring-bracket.js";
 import { adminWorkflowCallable } from "./workflow-service.js";
-import { courtMatchSummary } from "./court-display.js";
+import { courtMatchSummary, courtTeamNames } from "./court-display.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
 import { planCorrectionReplay } from "./score-workflow.js";
 
@@ -401,6 +401,8 @@ function subscribeWorkflowReviews() {
       if (!workflowDirty) resetWorkflowDraft();
       renderWorkflowCourtPlanner();
       renderScoreReviews();
+      renderPrelimGroups();
+      renderFinalBracket();
     }, (err) => reportError("코트 목록 구독", err)),
     onSnapshot(collection(db, ...root, "auditEvents"), (snap) => {
       reviewAudits = new Map(snap.docs
@@ -456,11 +458,11 @@ function workflowMatchOptions() {
 function resetWorkflowDraft() {
   workflowDraftCourts = [...reviewCourts.entries()].map(([id, court]) => ({
     id,
-    name: court.name || court.displayName || id,
+    name: court.name || court.displayName || "이름 없는 코트",
   }));
   for (const assignment of reviewAssignments) {
     if (!workflowDraftCourts.some((court) => court.id === assignment.courtId)) {
-      workflowDraftCourts.push({ id: assignment.courtId, name: assignment.courtId });
+      workflowDraftCourts.push({ id: assignment.courtId, name: "코트 정보 불러오는 중" });
     }
   }
   workflowDraftAssignments = reviewAssignments.map((assignment) => ({ ...assignment, matchKey: assignment.matchKey || assignment.id }));
@@ -468,7 +470,7 @@ function resetWorkflowDraft() {
 }
 
 function workflowCourtIds() { return workflowDraftCourts.map((court) => court.id); }
-function workflowCourtName(courtId) { return workflowDraftCourts.find((court) => court.id === courtId)?.name || courtId; }
+function workflowCourtName(courtId) { return workflowDraftCourts.find((court) => court.id === courtId)?.name || "이름 없는 코트"; }
 function loadWorkflowCourt(courtId) {
   selectedWorkflowCourtId = courtId;
   const nameInput = document.getElementById("workflowCourtName");
@@ -546,7 +548,7 @@ function workflowMatchDescription(assignment, optionByKey) {
   return optionByKey.get(assignment.matchKey) || {
     ...assignment,
     label: assignment.matchType === "final" ? "본선 경기" : "예선 경기",
-    teams: assignment.matchKey,
+    teams: "경기 정보를 불러오는 중",
   };
 }
 
@@ -730,10 +732,12 @@ function scoreReviewDisplay(assignment) {
   const officialMatch = assignment.matchType === "final"
     ? reviewFinalMatchesByDivision[division]?.find((match) => match.id === assignment.matchId)
     : allPrelimMatches.find((match) => match.id === assignment.matchId);
+  const teamsById = new Map(allTeams.map((team) => [team.id, team]));
   const view = courtMatchSummary(assignment, officialMatch, {
-    teamsById: new Map(allTeams.map((team) => [team.id, team])),
+    teamsById,
     groupsById: new Map(allGroups.map((group) => [group.id, group])),
   });
+  const names = courtTeamNames(officialMatch, teamsById);
   const court = reviewCourts.get(assignment.courtId);
   return {
     heading: [
@@ -742,6 +746,8 @@ function scoreReviewDisplay(assignment) {
       view.label,
     ].filter(Boolean).join(" · "),
     teams: view.teams || "대진 정보를 불러오는 중입니다.",
+    teamA: names?.a || "A팀",
+    teamB: names?.b || "B팀",
   };
 }
 
@@ -823,9 +829,10 @@ function renderScoreReviews() {
 
 function openAdminScoreModal(assignment, workflow) {
   const final = assignment.matchType === "final";
+  const display = scoreReviewDisplay(assignment);
   openScoreModal({
-    teamAName: "관리자 직접 수정",
-    teamBName: assignment.id,
+    teamAName: display.teamA,
+    teamBName: display.teamB,
     setLabels: final ? ["1세트 (10점)", "2세트 (10점)", "3세트 (7점)"] : ["1세트 (10점)", "2세트 (10점)"],
     targets: final ? [10, 10, 7] : [10, 10],
     existingSets: workflow.submittedSnapshot?.sets || workflow.draft?.sets || [],
@@ -1042,7 +1049,12 @@ function bindStaticHandlers() {
     if (!result) return;
     correctionPreview = { matchKeys, result };
     const active = matchKeys.filter((key) => reviewWorkflows.get(key)?.lock);
-    const targetText = (result.targets || []).map((target) => `${target.matchKey} (${target.courtId})`).join(", ");
+    const targetText = (result.targets || []).map((target) => {
+      const assignment = reviewAssignments.find((item) => item.id === target.matchKey);
+      if (!assignment) return "경기 정보 불러오는 중";
+      const display = scoreReviewDisplay(assignment);
+      return `${display.heading} (${display.teams})`;
+    }).join(", ");
     const courtId = result.targets?.[0]?.courtId;
     const queue = reviewQueues.get(courtId);
     correctionPreview.expectedQueueRevision = queue?.queueRevision;
