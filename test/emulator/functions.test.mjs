@@ -27,11 +27,11 @@ export async function runFunctionsSuite() {
 
     const created = await call(functions, 'createRecorderAccessCode', data);
     assert.equal(created.version, 1, 'access-code-create');
-    const exchanged = await call(functions, 'exchangeRecorderAccessCode', { ...data, code: created.code });
-    assert.equal(exchanged.grantVersion, 1, 'access-code-exchange');
-    const rotated = await call(functions, 'rotateRecorderAccessCode', data);
-    assert.equal(rotated.version, 2, 'access-code-rotate');
+    const reissued = await call(functions, 'createRecorderAccessCode', data);
+    assert.equal(reissued.version, 2, 'access-code-reissue');
     await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: created.code }), /Invalid access code/);
+    const exchanged = await call(functions, 'exchangeRecorderAccessCode', { ...data, code: reissued.code });
+    assert.equal(exchanged.grantVersion, 2, 'access-code-exchange-reissued');
     assert.deepEqual(await call(functions, 'revokeRecorderAccessCode', data), { revoked: true }, 'access-code-revoke');
 
     await call(functions, 'replaceCourtWorkflows', {

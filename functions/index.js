@@ -8,7 +8,6 @@ if (!getApps().length) initializeApp();
 const callable = (handler) => onCall({ region: 'asia-northeast3' }, handler);
 
 export const createRecorderAccessCode = callable(adminWorkflow.createRecorderAccessCode);
-export const rotateRecorderAccessCode = callable(adminWorkflow.rotateRecorderAccessCode);
 export const revokeRecorderAccessCode = callable(adminWorkflow.revokeRecorderAccessCode);
 export const exchangeRecorderAccessCode = callable(adminWorkflow.exchangeRecorderAccessCode);
 export const replaceCourtWorkflows = callable(adminWorkflow.replaceCourtWorkflows);

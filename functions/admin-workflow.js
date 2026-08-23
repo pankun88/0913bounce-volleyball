@@ -66,10 +66,17 @@ async function courtState(tx, courtId) {
 }
 export async function createRecorderAccessCode(request) {
   const uid = await admin(request, request.data); const code = randomCode(); const salt = crypto.randomBytes(24).toString('base64url');
-  await db().runTransaction(async (tx) => { const config = await tx.get(ref('recorderAccess', 'config')); if (config.exists) bad('Access code already exists; rotate it instead.'); const version = 1; tx.create(ref('recorderAccess', 'config'), { enabled:true, version, salt, codeHash:hash(code,salt), hashVersion:1, updatedBy:uid, updatedAt:FieldValue.serverTimestamp() }); tx.set(ref('recorderAccessChallenge', 'current'), { enabled:true, version }); });
-  return { version:1, code };
+  let version;
+  await db().runTransaction(async (tx) => {
+    const config = await tx.get(ref('recorderAccess', 'config'));
+    version = config.exists ? (config.data().version || 0) + 1 : 1;
+    const data = { enabled:true, version, salt, codeHash:hash(code,salt), hashVersion:1, updatedBy:uid, updatedAt:FieldValue.serverTimestamp() };
+    if (config.exists) tx.update(config.ref, data);
+    else tx.create(ref('recorderAccess', 'config'), data);
+    tx.set(ref('recorderAccessChallenge', 'current'), { enabled:true, version });
+  });
+  return { version, code };
 }
-export async function rotateRecorderAccessCode(request) { const uid=await admin(request,request.data); const code=randomCode(); const salt=crypto.randomBytes(24).toString('base64url'); let version; await db().runTransaction(async(tx)=>{const snap=await tx.get(ref('recorderAccess','config')); if(!snap.exists) bad('Access code does not exist.'); version=(snap.data().version||0)+1; tx.update(snap.ref,{enabled:true,version,salt,codeHash:hash(code,salt),hashVersion:1,updatedBy:uid,updatedAt:FieldValue.serverTimestamp()}); tx.set(ref('recorderAccessChallenge','current'),{enabled:true,version});}); return {version,code}; }
 export async function revokeRecorderAccessCode(request) { const uid=await admin(request,request.data); await db().runTransaction(async(tx)=>{const snap=await tx.get(ref('recorderAccess','config')); if(!snap.exists) bad('Access code does not exist.'); const version=(snap.data().version||0)+1; tx.update(snap.ref,{enabled:false,version,updatedBy:uid,updatedAt:FieldValue.serverTimestamp()}); tx.set(ref('recorderAccessChallenge','current'),{enabled:false,version});}); return {revoked:true}; }
 export async function exchangeRecorderAccessCode(request) {
   requireMain(request.data);

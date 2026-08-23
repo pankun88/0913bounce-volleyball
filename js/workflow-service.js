@@ -92,7 +92,6 @@ export async function submitDraft({ matchKey, courtId, token, queueRevision, sco
 
 export function adminWorkflowCallable(name, data = {}) { return httpsCallable(functions, name)({ tournamentId: TOURNAMENT_ID, ...data }); }
 export const createRecorderAccessCode = (data) => adminWorkflowCallable('createRecorderAccessCode', data);
-export const rotateRecorderAccessCode = (data) => adminWorkflowCallable('rotateRecorderAccessCode', data);
 export const revokeRecorderAccessCode = (data) => adminWorkflowCallable('revokeRecorderAccessCode', data);
 export const approveScoreReview = (data) => adminWorkflowCallable('approveScoreReview', data);
 export const rejectScoreReview = (data) => adminWorkflowCallable('rejectScoreReview', data);

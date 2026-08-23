@@ -942,15 +942,7 @@ function bindStaticHandlers() {
   document.getElementById("restoreFileInput").addEventListener("change", handleRestoreFile);
 
   document.getElementById("createRecorderCodeBtn").addEventListener("click", async (e) => {
-    const result = await runWorkflowButton(e.currentTarget, "접근 코드 생성", () => adminWorkflowCallable("createRecorderAccessCode"));
-    if (result?.code) {
-      const output = document.getElementById("recorderCodeOutput");
-      output.textContent = `접근 코드: ${result.code}`;
-      output.style.display = "";
-    }
-  });
-  document.getElementById("rotateRecorderCodeBtn").addEventListener("click", async (e) => {
-    const result = await runWorkflowButton(e.currentTarget, "접근 코드 교체", () => adminWorkflowCallable("rotateRecorderAccessCode"));
+    const result = await runWorkflowButton(e.currentTarget, "접근 코드 생성/재발급", () => adminWorkflowCallable("createRecorderAccessCode"));
     if (result?.code) {
       const output = document.getElementById("recorderCodeOutput");
       output.textContent = `새 접근 코드: ${result.code}`;
