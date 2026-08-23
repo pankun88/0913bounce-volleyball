@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { assertFails, assertSucceeds } from '@firebase/rules-unit-testing';
-import { doc, getDoc, writeBatch, serverTimestamp, updateDoc, setDoc } from 'firebase/firestore';
+import { deleteField, doc, getDoc, writeBatch, serverTimestamp, updateDoc, setDoc } from 'firebase/firestore';
 import { createFixture, IDS, path } from './fixtures.mjs';
 
 const audit = (batch, db, id, eventType, matchKey, uid, before, after) => batch.set(doc(db, path('auditEvents', id)), { transitionId: id, eventType, reason: eventType, matchKey, actor: { uid }, before, after, createdAt: serverTimestamp() });
@@ -16,6 +16,17 @@ export async function runRulesSuite() {
     await assertFails(getDoc(doc(f.staleRecorder(), path('scoreWorkflows', 'M1'))));
 
     const db = f.recorder();
+    await f.seed(async (admin) => {
+      await updateDoc(doc(admin, 'tournaments/main'), { maintenance: deleteField() });
+    });
+    await assertSucceeds(getDoc(doc(db, path('scoreWorkflows', 'M1'))));
+    await f.seed(async (admin) => {
+      await updateDoc(doc(admin, 'tournaments/main'), { maintenance: { enabled: true } });
+    });
+    await assertFails(getDoc(doc(db, path('scoreWorkflows', 'M1'))));
+    await f.seed(async (admin) => {
+      await updateDoc(doc(admin, 'tournaments/main'), { maintenance: { enabled: false } });
+    });
     const claim = writeBatch(db); const transitionId = 'M1:recorder_start:0';
     audit(claim, db, transitionId, 'recorder_start', 'M1', IDS.recorder, { lock: null }, { lock: { uid: IDS.recorder, token: 'lock-1' } });
     claim.update(doc(db, path('scoreWorkflows', 'M1')), { draftState: 'editing', lock: { uid: IDS.recorder, token: 'lock-1' }, lastTransitionId: transitionId });

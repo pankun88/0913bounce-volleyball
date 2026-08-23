@@ -27,7 +27,7 @@ service cloud.firestore {
       let config = accessConfig(tournamentId);
       let grant = get(/databases/$(database)/documents/tournaments/$(tournamentId)/recorderGrants/$(request.auth.uid));
       return request.auth != null
-        && root.data.maintenance.enabled != true
+        && root.data.get('maintenance', {}).get('enabled', false) != true
         && root.data.recorderFeatureEnabled == true
         && config.data.enabled == true
         && grant.data.uid == request.auth.uid
