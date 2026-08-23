@@ -21,8 +21,9 @@ async function admin(context, data) {
   if (!(await ref('admins', context.auth.uid).get()).exists) throw new HttpsError('permission-denied', 'Seeded administrator required.');
   return context.auth.uid;
 }
-function audit(tx, id, eventType, matchKey, uid, before, after, reason = eventType) {
-  tx.create(ref('auditEvents', id), { transitionId: id, eventType, reason, matchKey, actor: { uid }, before: bounded(before), after: bounded(after), createdAt: FieldValue.serverTimestamp() });
+function audit(tx, id, eventType, matchKey, identity, before, after, reason = eventType) {
+  const actor = typeof identity === 'object' ? bounded(identity) : { uid: identity };
+  tx.create(ref('auditEvents', id), { transitionId: id, eventType, reason, matchKey, actor, before: bounded(before), after: bounded(after), createdAt: FieldValue.serverTimestamp() });
 }
 async function recorder(tx, uid) {
   if (!uid) throw new HttpsError('unauthenticated', 'Authentication required.');
@@ -518,7 +519,11 @@ export async function submitRecorderDraft(request) {
     });
     tx.update(ref('courtAssignments', matchKey), { publicStatus: 'under_review', lastTransitionId: id });
     tx.update(ref('courtQueues', courtId), { ...queue, lastTransitionId: id });
-    audit(tx, id, 'submission_complete', matchKey, uid, { workflow, queue: state.queue }, { workflow: { ...workflow, draftState: 'submitted', lock: null, submissionVersion }, queue });
+    audit(tx, id, 'submission_complete', matchKey, {
+      uid,
+      name: request.auth?.token?.name || null,
+      email: request.auth?.token?.email || null,
+    }, { workflow, queue: state.queue }, { workflow: { ...workflow, draftState: 'submitted', lock: null, submissionVersion }, queue });
     return { transitionId: id, queueRevision: queue.queueRevision, nextMatchKey: queue.currentMatchKey };
   });
 }

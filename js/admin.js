@@ -16,6 +16,7 @@ import { renderBracket } from "./bracket-render.js";
 import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
 import { normalizeRingOrder, getRingMatchPairs, renderRingDiagram } from "./ring-bracket.js";
 import { adminWorkflowCallable } from "./workflow-service.js";
+import { courtMatchSummary } from "./court-display.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
 import { planCorrectionReplay } from "./score-workflow.js";
 
@@ -47,6 +48,7 @@ let reviewWorkflows = new Map();
 let reviewQueues = new Map();
 let reviewCourts = new Map();
 let reviewAudits = new Map();
+const reviewFinalMatchesByDivision = { men: [], women: [] };
 let correctionPreview = null;
 let unsubscribeWorkflowReviews = [];
 let selectedWorkflowCourtId = null;
@@ -70,6 +72,7 @@ function refreshActiveDivisionData() {
   renderPrelimGroups();
   renderFinalTeamPicker();
   renderWorkflowCourtPlanner();
+  renderScoreReviews();
 }
 
 function rebindFinalMatches() {
@@ -216,6 +219,8 @@ function initAuthGate() {
       reviewQueues = new Map();
       reviewCourts = new Map();
       reviewAudits = new Map();
+      reviewFinalMatchesByDivision.men = [];
+      reviewFinalMatchesByDivision.women = [];
       loginScreen.style.display = "flex";
       appShell.style.display = "none";
       if (passwordInput) passwordInput.value = "";
@@ -395,6 +400,7 @@ function subscribeWorkflowReviews() {
       reviewCourts = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
       if (!workflowDirty) resetWorkflowDraft();
       renderWorkflowCourtPlanner();
+      renderScoreReviews();
     }, (err) => reportError("코트 목록 구독", err)),
     onSnapshot(collection(db, ...root, "auditEvents"), (snap) => {
       reviewAudits = new Map(snap.docs
@@ -403,6 +409,10 @@ function subscribeWorkflowReviews() {
         .map((item) => [item.matchKey, item]));
       renderScoreReviews();
     }, (err) => reportError("검수 감사 로그 구독", err)),
+    ...Object.keys(reviewFinalMatchesByDivision).map((division) => subscribeFinalMatches(division, (matches) => {
+      reviewFinalMatchesByDivision[division] = matches;
+      renderScoreReviews();
+    })),
   ];
 }
 
@@ -715,6 +725,26 @@ function formatSets(score) {
   return (score?.sets || []).map((set) => `${set.a}:${set.b}`).join(" / ") || "점수 없음";
 }
 
+function scoreReviewDisplay(assignment) {
+  const division = assignment.divisionId || assignment.division || "men";
+  const officialMatch = assignment.matchType === "final"
+    ? reviewFinalMatchesByDivision[division]?.find((match) => match.id === assignment.matchId)
+    : allPrelimMatches.find((match) => match.id === assignment.matchId);
+  const view = courtMatchSummary(assignment, officialMatch, {
+    teamsById: new Map(allTeams.map((team) => [team.id, team])),
+    groupsById: new Map(allGroups.map((group) => [group.id, group])),
+  });
+  const court = reviewCourts.get(assignment.courtId);
+  return {
+    heading: [
+      court?.name || court?.displayName || "코트 미정",
+      DIVISION_LABELS[division] || division,
+      view.label,
+    ].filter(Boolean).join(" · "),
+    teams: view.teams || "대진 정보를 불러오는 중입니다.",
+  };
+}
+
 function renderScoreReviews() {
   const root = document.getElementById("scoreReviewList");
   if (!root) return;
@@ -730,12 +760,14 @@ function renderScoreReviews() {
   }
   submitted.forEach((assignment) => {
     const workflow = reviewWorkflows.get(assignment.id);
+    const display = scoreReviewDisplay(assignment);
     const row = document.createElement("div");
     row.className = "row";
     row.style.cssText = "padding:10px 0; border-bottom:1px solid var(--line); gap:8px; flex-wrap:wrap;";
     const audit = reviewAudits.get(assignment.id);
     const submittedAt = audit?.createdAt?.toDate?.()?.toLocaleString?.() || workflow.submittedAt?.toDate?.()?.toLocaleString?.() || workflow.updatedAt?.toDate?.()?.toLocaleString?.() || "시간 정보 없음";
-    row.innerHTML = `<div style="flex:1; min-width:220px;"><b>${escapeHtml(assignment.id)}</b><br><span class="empty-hint">작성자: ${escapeHtml(audit?.actor?.uid || workflow.submittedBy?.uid || workflow.lock?.ownerUid || "기록관")} · ${escapeHtml(submittedAt)} · ${escapeHtml(formatSets(workflow.submittedSnapshot || workflow.draft))}</span></div>`;
+    const author = audit?.actor?.name || workflow.submittedBy?.name || "기록관";
+    row.innerHTML = `<div style="flex:1; min-width:220px;"><b>${escapeHtml(display.heading)}</b><br><span>${escapeHtml(display.teams)}</span><br><span class="empty-hint">작성자: ${escapeHtml(author)} · ${escapeHtml(submittedAt)} · ${escapeHtml(formatSets(workflow.submittedSnapshot || workflow.draft))}</span></div>`;
     const approve = document.createElement("button");
     approve.className = "btn primary small";
     approve.textContent = "승인";

@@ -29,8 +29,10 @@ let venueConfigKey = "";
 let venueDisplayLocked = isVenueMode;
 let courtQueues = [];
 let courtAssignments = [];
+let courtDefinitions = new Map();
 let courtQueuesLoaded = false;
 let courtAssignmentsLoaded = false;
+let courtDefinitionsLoaded = false;
 let isOffline = !navigator.onLine;
 let maintenanceActive = false;
 let courtStatusError = false;
@@ -89,6 +91,12 @@ window.addEventListener("offline", () => {
 
 function subscribeCourtStatus() {
   const base = ["tournaments", TOURNAMENT_ID];
+  onSnapshot(collection(db, ...base, "courts"), (snap) => {
+    courtDefinitionsLoaded = true;
+    courtStatusError = false;
+    courtDefinitions = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+    renderCourtStatus();
+  }, (err) => handleCourtStatusError("코트 목록", err));
   onSnapshot(collection(db, ...base, "courtQueues"), (snap) => {
     courtQueuesLoaded = true;
     courtStatusError = false;
@@ -200,7 +208,7 @@ function renderCourtStatus() {
     message.textContent = "코트 현황을 불러오지 못했습니다. 연결 상태를 확인해주세요.";
   } else if (isOffline) {
     message.textContent = "오프라인 상태입니다. 마지막으로 받은 코트 현황을 표시합니다.";
-  } else if (!courtQueuesLoaded || !courtAssignmentsLoaded) {
+  } else if (!courtDefinitionsLoaded || !courtQueuesLoaded || !courtAssignmentsLoaded) {
     message.textContent = "코트 현황을 불러오는 중입니다.";
   } else if (!courtQueues.length) {
     message.textContent = "등록된 코트 대기열이 없습니다.";
@@ -213,7 +221,7 @@ function renderCourtStatus() {
     cards.appendChild(courtHint("코트 현황을 불러오지 못했습니다."));
     return;
   }
-  if (!courtQueuesLoaded || !courtAssignmentsLoaded) {
+  if (!courtDefinitionsLoaded || !courtQueuesLoaded || !courtAssignmentsLoaded) {
     cards.appendChild(courtHint("코트 정보를 불러오는 중입니다."));
     return;
   }
@@ -231,7 +239,8 @@ function renderCourtStatus() {
     const card = document.createElement("article");
     card.className = "court-status-card";
     const title = document.createElement("h3");
-    title.textContent = queue.courtName || queue.name || `${queue.id} 코트`;
+    const court = courtDefinitions.get(queue.id);
+    title.textContent = court?.name || court?.displayName || "이름 없는 코트";
     card.appendChild(title);
     card.append(
       courtMatchSlot("현재", queue.currentMatchKey, assignmentsByKey.get(queue.currentMatchKey), lookups),
