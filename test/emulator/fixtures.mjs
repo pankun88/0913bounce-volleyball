@@ -20,7 +20,11 @@ export async function createFixture() {
     await db.doc('tournaments/main/recorderAccessChallenge/current').set({ enabled: true, version: 2 });
     await db.doc(`tournaments/main/recorderGrants/${IDS.recorder}`).set({ uid: IDS.recorder, version: 2, proofHash: 'seed-hash' });
     await db.doc(`tournaments/main/recorderGrants/${IDS.stale}`).set({ uid: IDS.stale, version: 1, proofHash: 'old-hash' });
-    await db.doc('tournaments/main/courts/court-1').set({ id: 'court-1', name: 'Court 1' });
+    await db.doc('tournaments/main/courts/court-1').set({
+      id: 'court-1',
+      name: 'Court 1',
+      recorderName: 'Recorder One',
+    });
     await db.doc('tournaments/main/prelimMatches/M1').set({ id: 'M1', status: 'scheduled' });
     await db.doc('tournaments/main/prelimMatches/M2').set({ id: 'M2', status: 'scheduled' });
     await db.doc('tournaments/main/courtAssignments/M1').set(assignment('M1', 1));
@@ -44,7 +48,10 @@ export async function createFixture() {
       });
       return result;
     },
-    cleanup: () => env.cleanup(),
+    cleanup: async () => {
+      await env.clearFirestore();
+      await env.cleanup();
+    },
   };
 }
 

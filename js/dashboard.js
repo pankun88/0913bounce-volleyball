@@ -5,10 +5,6 @@ import {
 import { evaluatePrelimMatch, computeGroupStandings } from "./match-logic.js";
 import { renderBracket, displayTeamName } from "./bracket-render.js";
 import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
-import { courtMatchSummary } from "./court-display.js";
-import { collection, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { db } from "./firebase-init.js";
-import { TOURNAMENT_ID } from "./firebase-config.js";
 
 const DIVISIONS = ["men", "women"];
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
@@ -27,15 +23,7 @@ let activeTab = requestedTab;
 let venueTimer = null;
 let venueConfigKey = "";
 let venueDisplayLocked = isVenueMode;
-let courtQueues = [];
-let courtAssignments = [];
-let courtDefinitions = new Map();
-let courtQueuesLoaded = false;
-let courtAssignmentsLoaded = false;
-let courtDefinitionsLoaded = false;
-let isOffline = !navigator.onLine;
 let maintenanceActive = false;
-let courtStatusError = false;
 
 initTabs();
 initDivisionSwitch();
@@ -74,50 +62,8 @@ DIVISIONS.forEach((division) => {
   subscribeFinalMatches(division, (data) => {
     finalMatchesByDivision[division] = data;
     if (division === activeDivision) renderFinalBracket();
-    renderCourtStatus();
   });
 });
-
-subscribeCourtStatus();
-
-window.addEventListener("online", () => {
-  isOffline = false;
-  renderCourtStatus();
-});
-window.addEventListener("offline", () => {
-  isOffline = true;
-  renderCourtStatus();
-});
-
-function subscribeCourtStatus() {
-  const base = ["tournaments", TOURNAMENT_ID];
-  onSnapshot(collection(db, ...base, "courts"), (snap) => {
-    courtDefinitionsLoaded = true;
-    courtStatusError = false;
-    courtDefinitions = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
-    renderCourtStatus();
-  }, (err) => handleCourtStatusError("코트 목록", err));
-  onSnapshot(collection(db, ...base, "courtQueues"), (snap) => {
-    courtQueuesLoaded = true;
-    courtStatusError = false;
-    courtQueues = snap.docs.map((item) => ({ id: item.id, ...item.data() }));
-    renderCourtStatus();
-  }, (err) => handleCourtStatusError("코트 대기열", err));
-  onSnapshot(collection(db, ...base, "courtAssignments"), (snap) => {
-    courtAssignmentsLoaded = true;
-    courtStatusError = false;
-    courtAssignments = snap.docs.map((item) => ({ id: item.id, ...item.data() }));
-    renderCourtStatus();
-  }, (err) => handleCourtStatusError("코트 경기 배정", err));
-}
-
-function handleCourtStatusError(label, err) {
-  courtStatusError = true;
-  showErrorBanner(`⚠️ ${label} 구독에 실패했습니다. 코트 현황을 최신 상태로 표시할 수 없습니다.`);
-  const message = document.getElementById("courtStatusMessage");
-  if (message) message.textContent = "코트 현황을 불러오지 못했습니다. 연결 상태를 확인해주세요.";
-  console.error(`[Firestore] ${label} 오류:`, err);
-}
 
 function divisionData(division = activeDivision) {
   const groups = allGroups.filter((group) => group.division === division);
@@ -180,7 +126,6 @@ function renderActiveDivision() {
   document.getElementById("dashBracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${label} 본선 대진표`;
   renderPrelim();
   renderFinalBracket();
-  renderCourtStatus();
 }
 
 function setMaintenanceMode() {
@@ -192,111 +137,7 @@ function setMaintenanceMode() {
   if (maintenanceActive) {
     document.getElementById("dashPrelim").replaceChildren();
     document.getElementById("dashBracketContainer").replaceChildren();
-    document.getElementById("courtStatusCards").replaceChildren();
-  } else {
-    renderCourtStatus();
   }
-}
-
-function renderCourtStatus() {
-  if (maintenanceActive) return;
-  const cards = document.getElementById("courtStatusCards");
-  const message = document.getElementById("courtStatusMessage");
-  if (!cards || !message) return;
-
-  if (courtStatusError) {
-    message.textContent = "코트 현황을 불러오지 못했습니다. 연결 상태를 확인해주세요.";
-  } else if (isOffline) {
-    message.textContent = "오프라인 상태입니다. 마지막으로 받은 코트 현황을 표시합니다.";
-  } else if (!courtDefinitionsLoaded || !courtQueuesLoaded || !courtAssignmentsLoaded) {
-    message.textContent = "코트 현황을 불러오는 중입니다.";
-  } else if (!courtQueues.length) {
-    message.textContent = "등록된 코트 대기열이 없습니다.";
-  } else {
-    message.textContent = "저장된 코트 대기열 기준 실시간 현황";
-  }
-
-  cards.replaceChildren();
-  if (courtStatusError) {
-    cards.appendChild(courtHint("코트 현황을 불러오지 못했습니다."));
-    return;
-  }
-  if (!courtDefinitionsLoaded || !courtQueuesLoaded || !courtAssignmentsLoaded) {
-    cards.appendChild(courtHint("코트 정보를 불러오는 중입니다."));
-    return;
-  }
-  if (!courtQueues.length) {
-    cards.appendChild(courtHint("현재 표시할 코트가 없습니다."));
-    return;
-  }
-
-  const assignmentsByKey = new Map(courtAssignments.map((assignment) => [assignment.id, assignment]));
-  const lookups = {
-    teamsById: new Map(allTeams.map((team) => [team.id, team])),
-    groupsById: new Map(allGroups.map((group) => [group.id, group])),
-  };
-  [...courtQueues].sort((a, b) => a.id.localeCompare(b.id, "ko")).forEach((queue) => {
-    const card = document.createElement("article");
-    card.className = "court-status-card";
-    const title = document.createElement("h3");
-    const court = courtDefinitions.get(queue.id);
-    title.textContent = court?.name || court?.displayName || "이름 없는 코트";
-    card.appendChild(title);
-    card.append(
-      courtMatchSlot("현재", queue.currentMatchKey, assignmentsByKey.get(queue.currentMatchKey), lookups),
-      courtMatchSlot("다음", queue.nextMatchKey, assignmentsByKey.get(queue.nextMatchKey), lookups),
-    );
-    cards.appendChild(card);
-  });
-}
-
-function courtHint(text) {
-  const hint = document.createElement("div");
-  hint.className = "empty-hint";
-  hint.textContent = text;
-  return hint;
-}
-
-function officialMatchFor(assignment) {
-  if (!assignment?.matchId) return null;
-  if (assignment.matchType === "final") {
-    const division = assignment.divisionId || assignment.division;
-    return finalMatchesByDivision[division]?.find((match) => match.id === assignment.matchId) || null;
-  }
-  return allPrelimMatches.find((match) => match.id === assignment.matchId) || null;
-}
-
-function courtMatchSlot(label, matchKey, assignment, lookups) {
-  const slot = document.createElement("div");
-  slot.className = "court-match-slot";
-  const labelEl = document.createElement("strong");
-  labelEl.textContent = label;
-  const detail = document.createElement("div");
-  detail.className = "court-match-detail";
-  if (!matchKey) {
-    detail.textContent = "배정된 경기 없음";
-  } else if (!assignment) {
-    detail.textContent = "경기 정보 확인 중";
-  } else {
-    const view = courtMatchSummary(assignment, officialMatchFor(assignment), lookups);
-    const status = courtPublicStatus(assignment.publicStatus);
-    detail.textContent = [view.label, view.teams, status].filter(Boolean).join(" · ");
-  }
-  slot.append(labelEl, detail);
-  return slot;
-}
-
-function courtPublicStatus(status) {
-  const labels = {
-    under_review: "종료·검토 중",
-    replay_required: "재경기 필요",
-    rework_required: "재입력 필요",
-    dependency_blocked: "대진 확정 대기",
-    in_progress: "경기 중",
-    completed: "완료",
-    scheduled: "경기 예정",
-  };
-  return labels[status] || "경기 예정";
 }
 
 function initDivisionSwitch() {

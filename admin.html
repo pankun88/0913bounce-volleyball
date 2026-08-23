@@ -118,6 +118,19 @@
       <div id="groupTeamLists" class="grid-auto"></div>
       <p class="empty-hint" style="margin:8px 0 0;">조·팀 카드를 드래그해 순서를 바꾸거나, 팀을 다른 조로 옮길 수 있어요.</p>
     </div>
+
+    <div class="card">
+      <h2>🏟️ 코트 설정</h2>
+      <p class="empty-hint">코트 표시 이름과 담당 기록관을 설정하세요. 코트를 삭제하면 해당 경기는 미배정으로 이동합니다.</p>
+      <div id="courtSettingsList" class="court-settings-list"></div>
+      <h3>통합 경기 배정·순서</h3>
+      <p class="empty-hint">예선·본선 전체 경기 카드를 드래그해 코트를 배정하고 실제 진행 순서를 정하세요.</p>
+      <div id="allCourtBoard" class="court-board"></div>
+      <div class="workflow-save-row">
+        <span id="workflowPlannerHint" class="empty-hint">변경한 코트 설정과 배정을 저장하세요.</span>
+        <button class="btn primary" id="setupWorkflowBtn">코트 설정·배정 저장</button>
+      </div>
+    </div>
   </section>
 
   <section class="tab-panel" id="tab-workflow">
@@ -131,32 +144,6 @@
       <pre id="recorderCodeOutput" class="empty-hint" style="display:none; margin-top:10px;"></pre>
     </div>
     <div class="card">
-      <h2>🏟️ 코트 관리 및 전체 순서 확인</h2>
-      <p class="empty-hint workflow-guide">
-        경기 카드에서 코트를 배정한 뒤, 여기서 코트별 실제 진행 순서를 확인·정렬하세요. 기록관은 Google 로그인과 공용 접근 코드 후 현장에서 담당 코트를 선택합니다.
-      </p>
-      <div class="workflow-court-toolbar">
-        <div id="workflowCourtTabs" class="workflow-court-tabs"></div>
-        <button type="button" class="btn small" id="workflowNewCourtBtn">+ 새 코트</button>
-      </div>
-      <label class="workflow-field-label" for="workflowCourtName">코트 이름</label>
-      <input id="workflowCourtName" class="workflow-court-name" placeholder="예: A코트, 1코트" />
-
-      <div class="workflow-planner">
-        <section class="workflow-pane workflow-schedule-pane" aria-labelledby="courtScheduleTitle">
-          <div class="workflow-pane-header">
-            <h3 id="courtScheduleTitle">이 코트의 경기 순서</h3>
-            <span id="workflowScheduleCount" class="workflow-count">0경기</span>
-          </div>
-          <div id="workflowScheduleList" class="workflow-match-list"></div>
-        </section>
-      </div>
-      <div class="workflow-save-row">
-        <span id="workflowPlannerHint" class="empty-hint">변경한 코트 배정과 순서를 저장하세요.</span>
-        <button class="btn primary" id="setupWorkflowBtn">코트 배정·순서 저장</button>
-      </div>
-    </div>
-    <div class="card">
       <h2>📝 제출 결과 검수</h2>
       <p class="empty-hint">제출 검수는 코트의 current/next와 독립적으로 표시됩니다.</p>
       <div id="scoreReviewList"></div>
@@ -165,7 +152,7 @@
       <h2>🔁 승인 결과 정정</h2>
       <p class="empty-hint">적용 전 replay와 대기열 변경을 미리 확인합니다. 활성 경기 충돌은 적용할 수 없습니다.</p>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
-        <input id="correctionMatchKeys" style="flex:1; min-width:240px;" placeholder="정정할 경기 키 (쉼표로 구분)" />
+        <select id="correctionMatchKeys" multiple size="4" style="flex:1; min-width:280px;" aria-label="정정할 경기 선택"></select>
         <button class="btn" id="previewCorrectionBtn">정정 미리보기</button>
         <button class="btn danger" id="applyCorrectionBtn" disabled>명시적으로 적용</button>
       </div>
@@ -178,7 +165,6 @@
     <div class="card">
       <h2>📋 예선 대진 설정 <button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="모든 조의 예선 대진과 결과를 삭제합니다">초기화</button></h2>
       <p class="empty-hint" style="margin:0;">조마다 <b>라운드로빈</b>(모든 팀이 한 번씩 대결) 또는 <b>링크제</b>(도형 꼭짓점에 배치해 인접한 팀끼리만 대결) 방식을 선택하세요. 방식과 대진 생성은 아래 각 조 카드에서 진행합니다.</p>
-      <div id="prelimCourtFilters" class="court-filter-bar" aria-label="예선 경기 코트 필터"></div>
     </div>
     <div id="prelimGroups"></div>
   </section>
@@ -187,7 +173,6 @@
   <section class="tab-panel" id="tab-final">
     <div class="card">
       <h2>🏆 본선 진출팀 선택 &amp; 시드 배정</h2>
-      <div id="finalCourtFilters" class="court-filter-bar" aria-label="본선 경기 코트 필터"></div>
       <div class="settings-box row" style="margin-bottom:12px; align-items:center; justify-content:space-between;">
         <label style="font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px;">
           ⚙️ 조별 본선 진출 팀 수
@@ -203,7 +188,6 @@
         <button class="btn danger" id="clearBracketBtn">대진표 초기화</button>
       </div>
     </div>
-
     <div class="card" id="byeUnassignedCard" style="display:none;">
       <h3 style="margin:0 0 8px;">⏳ 미배정 팀 (부전승 대상)</h3>
       <p class="empty-hint" style="margin:0 0 10px; padding:0;">상대가 없어 대진표에는 보이지 않는 자리입니다. 부전승으로 진출시킬 팀을 직접 선택해서 배치하세요.</p>

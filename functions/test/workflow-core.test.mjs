@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {
   activateDependencyEntries, classifyCorrectionTarget, consumeCurrentAndAdvance,
   insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectCancel,
-  projectForceRelease, selectQueueView,
+  projectCourtQueue, projectForceRelease, selectQueueView,
 } from '../workflow-core.js';
 
 const assignments = () => ({
@@ -28,6 +28,31 @@ const queue = (changes = {}) => ({ queueRevision: 7, currentMatchKey: 'M2', next
   const advanced = consumeCurrentAndAdvance(queue(), submitted, submittedWorkflows, 'M2');
   assert.equal(advanced.currentMatchKey, 'M3');
   assert.equal(advanced.normalCursorMatchKey, 'M3');
+}
+
+{
+  const a = {
+    A: { matchKey: 'A', publicStatus: 'in_progress', courtOrder: 2, nextCourtMatchKey: null },
+    B: { matchKey: 'B', publicStatus: 'scheduled', courtOrder: 1, nextCourtMatchKey: 'A' },
+  };
+  const w = {
+    A: { draftState: 'editing', lock: { token: 'lock' }, draft: { sets: [{ a: 4, b: 3 }] } },
+    B: { draftState: 'idle' },
+  };
+  const projected = projectCourtQueue(queue(), a, w);
+  assert.equal(projected.currentMatchKey, 'A', 'editing-match-remains-current-after-relocation');
+  assert.equal(projected.normalCursorMatchKey, 'A', 'editing-match-owns-normal-cursor');
+}
+
+{
+  const blocked = {
+    F1: { matchKey: 'F1', publicStatus: 'scheduled', courtOrder: 1, nextCourtMatchKey: 'F2', dependencyReady: false },
+    F2: { matchKey: 'F2', publicStatus: 'scheduled', courtOrder: 2, nextCourtMatchKey: null, dependencyReady: true },
+  };
+  const ready = { ...blocked, F1: { ...blocked.F1, dependencyReady: true } };
+  const w = { F1: { draftState: 'idle' }, F2: { draftState: 'idle' } };
+  const projected = projectCourtQueue(queue({ currentMatchKey: 'F2', normalCursorMatchKey: 'F2' }), ready, w);
+  assert.equal(projected.currentMatchKey, 'F1', 'newly-ready-normal-final-rebuilds-cursor');
 }
 
 {

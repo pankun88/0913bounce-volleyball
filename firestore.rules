@@ -62,13 +62,15 @@ service cloud.firestore {
     function auditHasExistingLock(tournamentId) {
       let event = auditAfter(tournamentId, request.resource.data.lastTransitionId);
       return event.data.before.lock.uid == resource.data.lock.uid
-        && event.data.before.lock.token == resource.data.lock.token;
+        && event.data.before.lock.token == resource.data.lock.token
+        && event.data.before.lock.get('recorderName', '') == resource.data.lock.get('recorderName', '');
     }
 
     function auditHasNewLock(tournamentId) {
       let event = auditAfter(tournamentId, request.resource.data.lastTransitionId);
       return event.data.after.lock.uid == request.resource.data.lock.uid
-        && event.data.after.lock.token == request.resource.data.lock.token;
+        && event.data.after.lock.token == request.resource.data.lock.token
+        && event.data.after.lock.recorderName == request.resource.data.lock.recorderName;
     }
 
     function isCurrentMatch(tournamentId, matchKey) {
@@ -78,16 +80,23 @@ service cloud.firestore {
         && queue.data.currentMatchKey == matchKey;
     }
 
-    function ownsNewLock() {
+    function ownsNewLock(tournamentId, matchKey) {
+      let currentAssignment = assignment(tournamentId, matchKey);
+      let court = get(/databases/$(database)/documents/tournaments/$(tournamentId)/courts/$(currentAssignment.data.courtId));
       return request.resource.data.lock.uid == request.auth.uid
-        && request.resource.data.lock.token is string;
+        && request.resource.data.lock.token is string
+        && request.resource.data.lock.recorderName is string
+        && request.resource.data.lock.recorderName.size() > 0
+        && court.data.get('recorderName', '').size() > 0
+        && request.resource.data.lock.recorderName == court.data.get('recorderName', '');
     }
 
     function ownsExistingLock() {
       return resource.data.lock.uid == request.auth.uid
         && resource.data.lock.token is string
         && request.resource.data.lock.uid == resource.data.lock.uid
-        && request.resource.data.lock.token == resource.data.lock.token;
+        && request.resource.data.lock.token == resource.data.lock.token
+        && request.resource.data.lock.get('recorderName', '') == resource.data.lock.get('recorderName', '');
     }
 
     function assignmentAfter(tournamentId, matchKey, publicStatus) {
@@ -126,7 +135,7 @@ service cloud.firestore {
               || resource.data.draftState == 'rejected')
         && resource.data.lock == null
         && request.resource.data.draftState == 'editing'
-        && ownsNewLock()
+        && ownsNewLock(tournamentId, matchKey)
         && auditHasNewLock(tournamentId)
         && request.resource.data.draftRevision == resource.data.draftRevision
         && request.resource.data.officialRevision == resource.data.officialRevision
@@ -145,7 +154,6 @@ service cloud.firestore {
         && auditHasExistingLock(tournamentId)
         && request.resource.data.draftRevision == resource.data.draftRevision + 1
         && request.resource.data.officialRevision == resource.data.officialRevision
-        && isCurrentMatch(tournamentId, matchKey)
         && hasTransitionAudit(tournamentId, matchKey, 'draft_save', 'draft_save');
     }
 
@@ -229,11 +237,14 @@ service cloud.firestore {
         allow write: if false;
       }
       match /courts/{courtId} {
-        allow read: if isMain(tournamentId);
+        allow read: if isMain(tournamentId)
+          && (isAdmin() || hasCurrentRecorderGrant(tournamentId));
         allow write: if false;
       }
       match /courtAssignments/{matchKey} {
-        allow read: if isMain(tournamentId);
+        allow get: if isMain(tournamentId)
+          && (isAdmin() || hasCurrentRecorderGrant(tournamentId));
+        allow list: if isMain(tournamentId) && isAdmin();
         allow update: if isMain(tournamentId)
           && hasCurrentRecorderGrant(tournamentId)
           && isCurrentMatch(tournamentId, matchKey)
@@ -246,7 +257,9 @@ service cloud.firestore {
         allow create, delete: if false;
       }
       match /courtQueues/{courtId} {
-        allow read: if isMain(tournamentId);
+        allow get: if isMain(tournamentId)
+          && (isAdmin() || hasCurrentRecorderGrant(tournamentId));
+        allow list: if isMain(tournamentId) && isAdmin();
         allow create, update, delete: if false;
       }
 
@@ -265,22 +278,27 @@ service cloud.firestore {
         allow get: if isMain(tournamentId)
           && (isAdmin()
             || (hasCurrentRecorderGrant(tournamentId)
-              && isCurrentMatch(tournamentId, matchKey)
-              && ((resource.data.lock == null
-                    && resource.data.draftState in ['idle', 'rejected'])
-                  || resource.data.lock.uid == request.auth.uid)));
+              && resource.data.lock != null
+              && resource.data.lock.uid == request.auth.uid));
+        allow get: if isMain(tournamentId)
+          && hasCurrentRecorderGrant(tournamentId)
+          && isCurrentMatch(tournamentId, matchKey)
+          && resource.data.lock == null
+          && resource.data.draftState in ['idle', 'rejected'];
         allow list: if isMain(tournamentId) && isAdmin();
         allow update: if isMain(tournamentId)
           && hasCurrentRecorderGrant(tournamentId)
           && isCurrentMatch(tournamentId, matchKey)
-          && ((validClaim(tournamentId, matchKey)
-                && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-                  'draftState', 'resumeDraftState', 'lock', 'lastTransitionId'
-                ]))
-              || (validDraftSave(tournamentId, matchKey)
-                && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-                  'draft', 'draftRevision', 'lastTransitionId'
-                ])));
+          && validClaim(tournamentId, matchKey)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'draftState', 'resumeDraftState', 'lock', 'lastTransitionId'
+          ]);
+        allow update: if isMain(tournamentId)
+          && hasCurrentRecorderGrant(tournamentId)
+          && validDraftSave(tournamentId, matchKey)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'draft', 'draftRevision', 'lastTransitionId'
+          ]);
         allow create, delete: if false;
       }
       match /auditEvents/{transitionId} {

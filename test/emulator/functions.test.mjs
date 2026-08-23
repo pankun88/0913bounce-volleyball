@@ -4,7 +4,7 @@ import { getAuth, connectAuthEmulator, signInAnonymously } from 'firebase/auth';
 import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/functions';
 import { deleteDoc, doc, getDoc, setDoc } from 'firebase/firestore';
 import { createFixture, PROJECT_ID, path } from './fixtures.mjs';
-import { consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
+import { activateDependencyEntries, consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
 
 const host = process.env.FUNCTIONS_EMULATOR_HOST || '127.0.0.1:5001';
 const [functionsHost, functionsPort] = host.split(':');
@@ -33,67 +33,285 @@ export async function runFunctionsSuite() {
     const exchanged = await call(functions, 'exchangeRecorderAccessCode', { ...data, code: reissued.code });
     assert.equal(exchanged.grantVersion, 2, 'access-code-exchange-reissued');
     assert.deepEqual(await call(functions, 'revokeRecorderAccessCode', data), { revoked: true }, 'access-code-revoke');
+    const resumedAccess = await call(functions, 'createRecorderAccessCode', data);
+    await call(functions, 'exchangeRecorderAccessCode', { ...data, code: resumedAccess.code });
 
-    await call(functions, 'replaceCourtWorkflows', {
+    const initialTopology = await call(functions, 'replaceCourtWorkflows', {
       ...data,
-      courts: [{ id: 'callable-court', name: 'A코트' }],
+      expectedTopologyRevision: 0,
+      expectedQueueRevisions: { 'court-1': 0 },
+      courts: [{ id: 'callable-court', name: 'A코트', recorderName: '기록원' }],
       assignmentsByCourt: {
         'callable-court': [
           { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
           { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
         ],
       },
+      unassignedAssignments: [],
     });
+    assert.deepEqual(initialTopology, { replaced: true, topologyRevision: 1 }, 'replace-court-workflows-cas-response');
     const reorderedQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'callable-court'))));
     assert.equal(reorderedQueue.data().currentMatchKey, 'M2', 'replace-court-workflows-current');
     assert.equal(reorderedQueue.data().nextMatchKey, 'M1', 'replace-court-workflows-next');
+    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 0,
+      expectedQueueRevisions: { 'callable-court': 1 },
+      courts: [{ id: 'callable-court', name: 'stale', recorderName: '' }],
+      assignmentsByCourt: { 'callable-court': [] },
+      unassignedAssignments: [],
+    }), /revision changed/i, 'stale-topology-zero-write');
+    const rootAfterStale = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(rootAfterStale.data().courtTopologyRevision, 1, 'stale-topology-did-not-write');
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('courtQueues', 'callable-court')), {
+        queueRevision: 2,
+        lastTransitionId: 'recorder:queue-only-change',
+      }, { merge: true });
+    });
+    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 1,
+      expectedQueueRevisions: { 'callable-court': 1 },
+      courts: [{ id: 'callable-court', name: 'A코트', recorderName: '기록원' }],
+      assignmentsByCourt: {
+        'callable-court': [
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+        ],
+      },
+      unassignedAssignments: [],
+    }), /queue revision changed/i, 'stale-queue-zero-write');
+    const rootAfterQueueStale = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(rootAfterQueueStale.data().courtTopologyRevision, 1, 'stale-queue-did-not-write');
     await f.seed(async (db) => {
       await setDoc(doc(db, path('scoreWorkflows', 'M1')), {
-        draftState: 'approved',
-        officialRevision: 1,
+        draftState: 'editing',
+        lock: { uid: credential.user.uid, token: 'draft-lock', recorderName: '기록원' },
+        draft: { sets: [{ a: 4, b: 2 }] },
       }, { merge: true });
       await setDoc(doc(db, path('courtAssignments', 'M1')), {
-        publicStatus: 'completed',
+        publicStatus: 'in_progress',
         attemptCount: 1,
       }, { merge: true });
-      await setDoc(doc(db, path('courtQueues', 'callable-court')), {
-        ...reorderedQueue.data(),
-        nextMatchKey: null,
-        queueRevision: reorderedQueue.data().queueRevision + 1,
+    });
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 1,
+      expectedQueueRevisions: { 'callable-court': 2 },
+      courts: [
+        { id: 'callable-court', name: 'A코트', recorderName: '기록원' },
+        { id: 'destination', name: 'B코트', recorderName: '새 기록원' },
+      ],
+      assignmentsByCourt: {
+        'callable-court': [],
+        destination: [
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+        ],
+      },
+      unassignedAssignments: [],
+    });
+    const [movedAssignment, movedWorkflow, sourceQueue, destinationQueue] = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('courtAssignments', 'M1'))),
+      getDoc(doc(db, path('scoreWorkflows', 'M1'))),
+      getDoc(doc(db, path('courtQueues', 'callable-court'))),
+      getDoc(doc(db, path('courtQueues', 'destination'))),
+    ]));
+    assert.equal(movedAssignment.data().courtOrder, 1, 'editing-move-normalized-first');
+    assert.deepEqual(
+      movedWorkflow.data().lock,
+      { uid: credential.user.uid, token: 'draft-lock', recorderName: '기록원' },
+      'editing-move-preserves-lock',
+    );
+    assert.deepEqual(movedWorkflow.data().draft, { sets: [{ a: 4, b: 2 }] }, 'editing-move-preserves-draft');
+    assert.equal(destinationQueue.data().currentMatchKey, 'M1', 'editing-move-is-destination-current');
+    assert.equal(sourceQueue.data().queueRevision, 3, 'editing-move-increments-source-queue-revision');
+    assert.equal(destinationQueue.data().queueRevision, 1, 'editing-move-increments-destination-queue-revision');
+    await f.seed((db) => setDoc(doc(db, path('scoreWorkflows', 'M2')), {
+      draftState: 'editing', lock: { uid: 'other', token: 'other-lock' },
+    }, { merge: true }));
+    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 2,
+      expectedQueueRevisions: { 'callable-court': 3, destination: 1 },
+      courts: [{ id: 'destination', name: 'B코트', recorderName: '' }],
+      assignmentsByCourt: {
+        destination: [
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+        ],
+      },
+      unassignedAssignments: [],
+    }), /Only one editing/i, 'destination-editing-conflict-zero-write');
+    const conflictRevision = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(conflictRevision.data().courtTopologyRevision, 2, 'editing-conflict-did-not-write');
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('scoreWorkflows', 'M2')), {
+        draftState: 'submitted', lock: null, submissionVersion: 3,
+      }, { merge: true });
+      await setDoc(doc(db, path('courtAssignments', 'M2')), { publicStatus: 'under_review' }, { merge: true });
+    });
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 2,
+      expectedQueueRevisions: { 'callable-court': 3, destination: 1 },
+      courts: [{ id: 'destination', name: 'B코트', recorderName: '' }],
+      assignmentsByCourt: {
+        destination: [
+          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+        ],
+      },
+      unassignedAssignments: [],
+    });
+    const submittedWorkflow = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'M2'))));
+    assert.equal(submittedWorkflow.data().draftState, 'submitted', 'existing-submitted-state-is-not-reset');
+    await f.seed((db) => setDoc(doc(db, path('scoreWorkflows', 'M2')), {
+      draftState: 'approved', officialRevision: 2,
+    }, { merge: true }));
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 3,
+      expectedQueueRevisions: { destination: 2 },
+      courts: [],
+      assignmentsByCourt: {},
+      unassignedAssignments: [],
+    });
+    const [unassigned, retainedDraft, retainedApproved] = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('courtAssignments', 'M1'))),
+      getDoc(doc(db, path('scoreWorkflows', 'M1'))),
+      getDoc(doc(db, path('scoreWorkflows', 'M2'))),
+    ]));
+    assert.deepEqual(
+      [unassigned.data().courtId, unassigned.data().courtOrder, unassigned.data().nextCourtMatchKey],
+      [null, null, null],
+      'deleted-court-preserves-unassigned-assignment',
+    );
+    assert.deepEqual(retainedDraft.data().draft, { sets: [{ a: 4, b: 2 }] }, 'deleted-court-preserves-draft');
+    assert.equal(retainedApproved.data().draftState, 'approved', 'existing-approved-state-is-not-reset');
+    assert.equal(retainedApproved.data().submissionVersion, 3, 'existing-submission-state-is-not-reset');
+    await assert.rejects(call(functions, 'rejectScoreReview', {
+      ...data,
+      matchKey: 'M2',
+      reason: 'stale approved reject',
+      expectedSubmissionVersion: 3,
+      expectedQueueRevision: null,
+    }), /Only submitted reviews can be rejected/i, 'approved-unassigned-stale-reject-denied');
+    const unassignedSubmit = await call(functions, 'submitRecorderDraft', {
+      ...data,
+      matchKey: 'M1',
+      courtId: null,
+      token: 'draft-lock',
+      queueRevision: null,
+      score: { sets: score },
+    });
+    assert.equal(unassignedSubmit.queueRevision, null, 'unassigned-submit-has-no-queue-revision');
+    const [submittedUnassignedAssignment, submittedUnassignedWorkflow] = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('courtAssignments', 'M1'))),
+      getDoc(doc(db, path('scoreWorkflows', 'M1'))),
+    ]));
+    assert.equal(submittedUnassignedAssignment.data().publicStatus, 'under_review', 'unassigned-submit-enters-review');
+    assert.equal(submittedUnassignedWorkflow.data().draftState, 'submitted', 'unassigned-submit-preserves-review-workflow');
+    await call(functions, 'rejectScoreReview', {
+      ...data,
+      matchKey: 'M1',
+      reason: 'unassigned review test',
+      expectedSubmissionVersion: submittedUnassignedWorkflow.data().submissionVersion,
+      expectedQueueRevision: null,
+    });
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 4,
+      expectedQueueRevisions: {},
+      courts: [{ id: 'rework-court', name: '재경기 코트', recorderName: '기록원' }],
+      assignmentsByCourt: {
+        'rework-court': [
+          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
+        ],
+      },
+      unassignedAssignments: [],
+    });
+    const reassignedReworkQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'rework-court'))));
+    assert.equal(reassignedReworkQueue.data().currentMatchKey, 'M1', 'reassigned-rejected-match-restores-priority');
+    assert.equal(reassignedReworkQueue.data().priorityEntries[0].matchKey, 'M1', 'reassigned-rejected-priority-entry');
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 5,
+      expectedQueueRevisions: { 'rework-court': 1 },
+      courts: [],
+      assignmentsByCourt: {},
+      unassignedAssignments: [],
+    });
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('scoreWorkflows', 'M1')), {
+        draftState: 'editing',
+        resumeDraftState: 'rejected',
+        lock: { uid: credential.user.uid, token: 'cancel-lock', recorderName: '기록원' },
+      }, { merge: true });
+      await setDoc(doc(db, path('courtAssignments', 'M1')), {
+        publicStatus: 'in_progress',
+      }, { merge: true });
+    });
+    const unassignedCancel = await call(functions, 'cancelRecorderDraft', {
+      ...data,
+      matchKey: 'M1',
+      courtId: null,
+      token: 'cancel-lock',
+      queueRevision: null,
+    });
+    assert.equal(unassignedCancel.queueRevision, null, 'unassigned-cancel-has-no-queue-revision');
+    const cancelledUnassigned = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'M1'))));
+    assert.equal(cancelledUnassigned.data().draftState, 'rejected', 'unassigned-cancel-restores-rejected-state');
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('courtAssignments', 'BP')), {
+        matchKey: 'BP',
+        matchType: 'final',
+        matchId: 'BP',
+        divisionId: 'men',
+        courtId: null,
+        courtOrder: null,
+        nextCourtMatchKey: null,
+        publicStatus: 'replay_required',
+        dependencyReady: false,
+        lastTransitionId: 'correction:blocked',
+      });
+      await setDoc(doc(db, path('scoreWorkflows', 'BP')), {
+        draftState: 'idle',
+        lock: null,
+        submissionVersion: 1,
+        officialRevision: 1,
       });
     });
     await call(functions, 'replaceCourtWorkflows', {
       ...data,
-      courts: [{ id: 'callable-court', name: 'A코트 이름 변경' }],
+      expectedTopologyRevision: 6,
+      expectedQueueRevisions: {},
+      courts: [{ id: 'blocked-court', name: '대진 대기 코트', recorderName: '' }],
       assignmentsByCourt: {
-        'callable-court': [
-          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
-          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
-        ],
+        'blocked-court': [{
+          matchKey: 'BP',
+          matchType: 'final',
+          matchId: 'BP',
+          divisionId: 'men',
+          dependencyReady: false,
+        }],
       },
+      unassignedAssignments: [],
     });
-    const preservedQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'callable-court'))));
-    assert.equal(preservedQueue.data().nextMatchKey, null, 'started-queue-name-change-preserves-pointers');
-    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
-      ...data,
-      courts: [{ id: 'callable-court', name: 'A코트' }],
-      assignmentsByCourt: {
-        'callable-court': [
-          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
-          { matchKey: 'M2', matchType: 'prelim', matchId: 'M2', division: 'men' },
-        ],
-      },
-    }), /대회가 시작된 뒤에는/);
-    await assert.rejects(call(functions, 'replaceCourtWorkflows', {
-      ...data,
-      courts: [{ id: 'callable-court', name: 'A코트' }],
-      assignmentsByCourt: {
-        'callable-court': [
-          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
-          { matchKey: 'M1', matchType: 'prelim', matchId: 'M1', division: 'men' },
-        ],
-      },
-    }), /Duplicate or invalid match assignment/);
+    const [blockedQueueSnap, blockedAssignmentSnap, blockedWorkflowSnap] = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('courtQueues', 'blocked-court'))),
+      getDoc(doc(db, path('courtAssignments', 'BP'))),
+      getDoc(doc(db, path('scoreWorkflows', 'BP'))),
+    ]));
+    assert.equal(blockedQueueSnap.data().priorityEntries[0].eligibility, 'blocked_dependency', 'reassigned-correction-uses-canonical-blocked-state');
+    const activatedBlocked = activateDependencyEntries(
+      blockedQueueSnap.data(),
+      { BP: { ...blockedAssignmentSnap.data(), dependencyReady: true } },
+      { BP: blockedWorkflowSnap.data() },
+      ['BP'],
+    );
+    assert.equal(activatedBlocked.currentMatchKey, 'BP', 'reassigned-blocked-correction-activates');
 
     // Queue planning is the same pure core used by callable review/recovery handlers.
     const assignments = { C1: { publicStatus: 'under_review', courtOrder: 1, nextCourtMatchKey: 'C2' }, C2: { publicStatus: 'scheduled', courtOrder: 2, nextCourtMatchKey: null }, R1: { publicStatus: 'replay_required', courtOrder: 3, nextCourtMatchKey: null } };
@@ -113,6 +331,50 @@ export async function runFunctionsSuite() {
       () => planCorrectionReplay(advanced, busyAssignments, busy, ['C2'], 'active'),
       /active/i,
       'active-affected-zero-write',
+    );
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('courts', 'correction-court')), {
+        id: 'correction-court', name: '정정 코트', recorderName: '',
+      });
+      await setDoc(doc(db, path('courtAssignments', 'P1')), {
+        matchKey: 'P1', matchType: 'prelim', matchId: 'P1', division: 'men',
+        courtId: 'correction-court', courtOrder: 1, nextCourtMatchKey: 'P2', publicStatus: 'completed',
+      });
+      await setDoc(doc(db, path('courtAssignments', 'P2')), {
+        matchKey: 'P2', matchType: 'prelim', matchId: 'P2', division: 'men',
+        courtId: 'correction-court', courtOrder: 2, nextCourtMatchKey: null, publicStatus: 'completed',
+      });
+      await setDoc(doc(db, path('scoreWorkflows', 'P1')), { draftState: 'approved', lock: null, officialRevision: 1 });
+      await setDoc(doc(db, path('scoreWorkflows', 'P2')), { draftState: 'approved', lock: null, officialRevision: 1 });
+      await setDoc(doc(db, path('courtQueues', 'correction-court')), {
+        courtId: 'correction-court',
+        queueRevision: 0,
+        currentMatchKey: null,
+        nextMatchKey: null,
+        normalCursorMatchKey: null,
+        priorityEntries: [],
+        nextPrioritySequence: 0,
+      });
+    });
+    const correctionPreview = await call(functions, 'previewApprovedCorrection', {
+      ...data,
+      matchKeys: ['P2'],
+    });
+    assert.equal(correctionPreview.expectedQueueRevision, 0, 'server-correction-preview-revision');
+    await call(functions, 'applyApprovedCorrection', {
+      ...data,
+      matchKeys: ['P2'],
+      reason: 'preview/apply parity',
+      expectedQueueRevision: correctionPreview.expectedQueueRevision,
+    });
+    const appliedCorrectionQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'correction-court'))));
+    assert.deepEqual(
+      {
+        currentMatchKey: appliedCorrectionQueue.data().currentMatchKey || null,
+        nextMatchKey: appliedCorrectionQueue.data().nextMatchKey || null,
+      },
+      correctionPreview.projection.after,
+      'server-preview-apply-projection-parity',
     );
 
     const manifest = await call(functions, 'createMigrationManifest', { ...data, manifestId: 'migration-idempotent' });

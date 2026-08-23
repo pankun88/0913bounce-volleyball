@@ -66,8 +66,7 @@ function assertQueueOwnership(queue, assignments, workflows) {
   }
   if (queue.normalCursorMatchKey
       && !isNormalEligible(assignments, workflows, seen, queue.normalCursorMatchKey)
-      && !(assignmentFor(assignments, queue.normalCursorMatchKey).publicStatus === ACTIVE_STATUS
-        && workflowFor(workflows, queue.normalCursorMatchKey).draftState !== 'submitted')) {
+      && !isActive(assignments, workflows, queue.normalCursorMatchKey)) {
     throw new Error(`Stale or ineligible normal cursor: ${queue.normalCursorMatchKey}`);
   }
 }
@@ -137,6 +136,32 @@ function selectQueueView(queue, assignments, workflows) {
 function projectQueue(queue, assignments, workflows) {
   const view = selectQueueView(queue, assignments, workflows);
   return cloneQueue(queue, view);
+}
+
+/**
+ * Rebuild a court's normal cursor from its persisted assignment order while
+ * retaining priority work and any active recorder ownership.
+ */
+function projectCourtQueue(queue, assignments, workflows) {
+  const ordered = Object.values(assignments).sort((a, b) => (
+    (a.courtOrder || 0) - (b.courtOrder || 0)
+    || a.matchKey.localeCompare(b.matchKey)
+  ));
+  const assignedKeys = new Set(ordered.map((assignment) => assignment.matchKey));
+  const priorityEntries = (queue.priorityEntries || [])
+    .filter((entry) => assignedKeys.has(entry.matchKey))
+    .map((entry) => ({
+      ...entry,
+      courtOrder: assignmentFor(assignments, entry.matchKey).courtOrder || 0,
+    }));
+  const priorityKeys = new Set(priorityEntries.map((entry) => entry.matchKey));
+  const activeNormal = ordered.find((assignment) => (
+    !priorityKeys.has(assignment.matchKey)
+    && isActive(assignments, workflows, assignment.matchKey)
+  ));
+  const normalCursorMatchKey = activeNormal?.matchKey
+    || deriveEligibleNormal(ordered[0]?.matchKey || null, assignments, workflows, priorityEntries);
+  return projectQueue(cloneQueue(queue, { priorityEntries, normalCursorMatchKey }), assignments, workflows);
 }
 
 function insertPriorityEntry(queue, assignments, workflows, entry) {
@@ -259,6 +284,7 @@ export {
   deriveEligibleNormal,
   selectQueueView,
   projectQueue,
+  projectCourtQueue,
   insertPriorityEntry,
   consumeCurrentAndAdvance,
   projectReturnState,

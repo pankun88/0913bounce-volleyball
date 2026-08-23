@@ -136,69 +136,6 @@ a { color: var(--red); text-decoration: none; }
    실제 카드들이 남는 공간을 나눠 가지므로 항상 가로폭을 꽉 채운다. */
 .grid-auto { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
 
-.court-status-section {
-  margin-bottom: 20px;
-}
-
-.court-status-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 0 0 10px;
-}
-
-.court-status-heading h2 {
-  margin: 0;
-  font-size: 18px;
-  color: var(--red-dark);
-}
-
-.court-status-message {
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-  text-align: right;
-}
-
-.court-status-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 12px;
-}
-
-.court-status-card {
-  background: var(--white);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 16px;
-}
-
-.court-status-card h3 {
-  margin: 0 0 12px;
-  color: var(--ink);
-  font-size: 16px;
-}
-
-.court-match-slot {
-  display: grid;
-  grid-template-columns: 42px 1fr;
-  gap: 8px;
-  padding: 10px 0;
-  border-top: 1px solid var(--line);
-  font-size: 13px;
-}
-
-.court-match-slot strong {
-  color: var(--red-dark);
-  font-size: 12px;
-}
-
-.court-match-detail {
-  color: var(--ink);
-  overflow-wrap: anywhere;
-}
-
 .maintenance-notice {
   background: #fff4df;
   border: 1px solid #e5ae58;
@@ -232,8 +169,6 @@ a { color: var(--red); text-decoration: none; }
 @media (max-width: 720px) {
   .final-team-picker-groups { grid-template-columns: 1fr; }
   .final-team-picker-groups > div { border-left: none; padding-left: 0; }
-  .court-status-heading { display: block; }
-  .court-status-message { margin-top: 4px; text-align: left; }
 }
 
 input[type="text"], input[type="number"], select {
@@ -663,10 +598,50 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 .workflow-empty { color: var(--muted); margin: 0; padding: 8px 0; }
 .workflow-save-row { justify-content: space-between; flex-wrap: wrap; margin-top: 12px; }
 .match-court-control { padding: 7px 4px 0; }
+.court-settings-list { display: grid; gap: 8px; margin-top: 12px; }
+.court-settings-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.court-board {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(240px, 1fr);
+  gap: 12px;
+  overflow-x: auto;
+  padding: 4px 2px 10px;
+}
+.court-board-column {
+  min-height: 180px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--cream-light);
+}
+.court-board-column.drag-over { box-shadow: inset 0 0 0 2px var(--red); }
+.court-board-column h3 { margin: 0 0 8px; font-size: 14px; }
+.court-board-list { display: grid; gap: 8px; min-height: 100px; }
+.court-board-card {
+  display: grid;
+  gap: 5px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--white);
+  box-shadow: var(--shadow-soft);
+  cursor: grab;
+}
+.court-board-card > span { font-size: 13px; overflow-wrap: anywhere; }
+.court-board-card .badge { justify-self: start; }
+.court-board-controls { display: flex; gap: 5px; align-items: center; }
+.court-board-controls select { flex: 1; min-width: 0; font-size: 12px; padding: 5px; }
 @media (max-width: 620px) {
   .match-court-select { width: 100%; max-width: none; }
   .match-court-control { padding-top: 9px; }
   .workflow-save-row .btn { width: 100%; }
+  .court-settings-row { grid-template-columns: 1fr; }
 }
 
 /* ---- Claymorphism theme ---- */

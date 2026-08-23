@@ -3,7 +3,7 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { HttpsError } from 'firebase-functions/v2/https';
 import {
   activateDependencyEntries, consumeCurrentAndAdvance, planCorrectionReplay,
-  planRejectedRework, projectForceRelease, projectQueue, TOURNAMENT_ID,
+  planRejectedRework, projectCourtQueue, projectForceRelease, projectQueue, TOURNAMENT_ID,
 } from './workflow-core.js';
 
 const db = () => getFirestore();
@@ -108,89 +108,77 @@ export async function exchangeRecorderAccessCode(request) {
     return { tournamentId: TOURNAMENT_ID, grantVersion: version };
   });
 }
-function startedWorkflow(workflow, assignment) {
-  return Boolean(
-    workflow?.lock
-    || ['editing', 'submitted', 'rejected', 'approved'].includes(workflow?.draftState)
-    || (workflow?.submissionVersion || 0) > 0
-    || (workflow?.officialRevision || 0) > 0
-    || (workflow?.attemptCount || 0) > 0
-    || (assignment?.attemptCount || 0) > 0,
-  );
-}
-
 export async function replaceCourtWorkflows(request) {
   const uid = await admin(request, request.data);
-  const { courts, assignmentsByCourt } = request.data || {};
-  if (!Array.isArray(courts) || !assignmentsByCourt || typeof assignmentsByCourt !== 'object' || Array.isArray(assignmentsByCourt)) {
-    throw new HttpsError('invalid-argument', 'courts and assignmentsByCourt are required.');
+  const {
+    courts, assignmentsByCourt, unassignedAssignments, expectedTopologyRevision, expectedQueueRevisions,
+  } = request.data || {};
+  if (!Array.isArray(courts) || !assignmentsByCourt || typeof assignmentsByCourt !== 'object'
+      || Array.isArray(assignmentsByCourt) || !Array.isArray(unassignedAssignments)
+      || !Number.isInteger(expectedTopologyRevision) || !expectedQueueRevisions
+      || typeof expectedQueueRevisions !== 'object' || Array.isArray(expectedQueueRevisions)) {
+    throw new HttpsError('invalid-argument', 'courts, assignments, topology revision and queue revisions are required.');
   }
   const courtIds = new Set();
   const normalizedCourts = courts.map((court) => {
-    if (!court?.id || typeof court.name !== 'string' || !court.name.trim() || courtIds.has(court.id)) bad('Every court needs a unique id and display name.');
+    if (!court || typeof court.id !== 'string' || !court.id || typeof court.name !== 'string'
+        || !court.name.trim() || typeof court.recorderName !== 'string' || courtIds.has(court.id)) {
+      bad('Every court needs a unique id, display name and recorder name.');
+    }
     courtIds.add(court.id);
-    return { id: String(court.id), name: court.name.trim() };
+    return { id: court.id, name: court.name.trim(), recorderName: court.recorderName.trim() };
   });
   const desired = new Map();
+  const normalizeAssignment = (item, courtId, order, nextCourtMatchKey) => {
+    if (!item?.matchKey || typeof item.matchKey !== 'string' || desired.has(item.matchKey)
+        || !['prelim', 'final'].includes(item.matchType)) bad('Duplicate or invalid match assignment.');
+    if (item.matchType === 'prelim' && !item.division) bad('Prelim assignments require division.');
+    if (item.matchType === 'final' && !item.divisionId) bad('Final assignments require divisionId.');
+    desired.set(item.matchKey, {
+      ...bounded(item),
+      matchKey: item.matchKey,
+      matchId: item.matchId || item.matchKey,
+      courtId,
+      courtOrder: order,
+      nextCourtMatchKey,
+      publicStatus: item.publicStatus || 'scheduled',
+      dependencyReady: item.dependencyReady !== false,
+      attemptCount: item.attemptCount || 0,
+    });
+  };
   for (const [courtId, list] of Object.entries(assignmentsByCourt)) {
     if (!courtIds.has(courtId) || !Array.isArray(list)) bad('Assignments must belong to a registered court.');
     list.forEach((item, index) => {
-      if (!item?.matchKey || desired.has(item.matchKey) || !['prelim', 'final'].includes(item.matchType)) bad('Duplicate or invalid match assignment.');
-      if (item.matchType === 'prelim' && !item.division) bad('Prelim assignments require division.');
-      if (item.matchType === 'final' && !item.divisionId) bad('Final assignments require divisionId.');
-      desired.set(item.matchKey, {
-        ...bounded(item),
-        matchKey: item.matchKey,
-        matchId: item.matchId || item.matchKey,
-        courtId,
-        courtOrder: index + 1,
-        nextCourtMatchKey: list[index + 1]?.matchKey || null,
-        publicStatus: item.publicStatus || 'scheduled',
-        dependencyReady: item.dependencyReady !== false,
-        attemptCount: item.attemptCount || 0,
-      });
+      normalizeAssignment(item, courtId, index + 1, list[index + 1]?.matchKey || null);
     });
   }
-  await db().runTransaction(async (tx) => {
-    const [assignmentSnap, workflowSnap, queueSnap, courtSnap] = await Promise.all([
+  unassignedAssignments.forEach((item) => normalizeAssignment(item, null, null, null));
+  const topologyRevision = await db().runTransaction(async (tx) => {
+    const [tournamentSnap, assignmentSnap, workflowSnap, queueSnap, courtSnap] = await Promise.all([
+      tx.get(root()),
       tx.get(root().collection('courtAssignments')),
       tx.get(root().collection('scoreWorkflows')),
       tx.get(root().collection('courtQueues')),
       tx.get(root().collection('courts')),
     ]);
+    const currentTopologyRevision = tournamentSnap.data()?.courtTopologyRevision || 0;
+    if (currentTopologyRevision !== expectedTopologyRevision) {
+      throw new HttpsError('aborted', 'Court topology revision changed.');
+    }
+    const existingQueueIds = new Set(queueSnap.docs.map((snap) => snap.id));
+    const expectedQueueIds = Object.keys(expectedQueueRevisions);
+    if (expectedQueueIds.length !== existingQueueIds.size
+        || expectedQueueIds.some((courtId) => !existingQueueIds.has(courtId))
+        || queueSnap.docs.some((snap) => (
+          !Number.isInteger(expectedQueueRevisions[snap.id])
+          || expectedQueueRevisions[snap.id] !== (snap.data().queueRevision || 0)
+        ))) {
+      throw new HttpsError('aborted', 'Court queue revision changed.');
+    }
     const existingAssignments = new Map(assignmentSnap.docs.map((snap) => [snap.id, snap.data()]));
     const existingWorkflows = new Map(workflowSnap.docs.map((snap) => [snap.id, snap.data()]));
-    const hasStartedMatches = [...existingAssignments].some(([matchKey, assignment]) => (
-      startedWorkflow(existingWorkflows.get(matchKey), assignment)
-    ));
-    if (hasStartedMatches) {
-      const assignmentLayoutUnchanged = existingAssignments.size === desired.size
-        && [...existingAssignments].every(([matchKey, assignment]) => {
-          const next = desired.get(matchKey);
-          return next
-            && next.courtId === assignment.courtId
-            && next.courtOrder === assignment.courtOrder
-            && next.nextCourtMatchKey === (assignment.nextCourtMatchKey || null);
-        });
-      const existingCourtIds = new Set(courtSnap.docs.map((snap) => snap.id));
-      const courtSetUnchanged = existingCourtIds.size === courtIds.size
-        && [...existingCourtIds].every((courtId) => courtIds.has(courtId));
-      if (!assignmentLayoutUnchanged || !courtSetUnchanged) {
-        throw new HttpsError(
-          'aborted',
-          '대회가 시작된 뒤에는 코트 배정이나 경기 순서를 변경할 수 없습니다. 진행 전 설정에서만 변경하세요.',
-        );
-      }
-      const transition = `court_names_updated:${crypto.randomUUID()}`;
-      for (const court of normalizedCourts) tx.set(ref('courts', court.id), court, { merge: true });
-      audit(tx, transition, 'court_names_updated', 'courts', uid, {
-        courts: courtSnap.docs.map((snap) => ({ id: snap.id, name: snap.data().name || snap.id })),
-      }, {
-        courts: normalizedCourts,
-      });
-      return;
-    }
     for (const [matchKey, item] of desired) {
+      if (existingAssignments.has(matchKey)) continue;
       const official = await tx.get(matchRef(item));
       if (!official.exists) bad(`Official match not found: ${matchKey}.`);
       const officialData = official.data();
@@ -199,7 +187,7 @@ export async function replaceCourtWorkflows(request) {
         || ['done', 'completed'].includes(officialData.status)
         || (Array.isArray(officialData.sets)
           && officialData.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0));
-      if (!existingAssignments.has(matchKey) && hasOfficialHistory) {
+      if (hasOfficialHistory) {
         throw new HttpsError(
           'failed-precondition',
           '이미 결과가 기록된 경기는 새 기록관 대기열에 배정할 수 없습니다. 새 대진을 생성하거나 기존 결과를 초기화하세요.',
@@ -209,8 +197,69 @@ export async function replaceCourtWorkflows(request) {
     const transition = `court_workflows_replaced:${crypto.randomUUID()}`;
     for (const [matchKey, assignment] of existingAssignments) {
       if (desired.has(matchKey)) continue;
-      tx.delete(ref('courtAssignments', matchKey));
-      tx.delete(ref('scoreWorkflows', matchKey));
+      desired.set(matchKey, {
+        ...assignment,
+        matchKey,
+        courtId: null,
+        courtOrder: null,
+        nextCourtMatchKey: null,
+      });
+    }
+    const desiredByCourt = new Map(normalizedCourts.map((court) => [court.id, []]));
+    const priorityByCourt = new Map(normalizedCourts.map((court) => [court.id, []]));
+    for (const item of desired.values()) {
+      if (item.courtId) desiredByCourt.get(item.courtId).push(item);
+    }
+    for (const queue of queueSnap.docs) {
+      for (const entry of queue.data().priorityEntries || []) {
+        const courtId = desired.get(entry.matchKey)?.courtId;
+        if (courtId) priorityByCourt.get(courtId).push(entry);
+      }
+    }
+    let reassignmentSequence = Math.max(
+      0,
+      ...queueSnap.docs.map((snap) => snap.data().nextPrioritySequence || 0),
+      ...[...priorityByCourt.values()].flat().map((entry) => (entry.enqueueSequence || 0) + 1),
+    );
+    for (const item of desired.values()) {
+      if (!item.courtId) continue;
+      const assignment = existingAssignments.get(item.matchKey) || item;
+      const workflow = existingWorkflows.get(item.matchKey) || {};
+      const needsPriority = assignment.publicStatus === 'replay_required'
+        || assignment.publicStatus === 'rework_required'
+        || workflow.draftState === 'rejected';
+      const entries = priorityByCourt.get(item.courtId);
+      if (!needsPriority || entries.some((entry) => entry.matchKey === item.matchKey)) continue;
+      entries.push({
+        entryId: `${workflow.draftState === 'rejected' ? 'rejected_rework' : 'correction_replay'}:${item.matchKey}`,
+        matchKey: item.matchKey,
+        kind: workflow.draftState === 'rejected' ? 'rejected_rework' : 'correction_replay',
+        enqueueSequence: reassignmentSequence,
+        pathDepth: 0,
+        courtOrder: item.courtOrder || 0,
+        eligibility: item.dependencyReady === false ? 'blocked_dependency' : 'ready',
+        sourceTransitionIds: assignment.lastTransitionId ? [assignment.lastTransitionId] : [],
+      });
+      reassignmentSequence += 1;
+    }
+    for (const [courtId, entries] of desiredByCourt) {
+      entries.sort((a, b) => a.courtOrder - b.courtOrder);
+      const editing = entries.filter((item) => {
+        const workflow = existingWorkflows.get(item.matchKey);
+        return workflow?.draftState === 'editing' || Boolean(workflow?.lock);
+      });
+      if (editing.length > 1) throw new HttpsError('aborted', 'Only one editing match can occupy a court.');
+      if (editing.length) entries.splice(entries.indexOf(editing[0]), 1), entries.unshift(editing[0]);
+      const normalizedEntries = entries.map((item, index) => {
+        const normalized = {
+          ...item,
+          courtOrder: index + 1,
+          nextCourtMatchKey: entries[index + 1]?.matchKey || null,
+        };
+        desired.set(item.matchKey, normalized);
+        return normalized;
+      });
+      desiredByCourt.set(courtId, normalizedEntries);
     }
     for (const court of normalizedCourts) tx.set(ref('courts', court.id), court);
     for (const existing of courtSnap.docs) {
@@ -230,35 +279,51 @@ export async function replaceCourtWorkflows(request) {
         lastTransitionId: oldAssignment.lastTransitionId || null,
       } : item;
       tx.set(ref('courtAssignments', matchKey), storedItem);
-      if (!startedWorkflow(oldWorkflow, existingAssignments.get(matchKey))) {
+      if (!oldWorkflow) {
         tx.set(ref('scoreWorkflows', matchKey), {
           draftState: 'idle', draftRevision: 0, submissionVersion: 0, officialRevision: 0, lock: null,
         });
       }
     }
     for (const court of normalizedCourts) {
-      const entries = [...desired.values()].filter((item) => item.courtId === court.id).sort((a, b) => a.courtOrder - b.courtOrder);
+      const entries = desiredByCourt.get(court.id);
       const previous = queueSnap.docs.find((snap) => snap.id === court.id)?.data();
-      tx.set(ref('courtQueues', court.id), {
+      const assignments = Object.fromEntries(entries.map((item) => [item.matchKey, {
+        ...item,
+        ...(['publicStatus', 'attemptCount', 'officialRevision', 'lastTransitionId'].reduce((state, key) => (
+          existingAssignments.get(item.matchKey)?.[key] === undefined ? state : { ...state, [key]: existingAssignments.get(item.matchKey)[key] }
+        ), {})),
+      }]));
+      const workflows = Object.fromEntries(entries.map((item) => [item.matchKey, existingWorkflows.get(item.matchKey) || {
+        draftState: 'idle', draftRevision: 0, submissionVersion: 0, officialRevision: 0, lock: null,
+      }]));
+      const projected = projectCourtQueue({
         courtId: court.id,
-        currentMatchKey: entries[0]?.matchKey || null,
-        nextMatchKey: entries[1]?.matchKey || null,
-        normalCursorMatchKey: entries[0]?.matchKey || null,
-        priorityEntries: [],
-        nextPrioritySequence: 0,
+        ...(previous || {}),
+        priorityEntries: priorityByCourt.get(court.id),
+        nextPrioritySequence: Math.max(
+          previous?.nextPrioritySequence || 0,
+          ...priorityByCourt.get(court.id).map((entry) => (entry.enqueueSequence || 0) + 1),
+        ),
         queueRevision: (previous?.queueRevision || 0) + 1,
         lastTransitionId: transition,
-      });
+      }, assignments, workflows);
+      tx.set(ref('courtQueues', court.id), projected);
     }
+    tx.set(root(), { courtTopologyRevision: currentTopologyRevision + 1 }, { merge: true });
     audit(tx, transition, 'court_workflows_replaced', 'courts', uid, {
-      courts: courtSnap.docs.map((snap) => snap.id),
-      matchKeys: assignmentSnap.docs.map((snap) => snap.id),
+      topologyRevision: currentTopologyRevision,
+      courts: courtSnap.docs.map((snap) => ({ id: snap.id, ...snap.data() })),
+      assignments: assignmentSnap.docs.map((snap) => ({ matchKey: snap.id, courtId: snap.data().courtId, courtOrder: snap.data().courtOrder })),
     }, {
-      courts: normalizedCourts.map((court) => court.id),
+      topologyRevision: currentTopologyRevision + 1,
+      courts: normalizedCourts,
       assignmentsByCourt: Object.fromEntries(normalizedCourts.map((court) => [court.id, [...desired.values()].filter((item) => item.courtId === court.id).map((item) => item.matchKey)])),
+      unassignedAssignments: [...desired.values()].filter((item) => !item.courtId).map((item) => item.matchKey),
     });
+    return currentTopologyRevision + 1;
   });
-  return { replaced: true };
+  return { replaced: true, topologyRevision };
 }
 export async function publishFinalStructure(request) {
   const uid = await admin(request, request.data);
@@ -363,20 +428,26 @@ async function approve(request, direct = false) {
             && allDependenciesReady
             && downstreamAssignmentSnap.data().dependencyReady !== true) {
           const downstreamAssignment = downstreamAssignmentSnap.data();
-          const downstreamState = await courtState(tx, downstreamAssignment.courtId);
-          const assignments = {
+          const downstreamState = downstreamAssignment.courtId
+            ? await courtState(tx, downstreamAssignment.courtId)
+            : null;
+          const downstreamAssignments = downstreamState ? {
             ...downstreamState.assignments,
             [nextMatchKey]: { ...downstreamAssignment, dependencyReady: true },
-          };
-          const queue = activateDependencyEntries(
-            {
-              ...downstreamState.queue,
-              queueRevision: (downstreamState.queue.queueRevision || 0) + 1,
-            },
-            assignments,
+          } : null;
+          const queue = downstreamState ? projectCourtQueue(
+            activateDependencyEntries(
+              {
+                ...downstreamState.queue,
+                queueRevision: (downstreamState.queue.queueRevision || 0) + 1,
+              },
+              downstreamAssignments,
+              downstreamState.workflows,
+              [nextMatchKey],
+            ),
+            downstreamAssignments,
             downstreamState.workflows,
-            [nextMatchKey],
-          );
+          ) : null;
           dependencyActivation = {
             assignmentRef: downstreamAssignmentSnap.ref,
             courtId: downstreamAssignment.courtId,
@@ -394,10 +465,12 @@ async function approve(request, direct = false) {
     }
     if (dependencyActivation) {
       tx.update(dependencyActivation.assignmentRef, { dependencyReady: true, lastTransitionId: id });
-      tx.update(ref('courtQueues', dependencyActivation.courtId), {
-        ...dependencyActivation.queue,
-        lastTransitionId: id,
-      });
+      if (dependencyActivation.queue) {
+        tx.update(ref('courtQueues', dependencyActivation.courtId), {
+          ...dependencyActivation.queue,
+          lastTransitionId: id,
+        });
+      }
     }
     tx.update(workflowSnap.ref, { draftState: 'approved', lock: null, officialRevision: revision, officialSnapshot: official, lastTransitionId: id });
     tx.update(assignmentSnap.ref, { publicStatus: 'completed', officialRevision: revision, lastTransitionId: id });
@@ -414,26 +487,40 @@ export const directEditOfficialScore = (request) => approve(request, true);
 
 export async function rejectScoreReview(request) {
   const uid = await admin(request, request.data); const { matchKey, reason, expectedSubmissionVersion, expectedQueueRevision } = request.data;
-  if (typeof reason !== 'string' || !reason.trim() || !Number.isInteger(expectedSubmissionVersion) || !Number.isInteger(expectedQueueRevision)) {
-    throw new HttpsError('invalid-argument', 'Reason and expected revisions are required.');
+  if (typeof reason !== 'string' || !reason.trim() || !Number.isInteger(expectedSubmissionVersion)) {
+    throw new HttpsError('invalid-argument', 'Reason and submission revision are required.');
   }
   return db().runTransaction(async (tx) => {
-    const assignmentSnap = await tx.get(ref('courtAssignments', matchKey)); if (!assignmentSnap.exists) bad('Match not found.');
-    const assignment = assignmentSnap.data(); const state = await courtState(tx, assignment.courtId); const workflow = state.workflows[matchKey];
-    if (workflow.submissionVersion !== expectedSubmissionVersion || state.queue.queueRevision !== expectedQueueRevision) {
+    const [assignmentSnap, workflowSnap] = await Promise.all([
+      tx.get(ref('courtAssignments', matchKey)),
+      tx.get(ref('scoreWorkflows', matchKey)),
+    ]);
+    if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match not found.');
+    const assignment = assignmentSnap.data();
+    const workflow = workflowSnap.data();
+    if (assignment.publicStatus !== 'under_review' || workflow.draftState !== 'submitted') {
+      bad('Only submitted reviews can be rejected.');
+    }
+    const state = assignment.courtId ? await courtState(tx, assignment.courtId) : null;
+    if (workflow.submissionVersion !== expectedSubmissionVersion
+        || (state && (!Number.isInteger(expectedQueueRevision) || state.queue.queueRevision !== expectedQueueRevision))) {
       throw new HttpsError('aborted', 'Submission or queue revision changed.');
     }
     const id = transitionId(matchKey, 'review_rejected', workflow.submissionVersion || 0);
-    const planned = planRejectedRework(
+    const planned = state ? planRejectedRework(
       { ...state.queue, queueRevision: (state.queue.queueRevision || 0) + 1 },
       state.assignments,
       state.workflows,
       matchKey,
       id,
-    );
+    ) : {
+      assignments: { [matchKey]: { ...assignment, publicStatus: 'replay_required' } },
+      workflows: { [matchKey]: { ...workflow, draftState: 'rejected', lock: null } },
+      queue: null,
+    };
     tx.update(assignmentSnap.ref, { publicStatus: planned.assignments[matchKey].publicStatus, lastTransitionId: id });
     tx.update(ref('scoreWorkflows', matchKey), { draftState: 'rejected', lock: null, lastTransitionId: id });
-    tx.update(ref('courtQueues', assignment.courtId), { ...planned.queue, lastTransitionId: id });
+    if (state) tx.update(ref('courtQueues', assignment.courtId), { ...planned.queue, lastTransitionId: id });
     audit(tx, id, 'review_rejected', matchKey, uid, { assignment, workflow }, { assignment: planned.assignments[matchKey], workflow: planned.workflows[matchKey] }, reason.trim());
     return { transitionId: id };
   });
@@ -442,17 +529,25 @@ export async function cancelRecorderDraft(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;
   const { matchKey, courtId, token, queueRevision } = request.data || {};
-  if (!matchKey || !courtId || !token || !Number.isInteger(queueRevision)) {
-    throw new HttpsError('invalid-argument', 'matchKey, courtId, token and queueRevision are required.');
+  if (!matchKey || !token) {
+    throw new HttpsError('invalid-argument', 'matchKey and token are required.');
   }
   return db().runTransaction(async (tx) => {
     await recorder(tx, uid);
-    const state = await courtState(tx, courtId);
-    const assignment = state.assignments[matchKey];
-    const workflow = state.workflows[matchKey];
-    if (!assignment || !workflow || assignment.courtId !== courtId
-        || state.queue.queueRevision !== queueRevision
-        || state.queue.currentMatchKey !== matchKey
+    const [assignmentSnap, workflowSnap] = await Promise.all([
+      tx.get(ref('courtAssignments', matchKey)),
+      tx.get(ref('scoreWorkflows', matchKey)),
+    ]);
+    if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match workflow not found.');
+    const assignment = assignmentSnap.data();
+    const workflow = workflowSnap.data();
+    const state = assignment.courtId ? await courtState(tx, assignment.courtId) : null;
+    if ((state && (
+      assignment.courtId !== courtId
+      || !Number.isInteger(queueRevision)
+      || state.queue.queueRevision !== queueRevision
+      || state.queue.currentMatchKey !== matchKey
+    ))
         || workflow.draftState !== 'editing'
         || workflow.lock?.uid !== uid
         || workflow.lock?.token !== token) {
@@ -460,20 +555,23 @@ export async function cancelRecorderDraft(request) {
     }
     const draftState = workflow.resumeDraftState === 'rejected' ? 'rejected' : 'idle';
     const publicStatus = draftState === 'rejected' ? 'replay_required' : 'scheduled';
-    const id = transitionId(matchKey, 'recorder_cancel', `${queueRevision}:${token}`);
-    const assignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus } };
-    const queue = projectForceRelease(
-      { ...state.queue, queueRevision: queueRevision + 1 },
-      assignments,
-      state.workflows,
-      matchKey,
-      { draftState },
-    );
+    const id = transitionId(matchKey, 'recorder_cancel', `${queueRevision ?? 'unassigned'}:${token}`);
+    let queue = null;
+    if (state) {
+      const assignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus } };
+      queue = projectForceRelease(
+        { ...state.queue, queueRevision: queueRevision + 1 },
+        assignments,
+        state.workflows,
+        matchKey,
+        { draftState },
+      );
+    }
     tx.update(ref('scoreWorkflows', matchKey), { draftState, lock: null, lastTransitionId: id });
     tx.update(ref('courtAssignments', matchKey), { publicStatus, lastTransitionId: id });
-    tx.update(ref('courtQueues', courtId), { ...queue, lastTransitionId: id });
-    audit(tx, id, 'recorder_cancel', matchKey, uid, { workflow, queue: state.queue }, { workflow: { ...workflow, draftState, lock: null }, queue });
-    return { transitionId: id, queueRevision: queue.queueRevision };
+    if (state) tx.update(ref('courtQueues', assignment.courtId), { ...queue, lastTransitionId: id });
+    audit(tx, id, 'recorder_cancel', matchKey, uid, { workflow, queue: state?.queue || null }, { workflow: { ...workflow, draftState, lock: null }, queue });
+    return { transitionId: id, queueRevision: queue?.queueRevision ?? null };
   });
 }
 
@@ -481,17 +579,25 @@ export async function submitRecorderDraft(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;
   const { matchKey, courtId, token, queueRevision, score } = request.data || {};
-  if (!matchKey || !courtId || !token || !Number.isInteger(queueRevision)) {
-    throw new HttpsError('invalid-argument', 'matchKey, courtId, token and queueRevision are required.');
+  if (!matchKey || !token) {
+    throw new HttpsError('invalid-argument', 'matchKey and token are required.');
   }
   return db().runTransaction(async (tx) => {
     await recorder(tx, uid);
-    const state = await courtState(tx, courtId);
-    const assignment = state.assignments[matchKey];
-    const workflow = state.workflows[matchKey];
-    if (!assignment || !workflow || assignment.courtId !== courtId
-        || state.queue.queueRevision !== queueRevision
-        || state.queue.currentMatchKey !== matchKey
+    const [assignmentSnap, workflowSnap] = await Promise.all([
+      tx.get(ref('courtAssignments', matchKey)),
+      tx.get(ref('scoreWorkflows', matchKey)),
+    ]);
+    if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match workflow not found.');
+    const assignment = assignmentSnap.data();
+    const workflow = workflowSnap.data();
+    const state = assignment.courtId ? await courtState(tx, assignment.courtId) : null;
+    if ((state && (
+      assignment.courtId !== courtId
+      || !Number.isInteger(queueRevision)
+      || state.queue.queueRevision !== queueRevision
+      || state.queue.currentMatchKey !== matchKey
+    ))
         || workflow.draftState !== 'editing'
         || workflow.lock?.uid !== uid
         || workflow.lock?.token !== token) {
@@ -501,14 +607,17 @@ export async function submitRecorderDraft(request) {
     const submittedSnapshot = { sets: evaluated.sets };
     const submissionVersion = (workflow.submissionVersion || 0) + 1;
     const id = transitionId(matchKey, 'submission_complete', submissionVersion);
-    const assignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus: 'under_review' } };
-    const workflows = { ...state.workflows, [matchKey]: { ...workflow, draftState: 'submitted', lock: null } };
-    const queue = consumeCurrentAndAdvance(
-      state.queue,
-      assignments,
-      workflows,
-      matchKey,
-    );
+    let queue = null;
+    if (state) {
+      const assignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus: 'under_review' } };
+      const workflows = { ...state.workflows, [matchKey]: { ...workflow, draftState: 'submitted', lock: null } };
+      queue = consumeCurrentAndAdvance(
+        state.queue,
+        assignments,
+        workflows,
+        matchKey,
+      );
+    }
     tx.update(ref('scoreWorkflows', matchKey), {
       draft: submittedSnapshot,
       submittedSnapshot,
@@ -518,50 +627,81 @@ export async function submitRecorderDraft(request) {
       lastTransitionId: id,
     });
     tx.update(ref('courtAssignments', matchKey), { publicStatus: 'under_review', lastTransitionId: id });
-    tx.update(ref('courtQueues', courtId), { ...queue, lastTransitionId: id });
+    if (state) tx.update(ref('courtQueues', assignment.courtId), { ...queue, lastTransitionId: id });
     audit(tx, id, 'submission_complete', matchKey, {
       uid,
-      name: request.auth?.token?.name || null,
+      name: workflow.lock?.recorderName || request.auth?.token?.name || null,
       email: request.auth?.token?.email || null,
-    }, { workflow, queue: state.queue }, { workflow: { ...workflow, draftState: 'submitted', lock: null, submissionVersion }, queue });
-    return { transitionId: id, queueRevision: queue.queueRevision, nextMatchKey: queue.currentMatchKey };
+    }, { workflow, queue: state?.queue || null }, { workflow: { ...workflow, draftState: 'submitted', lock: null, submissionVersion }, queue });
+    return {
+      transitionId: id,
+      queueRevision: queue?.queueRevision ?? null,
+      nextMatchKey: queue?.currentMatchKey ?? null,
+    };
   });
 }
 export async function forceReleaseWorkflow(request) {
   const uid = await admin(request, request.data);
   const { matchKey, reason, expectedLockToken, expectedQueueRevision } = request.data;
-  if (typeof reason !== 'string' || !reason.trim() || !expectedLockToken || !Number.isInteger(expectedQueueRevision)) {
-    throw new HttpsError('invalid-argument', 'A release reason, lock token and queue revision are required.');
+  if (typeof reason !== 'string' || !reason.trim() || !expectedLockToken) {
+    throw new HttpsError('invalid-argument', 'A release reason and lock token are required.');
   }
   return db().runTransaction(async (tx) => {
     const assignmentSnap = await tx.get(ref('courtAssignments', matchKey)); const workflowSnap = await tx.get(ref('scoreWorkflows', matchKey));
     if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match not found.');
     const assignment = assignmentSnap.data(); const workflow = workflowSnap.data(); if (!workflow.lock) bad('No active lock to release.');
-    const state = await courtState(tx, assignment.courtId);
+    const state = assignment.courtId ? await courtState(tx, assignment.courtId) : null;
     const releaseId = `${transitionId(matchKey, 'force_release', workflow.draftRevision || 0)}:${crypto.createHash('sha256').update(expectedLockToken).digest('hex').slice(0, 12)}`;
-    if (workflow.lock.token !== expectedLockToken || state.queue.queueRevision !== expectedQueueRevision) {
+    if (workflow.lock.token !== expectedLockToken
+        || (state && (!Number.isInteger(expectedQueueRevision) || state.queue.queueRevision !== expectedQueueRevision))) {
       throw new HttpsError('aborted', 'Lock owner or queue revision changed.');
     }
     const returnState = { draftState: workflow.resumeDraftState === 'rejected' ? 'rejected' : 'idle' };
     const publicStatus = returnState.draftState === 'rejected' ? 'replay_required' : 'scheduled';
-    const postAssignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus } };
-    const queue = projectForceRelease(
+    const queue = state ? projectForceRelease(
       { ...state.queue, queueRevision: (state.queue.queueRevision || 0) + 1 },
-      postAssignments,
+      { ...state.assignments, [matchKey]: { ...assignment, publicStatus } },
       state.workflows,
       matchKey,
       returnState,
-    );
+    ) : null;
     tx.update(workflowSnap.ref, { ...returnState, lock: null, lastTransitionId: releaseId });
     tx.update(assignmentSnap.ref, { publicStatus, lastTransitionId: releaseId });
-    tx.update(ref('courtQueues', assignment.courtId), { ...queue, lastTransitionId: releaseId });
+    if (state) tx.update(ref('courtQueues', assignment.courtId), { ...queue, lastTransitionId: releaseId });
     audit(tx, releaseId, 'force_release', matchKey, uid, { lock: workflow.lock }, { lock: null }, reason.trim()); return { transitionId: releaseId };
   });
 }
 export async function previewApprovedCorrection(request) {
-  await admin(request, request.data); const targets = [...new Set(request.data?.matchKeys || [])]; if (!targets.length) throw new HttpsError('invalid-argument', 'matchKeys required.');
-  const assignments = await Promise.all(targets.map((key) => ref('courtAssignments', key).get())); if (assignments.some((snap) => !snap.exists)) bad('Unknown correction target.');
-  return { targets: assignments.map((snap) => ({ matchKey: snap.id, courtId: snap.data().courtId })) };
+  await admin(request, request.data);
+  const targets = [...new Set(request.data?.matchKeys || [])];
+  if (!targets.length) throw new HttpsError('invalid-argument', 'matchKeys required.');
+  return db().runTransaction(async (tx) => {
+    const targetSnaps = await Promise.all(targets.map((key) => tx.get(ref('courtAssignments', key))));
+    if (targetSnaps.some((snap) => !snap.exists)) bad('Unknown correction target.');
+    const courtId = targetSnaps[0].data().courtId;
+    if (!courtId || targetSnaps.some((snap) => snap.data().courtId !== courtId)) {
+      bad('Correction targets must share one assigned court.');
+    }
+    const state = await courtState(tx, courtId);
+    const planned = planCorrectionReplay(state.queue, state.assignments, state.workflows, targets, 'preview');
+    const replayMatchKeys = targets.filter((key) => planned.assignments[key]?.publicStatus === 'replay_required');
+    return {
+      targets: targetSnaps.map((snap) => ({ matchKey: snap.id, courtId })),
+      expectedQueueRevision: state.queue.queueRevision || 0,
+      projection: {
+        before: {
+          currentMatchKey: state.queue.currentMatchKey || null,
+          nextMatchKey: state.queue.nextMatchKey || null,
+        },
+        after: {
+          currentMatchKey: planned.queue.currentMatchKey || null,
+          nextMatchKey: planned.queue.nextMatchKey || null,
+        },
+        replayMatchKeys,
+        inPlaceMatchKeys: targets.filter((key) => !replayMatchKeys.includes(key)),
+      },
+    };
+  });
 }
 export async function applyApprovedCorrection(request) {
   const uid = await admin(request, request.data);

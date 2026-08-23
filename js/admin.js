@@ -1,5 +1,7 @@
 import { isFirebaseConfigured, db } from "./firebase-init.js";
-import { collection, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import {
+  collection, doc, getDoc, getDocs, onSnapshot,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { watchAuthState, login, logout, requestPasswordReset, changePassword, describeAuthError } from "./auth-service.js";
 import {
   saveTournamentInfo, subscribeTournamentInfo,
@@ -18,7 +20,6 @@ import { normalizeRingOrder, getRingMatchPairs, renderRingDiagram } from "./ring
 import { adminWorkflowCallable } from "./workflow-service.js";
 import { courtMatchSummary, courtTeamNames } from "./court-display.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
-import { planCorrectionReplay } from "./score-workflow.js";
 
 // ---------------- 상태 ----------------
 let tournamentInfo = {};
@@ -51,12 +52,10 @@ let reviewAudits = new Map();
 const reviewFinalMatchesByDivision = { men: [], women: [] };
 let correctionPreview = null;
 let unsubscribeWorkflowReviews = [];
-let selectedWorkflowCourtId = null;
 let workflowDraftAssignments = [];
 let workflowDraftCourts = [];
 let workflowDirty = false;
 let workflowSaveInProgress = false;
-let courtMatchFilter = "all";
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
@@ -82,6 +81,8 @@ function rebindFinalMatches() {
   renderFinalTeamPicker();
   unsubscribeFinalMatches = subscribeFinalMatches(activeDivision, (data) => {
     finalMatches = data;
+    if (!workflowDirty) resetWorkflowDraft();
+    else refreshWorkflowMatchMetadata();
     renderFinalBracket();
     renderFinalTeamPicker();
     renderWorkflowCourtPlanner();
@@ -127,16 +128,22 @@ subscribeTournamentInfo((info) => {
 
 subscribeGroups((data) => {
   allGroups = data;
+  if (!workflowDirty) resetWorkflowDraft();
+  else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
 });
 
 subscribeTeams((data) => {
   allTeams = data;
+  if (!workflowDirty) resetWorkflowDraft();
+  else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
 });
 
 subscribePrelimMatches((data) => {
   allPrelimMatches = data;
+  if (!workflowDirty) resetWorkflowDraft();
+  else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
 });
 
@@ -413,7 +420,10 @@ function subscribeWorkflowReviews() {
     }, (err) => reportError("검수 감사 로그 구독", err)),
     ...Object.keys(reviewFinalMatchesByDivision).map((division) => subscribeFinalMatches(division, (matches) => {
       reviewFinalMatchesByDivision[division] = matches;
+      if (!workflowDirty) resetWorkflowDraft();
+      else refreshWorkflowMatchMetadata();
       renderScoreReviews();
+      renderWorkflowCourtPlanner();
     })),
   ];
 }
@@ -425,33 +435,37 @@ function workflowTeamLabel(team) {
 }
 
 function workflowMatchOptions() {
-  const groupById = new Map(groups.map((group) => [group.id, group]));
+  const groupById = new Map(allGroups.map((group) => [group.id, group]));
+  const teamById = new Map(allTeams.map((team) => [team.id, team.name]));
+  const labelTeam = (team) => typeof team === "string"
+    ? (teamById.get(team) || "팀 정보 불러오는 중")
+    : workflowTeamLabel(team);
   return [
-    ...prelimMatches.map((match) => ({
+    ...allPrelimMatches.map((match) => ({
       matchKey: match.id,
       matchType: "prelim",
       matchId: match.id,
-      division: activeDivision,
-      label: `${groupById.get(match.groupId)?.name || "예선"} · ${match.round || "순서 미정"}경기`,
-      teams: `${workflowTeamLabel(match.teamA)} vs ${workflowTeamLabel(match.teamB)}`,
+      division: match.division,
+      label: `${DIVISION_LABELS[match.division] || match.division} · ${groupById.get(match.groupId)?.name || "예선"} · ${match.round || "순서 미정"}경기`,
+      teams: `${labelTeam(match.teamA)} vs ${labelTeam(match.teamB)}`,
       hasOfficialHistory: (match.officialRevision || 0) > 0
         || Boolean(match.result)
         || (Array.isArray(match.sets) && match.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0)),
     })),
-    ...finalMatches.map((match) => ({
-      matchKey: `final:${activeDivision}:${match.id}`,
+    ...Object.entries(reviewFinalMatchesByDivision).flatMap(([divisionId, matches]) => matches.map((match) => ({
+      matchKey: `final:${divisionId}:${match.id}`,
       matchType: "final",
       matchId: match.id,
-      divisionId: activeDivision,
+      divisionId,
       nextMatchId: match.nextMatchId || null,
       nextSlot: match.nextSlot || null,
       dependencyReady: Boolean(match.teamA && match.teamB),
-      label: `${match.roundLabel || `본선 ${match.round || ""}라운드`} · ${(match.index ?? 0) + 1}경기`,
-      teams: `${workflowTeamLabel(match.teamA)} vs ${workflowTeamLabel(match.teamB)}`,
+      label: `${DIVISION_LABELS[divisionId] || divisionId} · ${match.roundLabel || `본선 ${match.round || ""}라운드`} · ${(match.index ?? 0) + 1}경기`,
+      teams: `${labelTeam(match.teamA)} vs ${labelTeam(match.teamB)}`,
       hasOfficialHistory: (match.officialRevision || 0) > 0
         || Boolean(match.result || match.winner || match.winnerTeam)
         || (Array.isArray(match.sets) && match.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0)),
-    })),
+    }))),
   ];
 }
 
@@ -459,70 +473,99 @@ function resetWorkflowDraft() {
   workflowDraftCourts = [...reviewCourts.entries()].map(([id, court]) => ({
     id,
     name: court.name || court.displayName || "이름 없는 코트",
+    recorderName: court.recorderName || "",
   }));
-  for (const assignment of reviewAssignments) {
-    if (!workflowDraftCourts.some((court) => court.id === assignment.courtId)) {
-      workflowDraftCourts.push({ id: assignment.courtId, name: "코트 정보 불러오는 중" });
-    }
-  }
-  workflowDraftAssignments = reviewAssignments.map((assignment) => ({ ...assignment, matchKey: assignment.matchKey || assignment.id }));
+  const persisted = new Map(reviewAssignments.map((assignment) => [assignment.matchKey || assignment.id, {
+    ...assignment, matchKey: assignment.matchKey || assignment.id,
+  }]));
+  workflowDraftAssignments = workflowMatchOptions()
+    .filter((option) => persisted.has(option.matchKey) || !option.hasOfficialHistory)
+    .map((option) => ({
+      ...option,
+      ...(persisted.get(option.matchKey) || {}),
+      matchKey: option.matchKey,
+      courtId: persisted.get(option.matchKey)?.courtId || null,
+    }));
   workflowDirty = false;
 }
 
-function workflowCourtIds() { return workflowDraftCourts.map((court) => court.id); }
-function workflowCourtName(courtId) { return workflowDraftCourts.find((court) => court.id === courtId)?.name || "이름 없는 코트"; }
-function loadWorkflowCourt(courtId) {
-  selectedWorkflowCourtId = courtId;
-  const nameInput = document.getElementById("workflowCourtName");
-  if (nameInput) nameInput.value = workflowCourtName(courtId);
+async function reloadWorkflowAuthoritativeState({ preserveDraft = false } = {}) {
+  const root = ["tournaments", TOURNAMENT_ID];
+  const [tournamentSnap, assignmentSnap, workflowSnap, queueSnap, courtSnap] = await Promise.all([
+    getDoc(doc(db, ...root)),
+    getDocs(collection(db, ...root, "courtAssignments")),
+    getDocs(collection(db, ...root, "scoreWorkflows")),
+    getDocs(collection(db, ...root, "courtQueues")),
+    getDocs(collection(db, ...root, "courts")),
+  ]);
+  tournamentInfo = tournamentSnap.exists() ? { ...tournamentInfo, ...tournamentSnap.data() } : tournamentInfo;
+  reviewAssignments = assignmentSnap.docs.map((item) => ({ id: item.id, ...item.data() }));
+  reviewWorkflows = new Map(workflowSnap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+  reviewQueues = new Map(queueSnap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+  reviewCourts = new Map(courtSnap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+  if (!preserveDraft) {
+    workflowDirty = false;
+    resetWorkflowDraft();
+  }
   renderWorkflowCourtPlanner();
+  renderScoreReviews();
+  renderPrelimGroups();
+  renderFinalBracket();
 }
+
+function refreshWorkflowMatchMetadata() {
+  const options = new Map(workflowMatchOptions().map((option) => [option.matchKey, option]));
+  workflowDraftAssignments.forEach((assignment) => {
+    const option = options.get(assignment.matchKey);
+    if (!option) return;
+    assignment.label = option.label;
+    assignment.teams = option.teams;
+    assignment.dependencyReady = option.dependencyReady;
+    assignment.hasOfficialHistory = option.hasOfficialHistory;
+    assignment.nextMatchId = option.nextMatchId;
+    assignment.nextSlot = option.nextSlot;
+  });
+}
+
 function createWorkflowCourt() {
   const courtId = `court-${crypto.randomUUID().slice(0, 8)}`;
-  workflowDraftCourts.push({ id: courtId, name: "" });
-  selectedWorkflowCourtId = courtId;
+  workflowDraftCourts.push({ id: courtId, name: "", recorderName: "" });
   workflowDirty = true;
   renderWorkflowCourtPlanner();
-  document.getElementById("workflowCourtName").focus();
+  document.querySelector("#courtSettingsList input")?.focus();
 }
 
-function quickAddWorkflowCourt() {
-  const name = prompt("추가할 코트 이름을 입력하세요. (예: A코트, 1코트)")?.trim();
-  if (!name) return;
-  const courtId = `court-${crypto.randomUUID().slice(0, 8)}`;
-  workflowDraftCourts.push({ id: courtId, name });
-  selectedWorkflowCourtId = courtId;
-  workflowDirty = true;
-  renderWorkflowCourtPlanner();
-  renderPrelimGroups();
-  renderFinalBracket();
+function normalizeWorkflowOrders(courtId) {
+  workflowDraftAssignments
+    .filter((assignment) => (assignment.courtId || null) === courtId)
+    .sort((a, b) => (a.courtOrder || 0) - (b.courtOrder || 0))
+    .forEach((assignment, index) => { assignment.courtOrder = index + 1; });
 }
 
-function setMatchCourt(option, courtId) {
-  const index = workflowDraftAssignments.findIndex((assignment) => assignment.matchKey === option.matchKey);
-  if (!courtId) {
-    if (index >= 0) workflowDraftAssignments.splice(index, 1);
-  } else if (index >= 0) {
-    const assignment = workflowDraftAssignments[index];
-    if (assignment.courtId !== courtId) {
-      assignment.courtId = courtId;
-      const lastOrder = Math.max(0, ...workflowDraftAssignments.filter((item) => item.courtId === courtId).map((item) => item.courtOrder || 0));
-      assignment.courtOrder = lastOrder + 1;
-    }
-  } else {
-    const lastOrder = Math.max(0, ...workflowDraftAssignments.filter((item) => item.courtId === courtId).map((item) => item.courtOrder || 0));
-    workflowDraftAssignments.push({ ...option, courtId, courtOrder: lastOrder + 1 });
-  }
-  workflowDirty = true;
-  renderWorkflowCourtPlanner();
-  renderPrelimGroups();
-  renderFinalBracket();
-}
-
-function moveWorkflowMatch(index, offset) {
-  const courtAssignments = workflowDraftAssignments
-    .filter((assignment) => assignment.courtId === selectedWorkflowCourtId)
+function setMatchCourt(matchKey, courtId, beforeMatchKey = null) {
+  const assignment = assignmentFor(matchKey);
+  if (!assignment) return;
+  const sourceCourtId = assignment.courtId || null;
+  const targetCourtId = courtId || null;
+  const target = workflowDraftAssignments
+    .filter((item) => item !== assignment && (item.courtId || null) === targetCourtId)
     .sort((a, b) => (a.courtOrder || 0) - (b.courtOrder || 0));
+  const targetIndex = beforeMatchKey ? target.findIndex((item) => item.matchKey === beforeMatchKey) : -1;
+  target.splice(targetIndex < 0 ? target.length : targetIndex, 0, assignment);
+  assignment.courtId = targetCourtId;
+  target.forEach((item, index) => { item.courtOrder = index + 1; });
+  if (sourceCourtId !== targetCourtId) normalizeWorkflowOrders(sourceCourtId);
+  workflowDirty = true;
+  renderWorkflowCourtPlanner();
+}
+
+function moveWorkflowMatch(matchKey, offset) {
+  const assignment = assignmentFor(matchKey);
+  if (!assignment) return;
+  const courtAssignments = workflowDraftAssignments
+    .filter((item) => (item.courtId || null) === (assignment.courtId || null))
+    .sort((a, b) => (a.courtOrder || 0) - (b.courtOrder || 0));
+  const index = courtAssignments.indexOf(assignment);
   const target = index + offset;
   if (target < 0 || target >= courtAssignments.length) return;
   [courtAssignments[index].courtOrder, courtAssignments[target].courtOrder] = [
@@ -532,174 +575,140 @@ function moveWorkflowMatch(index, offset) {
   renderWorkflowCourtPlanner();
 }
 
-function removeWorkflowMatch(index) {
-  const courtAssignments = workflowDraftAssignments
-    .filter((assignment) => assignment.courtId === selectedWorkflowCourtId)
-    .sort((a, b) => (a.courtOrder || 0) - (b.courtOrder || 0));
-  const target = courtAssignments[index];
-  workflowDraftAssignments.splice(workflowDraftAssignments.indexOf(target), 1);
-  workflowDirty = true;
-  renderWorkflowCourtPlanner();
-  renderPrelimGroups();
-  renderFinalBracket();
-}
-
-function workflowMatchDescription(assignment, optionByKey) {
-  return optionByKey.get(assignment.matchKey) || {
-    ...assignment,
-    label: assignment.matchType === "final" ? "본선 경기" : "예선 경기",
-    teams: "경기 정보를 불러오는 중",
-  };
-}
-
 function assignmentFor(matchKey) {
   return workflowDraftAssignments.find((assignment) => assignment.matchKey === matchKey);
 }
 
-function matchPassesCourtFilter(matchKey) {
-  const courtId = assignmentFor(matchKey)?.courtId;
-  return courtMatchFilter === "all" || (courtMatchFilter === "unassigned" ? !courtId : courtId === courtMatchFilter);
-}
-
-function renderCourtFilters(rootId, matchType) {
-  const root = document.getElementById(rootId);
-  if (!root) return;
-  const options = workflowMatchOptions().filter((option) => option.matchType === matchType);
-  const unassigned = options.filter((option) => !assignmentFor(option.matchKey)?.courtId).length;
-  root.replaceChildren();
-  [
-    ["all", "전체"],
-    ...workflowDraftCourts.map((court) => [court.id, court.name || "이름 없는 코트"]),
-    ["unassigned", `미배정 ${unassigned}경기`],
-  ].forEach(([id, label]) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `court-filter-chip${courtMatchFilter === id ? " active" : ""}${id === "unassigned" && unassigned ? " attention" : ""}`;
-    button.textContent = label;
-    button.setAttribute("aria-pressed", String(courtMatchFilter === id));
-    button.addEventListener("click", () => {
-      courtMatchFilter = id;
-      renderPrelimGroups();
-      renderFinalBracket();
-    });
-    root.appendChild(button);
-  });
-  const addCourt = document.createElement("button");
-  addCourt.type = "button";
-  addCourt.className = "court-filter-chip";
-  addCourt.textContent = "+ 코트 추가";
-  addCourt.addEventListener("click", quickAddWorkflowCourt);
-  root.appendChild(addCourt);
-  if (workflowDirty) {
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "btn primary small";
-    save.textContent = "코트 배정 저장";
-    save.addEventListener("click", () => document.getElementById("setupWorkflowBtn").click());
-    root.appendChild(save);
-  }
-}
-
-function createCourtSelect(option) {
-  const select = document.createElement("select");
-  select.className = "match-court-select";
-  select.setAttribute("aria-label", `${option.teams} 코트 배정`);
-  select.append(new Option("코트 미정", ""));
-  workflowDraftCourts.forEach((court) => select.append(new Option(court.name || "이름 없는 코트", court.id)));
-  const assignment = assignmentFor(option.matchKey);
-  const workflow = reviewWorkflows.get(option.matchKey);
-  const started = Boolean(
-    workflow?.lock
-    || workflow?.draftState && workflow.draftState !== "idle"
-    || (workflow?.submissionVersion || 0) > 0
-    || (workflow?.officialRevision || 0) > 0
-    || (assignment?.attemptCount || 0) > 0
-  );
-  select.value = assignment?.courtId || "";
-  if ((!assignment && option.hasOfficialHistory) || started) {
-    select.disabled = true;
-    select.title = !assignment && option.hasOfficialHistory
-      ? "이미 결과가 기록된 경기는 새 기록관 대기열에 배정할 수 없습니다."
-      : "이미 시작된 경기는 코트 배정을 변경할 수 없습니다.";
-  }
-  select.addEventListener("change", () => setMatchCourt(option, select.value));
-  return select;
-}
-
 function renderWorkflowCourtPlanner() {
-  const tabs = document.getElementById("workflowCourtTabs");
-  const scheduleRoot = document.getElementById("workflowScheduleList");
-  if (!tabs || !scheduleRoot) return;
+  if (!document.activeElement?.closest?.("#courtSettingsList")) renderCourtSettings();
+  renderCourtBoard();
+  const hint = document.getElementById("workflowPlannerHint");
+  if (hint) hint.textContent = workflowDirty ? "저장하지 않은 코트 설정·배정·순서 변경이 있습니다." : "변경한 코트 설정과 배정을 저장하세요.";
+  const save = document.getElementById("setupWorkflowBtn");
+  if (save) save.disabled = !workflowDirty;
+}
 
-  const courtIds = workflowCourtIds();
-  if (!selectedWorkflowCourtId && courtIds.length) {
-    loadWorkflowCourt(courtIds[0]);
-    return;
-  }
-
-  tabs.replaceChildren();
-  if (!courtIds.length) {
-    const empty = document.createElement("span");
-    empty.className = "empty-hint";
-    empty.textContent = "등록된 코트가 없습니다.";
-    tabs.appendChild(empty);
-  } else {
-    courtIds.forEach((courtId) => {
-      const count = workflowDraftAssignments.filter((assignment) => assignment.courtId === courtId).length;
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `workflow-court-tab${courtId === selectedWorkflowCourtId ? " active" : ""}`;
-      button.textContent = `${workflowCourtName(courtId)} · ${count}경기`;
-      button.addEventListener("click", () => loadWorkflowCourt(courtId));
-      tabs.appendChild(button);
-    });
-  }
-
-  const optionByKey = new Map(workflowMatchOptions().map((option) => [option.matchKey, option]));
-  scheduleRoot.replaceChildren();
-  const scheduled = workflowDraftAssignments.filter((assignment) => assignment.courtId === selectedWorkflowCourtId)
-    .sort((a, b) => (a.courtOrder || 0) - (b.courtOrder || 0));
-  scheduled.forEach((assignment, index) => {
-    const description = workflowMatchDescription(assignment, optionByKey);
+function renderCourtSettings() {
+  const root = document.getElementById("courtSettingsList");
+  if (!root) return;
+  root.replaceChildren();
+  workflowDraftCourts.forEach((court) => {
     const row = document.createElement("div");
-    row.className = "workflow-match-item workflow-scheduled-item";
-    const order = document.createElement("span");
-    order.className = "workflow-order";
-    order.textContent = String(index + 1);
-    const info = document.createElement("div");
-    info.className = "workflow-match-info";
-    info.innerHTML = `<b>${escapeHtml(description.label)}</b><span>${escapeHtml(description.teams)}</span>`;
-    const controls = document.createElement("div");
-    controls.className = "workflow-order-controls";
-    [
-      ["↑", "앞으로 이동", () => moveWorkflowMatch(index, -1), index === 0],
-      ["↓", "뒤로 이동", () => moveWorkflowMatch(index, 1), index === scheduled.length - 1],
-      ["×", "이 코트에서 제거", () => removeWorkflowMatch(index), false],
-    ].forEach(([text, label, handler, disabled]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "workflow-icon-btn";
-      button.textContent = text;
-      button.title = label;
-      button.setAttribute("aria-label", label);
-      button.disabled = disabled;
-      button.addEventListener("click", handler);
-      controls.appendChild(button);
+    row.className = "court-settings-row";
+    const name = document.createElement("input");
+    name.placeholder = "코트 표시 이름";
+    name.value = court.name;
+    name.setAttribute("aria-label", "코트 표시 이름");
+    name.addEventListener("input", () => {
+      court.name = name.value;
+      workflowDirty = true;
+      document.getElementById("setupWorkflowBtn").disabled = false;
+      document.getElementById("workflowPlannerHint").textContent = "저장하지 않은 코트 설정·배정·순서 변경이 있습니다.";
     });
-    row.append(order, info, controls);
-    scheduleRoot.appendChild(row);
+    name.addEventListener("change", () => {
+      renderCourtBoard();
+    });
+    const recorder = document.createElement("input");
+    recorder.placeholder = "기록관 이름";
+    recorder.value = court.recorderName || "";
+    recorder.setAttribute("aria-label", `${court.name || "새 코트"} 기록관 이름`);
+    recorder.addEventListener("input", () => {
+      court.recorderName = recorder.value;
+      workflowDirty = true;
+      document.getElementById("setupWorkflowBtn").disabled = false;
+      document.getElementById("workflowPlannerHint").textContent = "저장하지 않은 코트 설정·배정·순서 변경이 있습니다.";
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "btn danger small";
+    remove.textContent = "삭제";
+    remove.addEventListener("click", () => {
+      if (!confirm(`'${court.name || "이 코트"}'를 삭제할까요? 배정된 경기는 미배정으로 이동합니다.`)) return;
+      workflowDraftAssignments.filter((assignment) => assignment.courtId === court.id)
+        .forEach((assignment) => { assignment.courtId = null; });
+      workflowDraftCourts = workflowDraftCourts.filter((item) => item !== court);
+      normalizeWorkflowOrders(null);
+      workflowDirty = true;
+      renderWorkflowCourtPlanner();
+    });
+    row.append(name, recorder, remove);
+    root.appendChild(row);
   });
-  if (!scheduled.length) {
-    const empty = document.createElement("p");
-    empty.className = "workflow-empty";
-    empty.textContent = "예선 또는 본선 경기 카드에서 이 코트를 배정하세요.";
-    scheduleRoot.appendChild(empty);
-  }
-  document.getElementById("workflowScheduleCount").textContent = `${scheduled.length}경기`;
-  document.getElementById("workflowPlannerHint").textContent = selectedWorkflowCourtId
-    ? (workflowDirty ? "저장하지 않은 코트 배정·순서 변경이 있습니다." : "위에서 아래 순서대로 기록관 화면과 관객 대시보드에 표시됩니다.")
-    : "먼저 코트를 선택하거나 새 코트를 추가하세요.";
-  document.getElementById("setupWorkflowBtn").disabled = !workflowDirty;
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "btn small";
+  add.textContent = "+ 코트 추가";
+  add.addEventListener("click", createWorkflowCourt);
+  root.appendChild(add);
+}
+
+function workflowStatusBadge(matchKey) {
+  const workflow = reviewWorkflows.get(matchKey);
+  if ((workflow?.officialRevision || 0) > 0) return "승인됨";
+  if ((workflow?.submissionVersion || 0) > 0 || workflow?.draftState === "submitted") return "제출됨";
+  if (workflow?.draftState && workflow.draftState !== "idle") return "작성 중";
+  return "대기";
+}
+
+function renderCourtBoard() {
+  const root = document.getElementById("allCourtBoard");
+  if (!root) return;
+  const options = workflowDraftAssignments;
+  root.replaceChildren();
+  const columns = [[null, "미배정"], ...workflowDraftCourts.map((court) => [court.id, court.name || "이름 없는 코트"])];
+  columns.forEach(([courtId, name]) => {
+    const column = document.createElement("section");
+    column.className = "court-board-column";
+    column.addEventListener("dragover", (e) => { e.preventDefault(); column.classList.add("drag-over"); });
+    column.addEventListener("dragleave", () => column.classList.remove("drag-over"));
+    column.addEventListener("drop", (e) => {
+      e.preventDefault(); column.classList.remove("drag-over");
+      const matchKey = e.dataTransfer.getData("text/plain");
+      if (matchKey) setMatchCourt(matchKey, courtId);
+    });
+    const heading = document.createElement("h3");
+    const count = options.filter((option) => (assignmentFor(option.matchKey)?.courtId || null) === courtId).length;
+    heading.textContent = `${name} · ${count}경기`;
+    column.appendChild(heading);
+    const list = document.createElement("div");
+    list.className = "court-board-list";
+    options.filter((option) => (assignmentFor(option.matchKey)?.courtId || null) === courtId)
+      .sort((a, b) => (assignmentFor(a.matchKey)?.courtOrder || 0) - (assignmentFor(b.matchKey)?.courtOrder || 0))
+      .forEach((option, index, items) => {
+        const assignment = assignmentFor(option.matchKey);
+        const card = document.createElement("article");
+        card.className = "court-board-card";
+        card.draggable = true;
+        card.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", option.matchKey); e.dataTransfer.effectAllowed = "move"; });
+        card.addEventListener("dragover", (e) => e.preventDefault());
+        card.addEventListener("drop", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          const matchKey = e.dataTransfer.getData("text/plain");
+          if (matchKey && matchKey !== option.matchKey) setMatchCourt(matchKey, courtId, option.matchKey);
+        });
+        card.innerHTML = `<b>${escapeHtml(option.label)}</b><span>${escapeHtml(option.teams)}</span><span class="badge">${workflowStatusBadge(option.matchKey)}</span>`;
+        const controls = document.createElement("div");
+        controls.className = "court-board-controls";
+        const select = document.createElement("select");
+        select.setAttribute("aria-label", `${option.teams} 코트 선택`);
+        select.append(new Option("미배정", ""));
+        workflowDraftCourts.forEach((court) => select.append(new Option(court.name || "이름 없는 코트", court.id)));
+        select.value = assignment?.courtId || "";
+        select.addEventListener("change", () => setMatchCourt(option.matchKey, select.value));
+        controls.appendChild(select);
+        [["↑", -1, index === 0], ["↓", 1, index === items.length - 1]].forEach(([text, offset, disabled]) => {
+          const button = document.createElement("button");
+          button.type = "button"; button.className = "workflow-icon-btn"; button.textContent = text;
+          button.disabled = disabled; button.addEventListener("click", () => moveWorkflowMatch(option.matchKey, offset));
+          controls.appendChild(button);
+        });
+        card.appendChild(controls);
+        list.appendChild(card);
+      });
+    if (!list.children.length) list.innerHTML = '<p class="workflow-empty">경기가 없습니다.</p>';
+    column.appendChild(list);
+    root.appendChild(column);
+  });
 }
 
 async function runWorkflowButton(button, label, action) {
@@ -710,10 +719,29 @@ async function runWorkflowButton(button, label, action) {
     const result = await action();
     return result?.data ?? {};
   } catch (err) {
+    const errorCode = String(err?.code || "").split("/").at(-1);
+    if (errorCode === "aborted" || /topology|stale|revision|version/i.test(err?.message || "")) {
+      if (label === "코트 배정·순서 저장") {
+        try {
+          await reloadWorkflowAuthoritativeState();
+          showToast("다른 관리자 변경이 반영되었습니다. 최신 상태로 다시 불러왔습니다.", 5000);
+        } catch (reloadError) {
+          reportError("최신 코트 상태 불러오기", reloadError);
+        }
+      } else {
+        try {
+          await reloadWorkflowAuthoritativeState({ preserveDraft: true });
+          showToast(`${label} 작업이 다른 변경과 충돌해 적용되지 않았습니다. 최신 상태를 다시 불러왔습니다.`, 5000);
+        } catch (reloadError) {
+          reportError(`${label} 충돌 후 상태 불러오기`, reloadError);
+        }
+      }
+      return null;
+    }
     reportError(label, err);
     return null;
   } finally {
-    button.disabled = false;
+    button.disabled = label === "코트 배정·순서 저장" ? !workflowDirty : false;
     button.textContent = original;
   }
 }
@@ -754,6 +782,7 @@ function scoreReviewDisplay(assignment) {
 function renderScoreReviews() {
   const root = document.getElementById("scoreReviewList");
   if (!root) return;
+  renderCorrectionMatchOptions();
   const submitted = reviewAssignments.filter((item) => {
     const workflow = reviewWorkflows.get(item.id);
     return (item.publicStatus === "under_review" && workflow?.draftState === "submitted") || workflow?.lock;
@@ -794,7 +823,7 @@ function renderScoreReviews() {
         matchKey: assignment.id,
         reason,
         expectedSubmissionVersion: workflow.submissionVersion,
-        expectedQueueRevision: reviewQueues.get(assignment.courtId)?.queueRevision,
+        expectedQueueRevision: reviewQueues.get(assignment.courtId)?.queueRevision ?? null,
       }));
       if (ok) showToast("반려했습니다.");
     });
@@ -806,7 +835,7 @@ function renderScoreReviews() {
     if (workflow.lock) {
       const lock = document.createElement("span");
       lock.className = "empty-hint";
-      lock.textContent = `잠금 소유자: ${workflow.lock.uid || "알 수 없음"}`;
+      lock.textContent = `입력 중: ${workflow.lock.recorderName || "기록관"}`;
       const release = document.createElement("button");
       release.className = "btn danger small";
       release.textContent = "잠금 강제 해제";
@@ -817,13 +846,37 @@ function renderScoreReviews() {
           matchKey: assignment.id,
           reason,
           expectedLockToken: workflow.lock.token,
-          expectedQueueRevision: reviewQueues.get(assignment.courtId)?.queueRevision,
+          expectedQueueRevision: reviewQueues.get(assignment.courtId)?.queueRevision ?? null,
         }));
         if (ok) showToast("잠금을 강제 해제했습니다.");
       });
       row.append(lock, release);
     }
     root.appendChild(row);
+  });
+}
+
+function renderCorrectionMatchOptions() {
+  const select = document.getElementById("correctionMatchKeys");
+  if (!select) return;
+  const selected = new Set([...select.selectedOptions].map((option) => option.value));
+  const approved = reviewAssignments.filter((assignment) => {
+    const workflow = reviewWorkflows.get(assignment.id);
+    return assignment.publicStatus === "completed"
+      || (workflow?.officialRevision || assignment.officialRevision || 0) > 0;
+  });
+  select.replaceChildren();
+  if (!approved.length) {
+    const empty = new Option("승인된 경기가 없습니다.", "");
+    empty.disabled = true;
+    select.appendChild(empty);
+    return;
+  }
+  approved.forEach((assignment) => {
+    const display = scoreReviewDisplay(assignment);
+    const option = new Option(`${display.heading} · ${display.teams}`, assignment.id);
+    option.selected = selected.has(assignment.id);
+    select.appendChild(option);
   });
 }
 
@@ -992,21 +1045,12 @@ function bindStaticHandlers() {
     const result = await runWorkflowButton(e.currentTarget, "접근 코드 폐기", () => adminWorkflowCallable("revokeRecorderAccessCode"));
     if (result?.revoked) showToast("기록관 접근 코드를 폐기했습니다.");
   });
-  document.getElementById("workflowNewCourtBtn").addEventListener("click", createWorkflowCourt);
-  document.getElementById("workflowCourtName").addEventListener("input", (e) => {
-    const court = workflowDraftCourts.find((item) => item.id === selectedWorkflowCourtId);
-    if (!court) return;
-    court.name = e.target.value;
-    workflowDirty = true;
-    renderWorkflowCourtPlanner();
-    renderPrelimGroups();
-    renderFinalBracket();
-  });
   document.getElementById("setupWorkflowBtn").addEventListener("click", async (e) => {
     const unnamed = workflowDraftCourts.find((court) => !court.name.trim());
-    if (unnamed) return showToast("새 코트의 표시명을 입력하세요.");
+    if (unnamed) return showToast("모든 코트의 표시명을 입력하세요.");
     if (workflowSaveInProgress) return;
     const assignmentsByCourt = {};
+    const unassignedAssignments = [];
     workflowDraftAssignments.forEach((assignment) => {
       const normalized = {
         matchKey: assignment.matchKey,
@@ -1022,29 +1066,34 @@ function bindStaticHandlers() {
       } else {
         normalized.division = assignment.division || activeDivision;
       }
-      (assignmentsByCourt[assignment.courtId] ||= []).push(normalized);
+      if (assignment.courtId) (assignmentsByCourt[assignment.courtId] ||= []).push(normalized);
+      else unassignedAssignments.push(normalized);
     });
     Object.values(assignmentsByCourt).forEach((assignments) => assignments.sort((a, b) => a.courtOrder - b.courtOrder));
     workflowSaveInProgress = true;
     try {
       const result = await runWorkflowButton(e.currentTarget, "코트 배정·순서 저장", () => adminWorkflowCallable("replaceCourtWorkflows", {
-        courts: workflowDraftCourts.map((court) => ({ id: court.id, name: court.name.trim() })),
+        courts: workflowDraftCourts.map((court) => ({ id: court.id, name: court.name.trim(), recorderName: court.recorderName.trim() })),
         assignmentsByCourt,
+        unassignedAssignments,
+        expectedTopologyRevision: Number(tournamentInfo.courtTopologyRevision || 0),
+        expectedQueueRevisions: Object.fromEntries(
+          [...reviewQueues].map(([courtId, queue]) => [courtId, Number(queue.queueRevision || 0)]),
+        ),
       }));
       if (result) {
-        workflowDirty = false;
+        await reloadWorkflowAuthoritativeState();
         showToast("코트 배정과 경기 순서를 저장했습니다.");
-        renderWorkflowCourtPlanner();
-        renderPrelimGroups();
-        renderFinalBracket();
       }
     } finally {
       workflowSaveInProgress = false;
     }
   });
   document.getElementById("previewCorrectionBtn").addEventListener("click", async (e) => {
-    const matchKeys = document.getElementById("correctionMatchKeys").value.split(",").map((key) => key.trim()).filter(Boolean);
-    if (!matchKeys.length) return showToast("정정할 경기 키를 입력하세요.");
+    const matchKeys = [...document.getElementById("correctionMatchKeys").selectedOptions]
+      .map((option) => option.value)
+      .filter(Boolean);
+    if (!matchKeys.length) return showToast("정정할 경기를 선택하세요.");
     const result = await runWorkflowButton(e.currentTarget, "정정 미리보기", () => adminWorkflowCallable("previewApprovedCorrection", { matchKeys }));
     if (!result) return;
     correctionPreview = { matchKeys, result };
@@ -1055,21 +1104,16 @@ function bindStaticHandlers() {
       const display = scoreReviewDisplay(assignment);
       return `${display.heading} (${display.teams})`;
     }).join(", ");
-    const courtId = result.targets?.[0]?.courtId;
-    const queue = reviewQueues.get(courtId);
-    correctionPreview.expectedQueueRevision = queue?.queueRevision;
-    const assignments = Object.fromEntries(reviewAssignments.filter((item) => item.courtId === courtId).map((item) => [item.id, item]));
-    const workflows = Object.fromEntries([...reviewWorkflows].map(([key, workflow]) => [key, workflow]));
-    let projected = null;
-    if (!queue) active.push("코트 대기열을 아직 불러오지 못했습니다");
-    if (!active.length && queue) {
-      try { projected = planCorrectionReplay(queue, assignments, workflows, matchKeys, "preview"); } catch (err) { active.push(err.message); }
-    }
-    const replay = projected ? matchKeys.filter((key) => projected.assignments[key]?.publicStatus === "replay_required") : [];
-    const inPlace = projected ? matchKeys.filter((key) => !replay.includes(key)) : [];
+    correctionPreview.expectedQueueRevision = result.expectedQueueRevision;
+    const matchLabel = (matchKey) => {
+      const assignment = reviewAssignments.find((item) => item.id === matchKey);
+      return assignment ? scoreReviewDisplay(assignment).heading : "없음";
+    };
+    const replay = (result.projection?.replayMatchKeys || []).map(matchLabel);
+    const inPlace = (result.projection?.inPlaceMatchKeys || []).map(matchLabel);
     document.getElementById("correctionPreview").textContent = active.length
       ? `활성 경기 충돌: ${active.join(", ")}. active affected 경기는 정정을 적용할 수 없습니다.`
-      : `대상: ${targetText}. never-started normal 제자리 유지: ${inPlace.join(", ") || "없음"}; ready/blocked replay: ${replay.join(", ") || "없음"}; queue before ${queue?.currentMatchKey || "없음"} → ${queue?.nextMatchKey || "없음"}, after ${projected.queue.currentMatchKey || "없음"} → ${projected.queue.nextMatchKey || "없음"}.`;
+      : `대상: ${targetText}. 제자리 유지: ${inPlace.join(", ") || "없음"}; 재경기 대기: ${replay.join(", ") || "없음"}; 변경 전 ${matchLabel(result.projection?.before?.currentMatchKey)} → ${matchLabel(result.projection?.before?.nextMatchKey)}, 변경 후 ${matchLabel(result.projection?.after?.currentMatchKey)} → ${matchLabel(result.projection?.after?.nextMatchKey)}.`;
     document.getElementById("applyCorrectionBtn").disabled = active.length > 0;
   });
   document.getElementById("applyCorrectionBtn").addEventListener("click", async (e) => {
@@ -1712,7 +1756,6 @@ async function handleMatchReorderDrop(groupId, groupMatches, draggedId, targetId
 
 function renderPrelimGroups() {
   const el = document.getElementById("prelimGroups");
-  renderCourtFilters("prelimCourtFilters", "prelim");
   if (!groups.length) {
     el.innerHTML = '<div class="empty-hint">먼저 대회설정 탭에서 조를 만들어 주세요.</div>';
     return;
@@ -1802,7 +1845,6 @@ function renderPrelimGroups() {
         matchList.appendChild(dragHint);
       }
       groupMatches.forEach((m, idx) => {
-        if (!matchPassesCourtFilter(m.id)) return;
         const row = document.createElement("div");
         row.className = "row" + (reorderable ? " match-row-draggable" : "");
         row.style.justifyContent = "space-between";
@@ -1826,8 +1868,6 @@ function renderPrelimGroups() {
         editBtn.textContent = evald.status === "done" ? "점수 수정" : "점수 입력";
         editBtn.addEventListener("click", () => openPrelimScoreModal(m));
         right.appendChild(editBtn);
-        const option = workflowMatchOptions().find((item) => item.matchKey === m.id);
-        if (option) right.appendChild(createCourtSelect(option));
         row.appendChild(right);
 
         if (reorderable) {
@@ -2065,7 +2105,6 @@ async function onGenerateBracket() {
 function renderFinalBracket() {
   renderByeUnassignedPanel();
   updateBracketPublishBar();
-  renderCourtFilters("finalCourtFilters", "final");
   const container = document.getElementById("finalBracketContainer");
   renderBracket(container, finalMatches, {
     editable: true,
@@ -2073,17 +2112,6 @@ function renderFinalBracket() {
     onSwapSlot: handleBracketSlotSwap,
     onConfirmBye: handleConfirmBye,
     getTeamLabel: teamGroupRankLabel,
-  });
-  const options = new Map(workflowMatchOptions().filter((option) => option.matchType === "final").map((option) => [option.matchId, option]));
-  container.querySelectorAll(".match-card-wrap").forEach((wrap) => {
-    const card = wrap.querySelector(".match-card");
-    const option = options.get(card?.dataset.matchId);
-    if (!option) return;
-    wrap.hidden = !matchPassesCourtFilter(option.matchKey);
-    const control = document.createElement("div");
-    control.className = "match-court-control";
-    control.appendChild(createCourtSelect(option));
-    wrap.appendChild(control);
   });
 }
 

@@ -35,7 +35,9 @@ export function subscribeAssignment(matchKey, callback, onError) { return onSnap
 export function subscribeWorkflow(matchKey, callback, onError) { return onSnapshot(workflowRef(matchKey), (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null), onError); }
 export function subscribeReview(matchKey, callback, onError) { return subscribeAssignment(matchKey, callback, onError); }
 
-export async function claimCurrentMatch({ matchKey, courtId, queueRevision, token = crypto.randomUUID() }) {
+export async function claimCurrentMatch({ matchKey, courtId, queueRevision, recorderName, token = crypto.randomUUID() }) {
+  const normalizedRecorderName = typeof recorderName === "string" ? recorderName.trim() : "";
+  required(normalizedRecorderName, "기록관 이름을 선택하세요.");
   return runTransaction(db, async (tx) => {
     const [queueSnap, assignmentSnap, workflowSnap] = await Promise.all([tx.get(queueRef(courtId)), tx.get(assignmentRef(matchKey)), tx.get(workflowRef(matchKey))]);
     const queue = required(queueSnap.data(), "대기열이 없습니다."); const assignment = required(assignmentSnap.data(), "배정이 없습니다."); const workflow = required(workflowSnap.data(), "워크플로가 없습니다.");
@@ -43,7 +45,7 @@ export async function claimCurrentMatch({ matchKey, courtId, queueRevision, toke
     if (queue.currentMatchKey !== matchKey) throw new Error("현재 경기가 아닙니다.");
     if (!['idle', 'rejected'].includes(workflow.draftState) || workflow.lock) throw new Error("이미 다른 기록관이 작업 중입니다.");
     const eventType = workflow.draftState === 'rejected' ? 'rejected_reclaim' : 'recorder_start'; const id = transitionId(matchKey, eventType, token, workflow.draftRevision || 0);
-    const lock = { uid: required(auth.currentUser?.uid, "로그인이 필요합니다."), token };
+    const lock = { uid: required(auth.currentUser?.uid, "로그인이 필요합니다."), token, recorderName: normalizedRecorderName };
     const nextWorkflow = { ...workflow, draftState: 'editing', resumeDraftState: workflow.draftState, lock, lastTransitionId: id };
     const nextAssignment = { ...assignment, publicStatus: 'in_progress', lastTransitionId: id };
     tx.update(workflowRef(matchKey), nextWorkflow);
@@ -57,11 +59,12 @@ export async function claimCurrentMatch({ matchKey, courtId, queueRevision, toke
   });
 }
 
-export async function saveDraft({ matchKey, courtId, token, score }) {
+export async function saveDraft({ matchKey, token, score }) {
   const snapshot = scoreSnapshot(score);
   return runTransaction(db, async (tx) => {
-    const [queueSnap, workflowSnap] = await Promise.all([tx.get(queueRef(courtId)), tx.get(workflowRef(matchKey))]); const queue = required(queueSnap.data(), "대기열이 없습니다."); const workflow = required(workflowSnap.data(), "워크플로가 없습니다.");
-    if (queue.currentMatchKey !== matchKey || workflow.draftState !== 'editing' || workflow.lock?.token !== token) throw new Error("현재 편집 권한이 없습니다.");
+    const workflowSnap = await tx.get(workflowRef(matchKey));
+    const workflow = required(workflowSnap.data(), "워크플로가 없습니다.");
+    if (workflow.draftState !== 'editing' || workflow.lock?.token !== token) throw new Error("현재 편집 권한이 없습니다.");
     const revision = (workflow.draftRevision || 0) + 1; const id = transitionId(matchKey, 'draft_save', token, revision);
     tx.update(workflowRef(matchKey), { draft: snapshot, draftRevision: revision, lastTransitionId: id }); tx.set(auditRef(id), clientAudit('draft_save', matchKey, { draft: workflow.draft || null, lock: workflow.lock }, { draft: snapshot, lock: workflow.lock }, id)); return { draftRevision: revision, transitionId: id };
   });
@@ -71,9 +74,9 @@ export async function cancelDraft({ matchKey, courtId, token, queueRevision }) {
   const result = await httpsCallable(functions, "cancelRecorderDraft")({
     tournamentId: TOURNAMENT_ID,
     matchKey,
-    courtId,
+    courtId: courtId || null,
     token,
-    queueRevision,
+    queueRevision: Number.isInteger(queueRevision) ? queueRevision : null,
   });
   return result.data;
 }
@@ -82,9 +85,9 @@ export async function submitDraft({ matchKey, courtId, token, queueRevision, sco
   const result = await httpsCallable(functions, "submitRecorderDraft")({
     tournamentId: TOURNAMENT_ID,
     matchKey,
-    courtId,
+    courtId: courtId || null,
     token,
-    queueRevision,
+    queueRevision: Number.isInteger(queueRevision) ? queueRevision : null,
     score: scoreSnapshot(score),
   });
   return result.data;

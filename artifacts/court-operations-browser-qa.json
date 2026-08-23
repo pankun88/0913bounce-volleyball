@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "kind": "web-automation-transcript",
+  "surface": "admin-and-dashboard-web",
+  "baseUrl": "http://127.0.0.1:8765",
+  "steps": [
+    {
+      "action": "temporary-admin-login",
+      "result": "passed",
+      "evidence": "Authenticated app shell became visible; temporary account was isolated to QA."
+    },
+    {
+      "action": "inspect-court-settings",
+      "result": "passed",
+      "evidence": "Three configured courts rendered as C코트, A코트, B코트 with recorder-name inputs; no court-* identifier was visible."
+    },
+    {
+      "action": "edit-recorder-name",
+      "result": "passed",
+      "evidence": "Typing 김기록 enabled the save button and changed the hint to an unsaved-changes warning."
+    },
+    {
+      "action": "inspect-unified-court-board",
+      "result": "passed",
+      "evidence": "One board rendered all 12 schedulable preliminary/final matches across divisions in columns 미배정, C코트, A코트, B코트 with real team names and no internal IDs; no duplicate phase board remained."
+    },
+    {
+      "action": "drag-card-between-courts",
+      "result": "passed",
+      "evidence": "A final-round card moved from 미배정 to a court alongside preliminary cards, proving the visible list is the complete persisted court order."
+    },
+    {
+      "action": "drag-card-within-court",
+      "result": "passed",
+      "evidence": "Dropping the last C코트 card before the first changed the rendered team order."
+    },
+    {
+      "action": "intercept-save-callable",
+      "result": "passed",
+      "evidence": "Payload contained courts including recorderName, assignmentsByCourt, unassignedAssignments, expectedTopologyRevision, and all observed expectedQueueRevisions; no production write was performed."
+    },
+    {
+      "action": "simulate-stale-queue-cas",
+      "result": "passed",
+      "evidence": "An ABORTED callable response discarded the losing local recorder-name draft, reloaded authoritative Firestore state, and left the save button disabled."
+    },
+    {
+      "action": "simulate-review-action-cas",
+      "result": "passed",
+      "evidence": "A Firebase-namespaced ABORTED response with a submission-version conflict produced an explicit not-applied conflict toast and refreshed authoritative review state without discarding an unrelated planner draft."
+    },
+    {
+      "action": "verify-existing-audience-surfaces",
+      "result": "passed",
+      "evidence": "Preliminary group standings and final bracket rendered; the deferred court-status audience section was absent."
+    }
+  ],
+  "screenshot": "artifacts/court-operations-board.webp",
+  "verdict": "passed"
+}

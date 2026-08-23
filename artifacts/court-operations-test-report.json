@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "kind": "test-report",
+  "surface": "firebase-workflow-api-and-rules",
+  "command": "npm run test:release",
+  "result": "passed",
+  "evidence": {
+    "unit": "204 passed, 0 failed; score-workflow fixtures passed; workflow-core fixtures passed",
+    "emulator": "demo-bounce-volleyball emulator release gate passed",
+    "coverage": [
+      "court topology revision CAS and stale zero-write rejection",
+      "queue revision CAS and queue-only stale zero-write rejection",
+      "court deletion moves assignments to unassigned without deleting workflow/draft",
+      "active match cross-court movement preserves lock and draft",
+      "active match moved to unassigned can keep saving, submit for review, be rejected, and cancel",
+      "rejected match priority is reconstructed after unassigned reassignment",
+      "dependency-blocked correction replay uses canonical eligibility and activates after reassignment",
+      "stale rejection cannot overwrite an already-approved unassigned workflow",
+      "newly-ready blocked final match rebuilds the normal queue cursor",
+      "destination active conflict rejects atomically",
+      "submitted and approved lifecycle preservation",
+      "recorderName claim validation and forged-name denial",
+      "legacy active lock without recorderName can continue draft saves during deployment",
+      "moved active match can save draft under the destination queue",
+      "server correction preview and apply use the same projected queue",
+      "access-code create/reissue/revoke and existing release gates"
+    ]
+  }
+}
