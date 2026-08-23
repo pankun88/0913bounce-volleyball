@@ -4,7 +4,7 @@
   "tool": "browser_tool",
   "surface": "admin-and-dashboard-web",
   "baseUrl": "http://127.0.0.1:8765",
-  "steps": [
+  "actions": [
     {
       "action": "temporary-admin-login",
       "result": "passed",
