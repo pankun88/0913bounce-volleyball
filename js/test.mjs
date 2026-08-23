@@ -10,12 +10,34 @@ import { generateBracket, recordMatchResult, groupByRound, seedOrder, nextPowerO
 import { generateRoundRobin } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
 import { normalizeBackupData } from './backup-format.js';
+import { courtMatchSummary, courtTeamNames } from './court-display.js';
 
 let pass = 0, fail = 0;
 function check(label, cond) {
   if (cond) { pass++; }
   else { fail++; console.error('FAIL:', label); }
 }
+
+// ---- court display ----
+const courtTeams = new Map([
+  ['team-a', { name: '강남 스파이크' }],
+  ['team-b', { name: '서초 블로커스' }],
+]);
+const courtGroups = new Map([['group-a', { name: 'A조' }]]);
+const prelimCourtView = courtMatchSummary(
+  { matchType: 'prelim' },
+  { teamA: 'team-a', teamB: 'team-b', groupId: 'group-a', round: 3 },
+  { teamsById: courtTeams, groupsById: courtGroups },
+);
+check('prelim court display resolves real team names', prelimCourtView.teams === '강남 스파이크 vs 서초 블로커스');
+check('prelim court display resolves group and round', prelimCourtView.label === 'A조 예선 · 3경기');
+const finalCourtView = courtMatchSummary(
+  { matchType: 'final' },
+  { teamA: { name: '남자 1위' }, teamB: { name: '남자 2위' }, roundLabel: '결승', index: 0 },
+);
+check('final court display resolves embedded team names', finalCourtView.teams === '남자 1위 vs 남자 2위');
+check('final court display resolves round label', finalCourtView.label === '결승 1경기');
+check('unresolved final teams are explicit', courtTeamNames({ teamA: null, teamB: null }).a === '대진 미정');
 
 // ---- backup format migration ----
 const legacyBackup = {

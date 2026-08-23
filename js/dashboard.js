@@ -5,6 +5,7 @@ import {
 import { evaluatePrelimMatch, computeGroupStandings } from "./match-logic.js";
 import { renderBracket, displayTeamName } from "./bracket-render.js";
 import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
+import { courtMatchSummary } from "./court-display.js";
 import { collection, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { db } from "./firebase-init.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
@@ -71,6 +72,7 @@ DIVISIONS.forEach((division) => {
   subscribeFinalMatches(division, (data) => {
     finalMatchesByDivision[division] = data;
     if (division === activeDivision) renderFinalBracket();
+    renderCourtStatus();
   });
 });
 
@@ -170,6 +172,7 @@ function renderActiveDivision() {
   document.getElementById("dashBracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${label} 본선 대진표`;
   renderPrelim();
   renderFinalBracket();
+  renderCourtStatus();
 }
 
 function setMaintenanceMode() {
@@ -220,6 +223,10 @@ function renderCourtStatus() {
   }
 
   const assignmentsByKey = new Map(courtAssignments.map((assignment) => [assignment.id, assignment]));
+  const lookups = {
+    teamsById: new Map(allTeams.map((team) => [team.id, team])),
+    groupsById: new Map(allGroups.map((group) => [group.id, group])),
+  };
   [...courtQueues].sort((a, b) => a.id.localeCompare(b.id, "ko")).forEach((queue) => {
     const card = document.createElement("article");
     card.className = "court-status-card";
@@ -227,8 +234,8 @@ function renderCourtStatus() {
     title.textContent = queue.courtName || queue.name || `${queue.id} 코트`;
     card.appendChild(title);
     card.append(
-      courtMatchSlot("현재", queue.currentMatchKey, assignmentsByKey.get(queue.currentMatchKey)),
-      courtMatchSlot("다음", queue.nextMatchKey, assignmentsByKey.get(queue.nextMatchKey)),
+      courtMatchSlot("현재", queue.currentMatchKey, assignmentsByKey.get(queue.currentMatchKey), lookups),
+      courtMatchSlot("다음", queue.nextMatchKey, assignmentsByKey.get(queue.nextMatchKey), lookups),
     );
     cards.appendChild(card);
   });
@@ -241,7 +248,16 @@ function courtHint(text) {
   return hint;
 }
 
-function courtMatchSlot(label, matchKey, assignment) {
+function officialMatchFor(assignment) {
+  if (!assignment?.matchId) return null;
+  if (assignment.matchType === "final") {
+    const division = assignment.divisionId || assignment.division;
+    return finalMatchesByDivision[division]?.find((match) => match.id === assignment.matchId) || null;
+  }
+  return allPrelimMatches.find((match) => match.id === assignment.matchId) || null;
+}
+
+function courtMatchSlot(label, matchKey, assignment, lookups) {
   const slot = document.createElement("div");
   slot.className = "court-match-slot";
   const labelEl = document.createElement("strong");
@@ -253,9 +269,9 @@ function courtMatchSlot(label, matchKey, assignment) {
   } else if (!assignment) {
     detail.textContent = "경기 정보 확인 중";
   } else {
-    const matchLabel = assignment.displayName || assignment.matchLabel || assignment.matchId || matchKey;
+    const view = courtMatchSummary(assignment, officialMatchFor(assignment), lookups);
     const status = courtPublicStatus(assignment.publicStatus);
-    detail.textContent = `${matchLabel} · ${status}`;
+    detail.textContent = [view.label, view.teams, status].filter(Boolean).join(" · ");
   }
   slot.append(labelEl, detail);
   return slot;

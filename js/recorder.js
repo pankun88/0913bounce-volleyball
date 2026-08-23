@@ -3,6 +3,7 @@ import { db } from "./firebase-init.js";
 import { TOURNAMENT_ID, describeRecorderAuthError, exchangeRecorderAccessCode, loginWithGoogle, logoutRecorder, watchRecorderAuthState } from "./recorder-auth-service.js";
 import { cancelDraft, claimCurrentMatch, saveDraft, submitDraft, subscribeAssignment, subscribeCourt, subscribeWorkflow } from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, validateSetScore } from "./match-logic.js";
+import { courtMatchSummary, courtTeamNames } from "./court-display.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries(["logoutButton", "connectionStatus", "authPanel", "authMessage", "identity", "googleLoginButton", "accessCodeForm", "accessCode", "accessCodeButton", "courtPanel", "courtSelect", "courtMessage", "workflowPanel", "matchSummary", "rejectionNotice", "lockNotice", "claimButton", "scoreForm", "scoreFields", "scoreLegend", "scoreError", "saveButton", "reviewButton", "cancelButton", "confirmPanel", "confirmScore", "backToEditButton", "submitButton"].map((id) => [id, $(id)]));
@@ -21,15 +22,22 @@ let stopCourt = () => {};
 let stopQueue = () => {};
 let stopAssignment = () => {};
 let stopWorkflow = () => {};
+let stopOfficialMatch = () => {};
+let stopTeams = () => {};
+let stopGroups = () => {};
+let officialMatch = null;
+let officialMatchKey = "";
+let teamsById = new Map();
+let groupsById = new Map();
 
 function setStatus(text) { ui.connectionStatus.textContent = text; }
 function setBusy(next) {
   busy = next;
   [ui.googleLoginButton, ui.accessCodeButton, ui.courtSelect, ui.claimButton, ui.saveButton, ui.reviewButton, ui.cancelButton, ui.backToEditButton, ui.submitButton].forEach((element) => { if (element) element.disabled = next; });
 }
-function stopMatchSubscriptions() { stopAssignment(); stopWorkflow(); stopAssignment = () => {}; stopWorkflow = () => {}; activeMatchKey = null; assignment = null; workflow = null; }
+function stopMatchSubscriptions() { stopAssignment(); stopWorkflow(); stopOfficialMatch(); stopAssignment = () => {}; stopWorkflow = () => {}; stopOfficialMatch = () => {}; activeMatchKey = null; assignment = null; workflow = null; officialMatch = null; officialMatchKey = ""; }
 function stopCourtSubscriptions() { stopCourt(); stopQueue(); stopCourt = () => {}; stopQueue = () => {}; stopMatchSubscriptions(); queue = null; }
-function resetPrivateSession() { stopCourts(); stopCourts = () => {}; stopCourtSubscriptions(); courts = []; selectedCourtId = ""; editToken = null; ui.courtSelect.replaceChildren(new Option("코트를 선택하세요", "")); ui.workflowPanel.hidden = true; ui.courtPanel.hidden = true; ui.confirmPanel.hidden = true; }
+function resetPrivateSession() { stopCourts(); stopTeams(); stopGroups(); stopCourts = () => {}; stopTeams = () => {}; stopGroups = () => {}; teamsById = new Map(); groupsById = new Map(); stopCourtSubscriptions(); courts = []; selectedCourtId = ""; editToken = null; ui.courtSelect.replaceChildren(new Option("코트를 선택하세요", "")); ui.workflowPanel.hidden = true; ui.courtPanel.hidden = true; ui.confirmPanel.hidden = true; }
 function describeError(error) {
   const code = error?.code || "";
   if (code.includes("permission-denied") || code.includes("unauthenticated")) return "권한이 없거나 권한이 만료되었습니다.";
@@ -39,10 +47,9 @@ function describeError(error) {
 }
 function isFinal() { return assignment?.matchType === "final" || assignment?.matchType === "tournament" || assignment?.phase === "final" || assignment?.phase === "finals"; }
 function teamName(side) {
-  const value = assignment?.[side === "a" ? "teamA" : "teamB"];
-  return assignment?.[`${side === "a" ? "teamA" : "teamB"}Name`] || value?.name || value || (side === "a" ? "A팀" : "B팀");
+  const names = courtTeamNames(officialMatch, teamsById);
+  return names ? names[side] : (side === "a" ? "A팀" : "B팀");
 }
-function matchLabel(match) { return match?.matchLabel || match?.label || match?.roundName || match?.matchType || "경기"; }
 function scoreFromForm() { return [...ui.scoreFields.querySelectorAll(".score-row")].map((row) => ({ a: Number(row.querySelector('[name$="-a"]').value), b: Number(row.querySelector('[name$="-b"]').value) })); }
 function requiredSets() { return isFinal() ? 3 : 2; }
 function validateScore(forSubmit) {
@@ -90,7 +97,8 @@ function renderWorkflow() {
   ui.confirmPanel.hidden = true;
   if (!queue?.currentMatchKey) { ui.matchSummary.textContent = "현재 대기 중인 경기가 없습니다."; ui.claimButton.hidden = true; ui.scoreForm.hidden = true; return; }
   if (activeMatchKey !== queue.currentMatchKey) return;
-  ui.matchSummary.textContent = `${matchLabel(assignment)}\n${teamName("a")} vs ${teamName("b")}${queue.nextMatchKey ? "\n다음 경기가 대기 중입니다." : ""}`;
+  const view = courtMatchSummary(assignment, officialMatch, { teamsById, groupsById });
+  ui.matchSummary.textContent = [view.label, view.teams || "경기 정보를 불러오는 중입니다.", queue.nextMatchKey ? "다음 경기가 대기 중입니다." : ""].filter(Boolean).join("\n");
   const rejected = workflow?.draftState === "rejected";
   const reason = workflow?.rejectionReason || workflow?.reviewReason || workflow?.rejectedReason;
   ui.rejectionNotice.hidden = !rejected; ui.rejectionNotice.textContent = rejected ? `반려됨${reason ? `: ${reason}` : ". 점수를 수정해 다시 제출하세요."}` : "";
@@ -100,9 +108,23 @@ function renderWorkflow() {
   ui.claimButton.hidden = !(workflow && ["idle", "rejected"].includes(workflow.draftState) && !workflow.lock);
   renderScoreForm();
 }
+/** 배정은 경기 참조만 가지므로 팀이름·경기명은 공식 경기 문서에서 읽는다. */
+function attachOfficialMatch(current) {
+  const isFinalMatch = current?.matchType === "final";
+  const divisionId = current?.divisionId || current?.division || "";
+  const usable = Boolean(current?.matchId) && (!isFinalMatch || Boolean(divisionId));
+  const key = usable ? `${current.matchType}:${divisionId}:${current.matchId}` : "";
+  if (key === officialMatchKey) return;
+  stopOfficialMatch(); stopOfficialMatch = () => {}; officialMatch = null; officialMatchKey = key;
+  if (!key) { renderWorkflow(); return; }
+  const ref = isFinalMatch
+    ? doc(db, "tournaments", TOURNAMENT_ID, "divisions", divisionId, "finalMatches", current.matchId)
+    : doc(db, "tournaments", TOURNAMENT_ID, "prelimMatches", current.matchId);
+  stopOfficialMatch = onSnapshot(ref, (snapshot) => { officialMatch = snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null; renderWorkflow(); }, () => { officialMatch = null; renderWorkflow(); });
+}
 function attachMatch(matchKey) {
   stopMatchSubscriptions(); activeMatchKey = matchKey;
-  stopAssignment = subscribeAssignment(matchKey, (value) => { assignment = value; renderWorkflow(); }, (error) => { setStatus(describeError(error)); });
+  stopAssignment = subscribeAssignment(matchKey, (value) => { assignment = value; attachOfficialMatch(value); renderWorkflow(); }, (error) => { setStatus(describeError(error)); });
   stopWorkflow = subscribeWorkflow(matchKey, (value) => { workflow = value; if (value?.draftState !== "editing" || value?.lock?.token !== editToken) editToken = value?.lock?.token === editToken ? editToken : null; renderWorkflow(); }, (error) => { workflow = null; renderWorkflow(); if (!assignment || assignment.publicStatus !== "in_progress") setStatus(describeError(error)); });
 }
 function attachCourt(courtId) {
@@ -112,6 +134,15 @@ function attachCourt(courtId) {
   stopQueue = onSnapshot(doc(db, "tournaments", TOURNAMENT_ID, "courtQueues", courtId), (snapshot) => { queue = snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null; if (queue?.currentMatchKey) attachMatch(queue.currentMatchKey); else { stopMatchSubscriptions(); renderWorkflow(); } }, (error) => { queue = null; setStatus(describeError(error)); renderWorkflow(); });
 }
 function startReadySubscriptions() {
+  stopTeams(); stopGroups();
+  stopTeams = onSnapshot(collection(db, "tournaments", TOURNAMENT_ID, "teams"), (snapshot) => {
+    teamsById = new Map(snapshot.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+    renderWorkflow();
+  }, (error) => { setStatus(describeError(error)); });
+  stopGroups = onSnapshot(collection(db, "tournaments", TOURNAMENT_ID, "groups"), (snapshot) => {
+    groupsById = new Map(snapshot.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+    renderWorkflow();
+  }, (error) => { setStatus(describeError(error)); });
   stopCourts();
   stopCourts = onSnapshot(collection(db, "tournaments", TOURNAMENT_ID, "courts"), (snapshot) => {
     courts = snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id), "ko"));
