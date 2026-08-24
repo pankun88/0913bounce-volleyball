@@ -746,6 +746,64 @@ export async function cancelRecorderDraft(request) {
   });
 }
 
+export async function resumeRecorderDraft(request) {
+  requireMain(request.data);
+  const uid = request.auth?.uid;
+  const { matchKey, courtId, recorderName, queueRevision } = request.data || {};
+  if (typeof matchKey !== 'string' || !matchKey || typeof courtId !== 'string' || !courtId
+      || typeof recorderName !== 'string' || !recorderName.trim()) {
+    throw new HttpsError('invalid-argument', 'Match, court and recorder name required.');
+}
+  const normalizedRecorderName = recorderName.trim();
+  const token = randomCode();
+  let result;
+  await db().runTransaction(async (tx) => {
+    await recorder(tx, uid);
+    const [assignmentSnap, workflowSnap, courtSnap, queueSnap] = await Promise.all([
+      tx.get(ref('courtAssignments', matchKey)),
+      tx.get(ref('scoreWorkflows', matchKey)),
+      tx.get(ref('courts', courtId)),
+      tx.get(ref('courtQueues', courtId)),
+    ]);
+    if (!assignmentSnap.exists || !workflowSnap.exists || !courtSnap.exists || !queueSnap.exists) {
+      throw new HttpsError('not-found', 'Recorder workflow not found.');
+}
+    const assignment = assignmentSnap.data();
+    const workflow = workflowSnap.data();
+    const court = courtSnap.data();
+    const queue = queueSnap.data();
+    if (assignment.courtId !== courtId || queue.currentMatchKey !== matchKey
+        || !Number.isInteger(queueRevision) || queue.queueRevision !== queueRevision) {
+      throw new HttpsError('aborted', 'Court queue changed. Refresh and try again.');
+}
+    if (assignment.publicStatus !== 'in_progress' || workflow.draftState !== 'editing'
+        || !workflow.lock || workflow.lock.uid !== uid
+        || workflow.lock.recorderName !== normalizedRecorderName
+        || court.recorderName?.trim() !== normalizedRecorderName) {
+      throw new HttpsError('permission-denied', 'Only the same recorder can resume this draft.');
+}
+    const nextLock = { uid, token, recorderName: normalizedRecorderName };
+    const id = `${transitionId(matchKey, 'recorder_resume', workflow.draftRevision || 0)}:${resetTokenHash(token).slice(0, 12)}`;
+    tx.update(workflowSnap.ref, { lock: nextLock, lastTransitionId: id });
+    tx.update(assignmentSnap.ref, { lastTransitionId: id });
+    audit(tx, id, 'recorder_resume', matchKey, {
+      uid,
+      name: normalizedRecorderName,
+      email: request.auth?.token?.email || null,
+    }, {
+      lock: workflow.lock,
+      draftState: workflow.draftState,
+      draftRevision: workflow.draftRevision || 0,
+    }, {
+      lock: nextLock,
+      draftState: workflow.draftState,
+      draftRevision: workflow.draftRevision || 0,
+    });
+    result = { token, transitionId: id, resumed: true, draftRevision: workflow.draftRevision || 0 };
+  });
+  return result;
+}
+
 export async function submitRecorderDraft(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;

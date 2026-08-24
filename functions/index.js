@@ -16,6 +16,7 @@ export const resetTournament = callable(adminWorkflow.resetTournament);
 export const exchangeRecorderAccessCode = callable(adminWorkflow.exchangeRecorderAccessCode);
 export const replaceCourtWorkflows = callable(adminWorkflow.replaceCourtWorkflows);
 export const publishFinalStructure = callable(adminWorkflow.publishFinalStructure);
+export const resumeRecorderDraft = callable(adminWorkflow.resumeRecorderDraft);
 export const cancelRecorderDraft = callable(adminWorkflow.cancelRecorderDraft);
 export const submitRecorderDraft = callable(adminWorkflow.submitRecorderDraft);
 export const approveScoreReview = callable(adminWorkflow.approveScoreReview);

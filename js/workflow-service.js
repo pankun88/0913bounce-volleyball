@@ -35,6 +35,27 @@ export function subscribeAssignment(matchKey, callback, onError) { return onSnap
 export function subscribeWorkflow(matchKey, callback, onError) { return onSnapshot(workflowRef(matchKey), (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null), onError); }
 export function subscribeReview(matchKey, callback, onError) { return subscribeAssignment(matchKey, callback, onError); }
 
+export function canResumeCurrentMatch(workflow, recorderName) {
+  const normalizedRecorderName = typeof recorderName === "string" ? recorderName.trim() : "";
+  return Boolean(
+    workflow?.draftState === "editing"
+    && workflow?.lock
+    && workflow.lock.uid === auth.currentUser?.uid
+    && workflow.lock.recorderName === normalizedRecorderName,
+  );
+}
+
+export async function resumeCurrentMatch({ matchKey, courtId, queueRevision, recorderName }) {
+  const result = await httpsCallable(functions, "resumeRecorderDraft")({
+    tournamentId: TOURNAMENT_ID,
+    matchKey,
+    courtId,
+    queueRevision,
+    recorderName,
+  });
+  return result.data;
+}
+
 export async function claimCurrentMatch({ matchKey, courtId, queueRevision, recorderName, token = crypto.randomUUID() }) {
   const normalizedRecorderName = typeof recorderName === "string" ? recorderName.trim() : "";
   required(normalizedRecorderName, "기록관 이름을 선택하세요.");

@@ -467,6 +467,63 @@ export async function runFunctionsSuite() {
     assert.equal(approvedPrelim.data().result, 'draw', 'approved-recorder-score-updates-prelim-result');
     assert.equal(approvedPrelim.data().officialRevision, 1, 'approved-recorder-score-increments-official-revision');
     await f.seed(async (db) => {
+      await setDoc(doc(db, path('courts', 'resume-court')), {
+        id: 'resume-court',
+        name: '재접속',
+        recorderName: '재접속 기록관',
+      });
+      await setDoc(doc(db, path('courtAssignments', 'resume-match')), {
+        matchKey: 'resume-match',
+        matchType: 'prelim',
+        matchId: 'resume-match',
+        courtId: 'resume-court',
+        publicStatus: 'in_progress',
+        lastTransitionId: 'seed:resume',
+      });
+      await setDoc(doc(db, path('courtQueues', 'resume-court')), {
+        courtId: 'resume-court',
+        currentMatchKey: 'resume-match',
+        nextMatchKey: null,
+        normalCursorMatchKey: 'resume-match',
+        priorityEntries: [],
+        nextPrioritySequence: 0,
+        queueRevision: 3,
+        lastTransitionId: 'seed:resume',
+      });
+      await setDoc(doc(db, path('scoreWorkflows', 'resume-match')), {
+        matchKey: 'resume-match',
+        draftState: 'editing',
+        resumeDraftState: 'idle',
+        lock: { uid: credential.user.uid, token: 'lost-browser-token', recorderName: '재접속 기록관' },
+        draft: { sets: [{ a: 6, b: 4 }] },
+        draftRevision: 2,
+        submissionVersion: 0,
+        officialRevision: 0,
+        lastTransitionId: 'seed:resume',
+      });
+    });
+    await assert.rejects(call(functions, 'resumeRecorderDraft', {
+      ...data,
+      matchKey: 'resume-match',
+      courtId: 'resume-court',
+      recorderName: '다른 기록관',
+      queueRevision: 3,
+    }), /same recorder/i, 'resume-different-recorder-rejected');
+    const resumedDraft = await call(functions, 'resumeRecorderDraft', {
+      ...data,
+      matchKey: 'resume-match',
+      courtId: 'resume-court',
+      recorderName: '재접속 기록관',
+      queueRevision: 3,
+    });
+    assert.equal(resumedDraft.resumed, true, 'same-recorder-browser-reconnect-succeeds');
+    assert.notEqual(resumedDraft.token, 'lost-browser-token', 'resume-rotates-lost-browser-token');
+    const resumedWorkflow = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'resume-match'))));
+    assert.deepEqual(resumedWorkflow.data().draft, { sets: [{ a: 6, b: 4 }] }, 'resume-preserves-saved-draft');
+    assert.equal(resumedWorkflow.data().lock.uid, credential.user.uid, 'resume-preserves-google-account-owner');
+    assert.equal(resumedWorkflow.data().lock.recorderName, '재접속 기록관', 'resume-preserves-recorder-name');
+    assert.equal(resumedWorkflow.data().lock.token, resumedDraft.token, 'resume-persists-new-token');
+    await f.seed(async (db) => {
       await setDoc(doc(db, 'tournaments/main'), {
         tournamentId: 'main',
         name: '초기화 대상 대회',

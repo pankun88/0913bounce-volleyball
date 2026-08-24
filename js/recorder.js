@@ -1,7 +1,10 @@
 import { collection, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { db } from "./firebase-init.js";
 import { TOURNAMENT_ID, describeRecorderAuthError, exchangeRecorderAccessCode, loginWithGoogle, logoutRecorder, watchRecorderAuthState } from "./recorder-auth-service.js";
-import { cancelDraft, claimCurrentMatch, saveDraft, submitDraft, subscribeAssignment, subscribeCourt, subscribeWorkflow } from "./workflow-service.js";
+import {
+  canResumeCurrentMatch, cancelDraft, claimCurrentMatch, resumeCurrentMatch, saveDraft, submitDraft,
+  subscribeAssignment, subscribeCourt, subscribeWorkflow,
+} from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, validateSetScore } from "./match-logic.js";
 import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-display.js";
 
@@ -166,10 +169,12 @@ function renderWorkflow() {
   const rejected = workflow?.draftState === "rejected";
   const reason = workflow?.rejectionReason || workflow?.reviewReason || workflow?.rejectedReason;
   ui.rejectionNotice.hidden = !rejected; ui.rejectionNotice.textContent = rejected ? `반려됨${reason ? `: ${reason}` : ". 점수를 수정해 다시 제출하세요."}` : "";
+  const resumable = !editToken && canResumeCurrentMatch(workflow, selectedRecorderName);
   const lockedByOther = assignment?.publicStatus === "in_progress"
-    && (!workflow || workflow?.draftState !== "editing" || workflow?.lock?.token !== editToken);
+    && (!workflow || workflow?.draftState !== "editing" || (workflow?.lock?.token !== editToken && !resumable));
   ui.lockNotice.hidden = !lockedByOther; ui.lockNotice.textContent = lockedByOther ? "다른 기록관이 이 경기를 입력 중입니다." : "";
-  ui.claimButton.hidden = !(workflow && ["idle", "rejected"].includes(workflow.draftState) && !workflow.lock);
+  ui.claimButton.hidden = !(resumable || (workflow && ["idle", "rejected"].includes(workflow.draftState) && !workflow.lock));
+  ui.claimButton.textContent = resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
   renderScoreForm();
 }
 /** 배정은 경기 참조만 가지므로 팀이름·경기명은 공식 경기 문서에서 읽는다. */
@@ -301,7 +306,23 @@ ui.courtSelect.addEventListener("change", () => {
   selectedRecorderName = recorderName(court);
   attachCourt(ui.courtSelect.value);
 });
-ui.claimButton.addEventListener("click", async () => { if (!queue?.currentMatchKey || !selectedCourtId || !selectedRecorderName || busy) return; setBusy(true); try { const result = await claimCurrentMatch({ matchKey: queue.currentMatchKey, courtId: selectedCourtId, queueRevision: queue.queueRevision, recorderName: selectedRecorderName }); editToken = result.token; setStatus("배정이 완료되었습니다. 경기 입력을 시작했습니다."); } catch (error) { setStatus(describeError(error)); } finally { setBusy(false); } });
+ui.claimButton.addEventListener("click", async () => {
+  if (!queue?.currentMatchKey || !selectedCourtId || !selectedRecorderName || busy) return;
+  setBusy(true);
+  try {
+    const resumable = !editToken && canResumeCurrentMatch(workflow, selectedRecorderName);
+    const result = resumable
+      ? await resumeCurrentMatch({ matchKey: queue.currentMatchKey, courtId: selectedCourtId, queueRevision: queue.queueRevision, recorderName: selectedRecorderName })
+      : await claimCurrentMatch({ matchKey: queue.currentMatchKey, courtId: selectedCourtId, queueRevision: queue.queueRevision, recorderName: selectedRecorderName });
+    editToken = result.token;
+    setStatus(resumable ? "이전 작성 내용을 불러왔습니다." : "배정이 완료되었습니다. 경기 입력을 시작했습니다.");
+    renderWorkflow();
+  } catch (error) {
+    setStatus(describeError(error));
+  } finally {
+    setBusy(false);
+  }
+});
 ui.scoreForm.addEventListener("submit", async (event) => { event.preventDefault(); if (busy) return; const check = validateScore(false); ui.scoreError.textContent = check.ok ? "" : check.message; if (!check.ok) return; setBusy(true); try { await saveDraft({ matchKey: activeMatchKey, token: editToken, score: check.score }); setStatus("임시 저장되었습니다."); } catch (error) { ui.scoreError.textContent = describeError(error); } finally { setBusy(false); } });
 ui.reviewButton.addEventListener("click", () => { const check = validateScore(true); ui.scoreError.textContent = check.ok ? "" : check.message; if (!check.ok) return; renderConfirmScore(check.score); ui.confirmPanel.hidden = false; ui.confirmPanel.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
 ui.backToEditButton.addEventListener("click", () => { ui.confirmPanel.hidden = true; });
