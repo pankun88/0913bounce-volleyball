@@ -68,7 +68,7 @@ function refreshActiveDivisionData() {
   renderGroupList();
   renderTeamGroupSelect();
   renderGroupTeamLists();
-  renderPrelimGroups();
+  renderPrelimViews();
   renderFinalTeamPicker();
   renderWorkflowCourtPlanner();
   renderScoreReviews();
@@ -392,7 +392,7 @@ function subscribeWorkflowReviews() {
       if (!workflowDirty) resetWorkflowDraft();
       renderScoreReviews();
       renderWorkflowCourtPlanner();
-      renderPrelimGroups();
+      renderPrelimViews();
       renderFinalBracket();
     }, (err) => reportError("검수 목록 구독", err)),
     onSnapshot(collection(db, ...root, "scoreWorkflows"), (snap) => {
@@ -408,7 +408,7 @@ function subscribeWorkflowReviews() {
       if (!workflowDirty) resetWorkflowDraft();
       renderWorkflowCourtPlanner();
       renderScoreReviews();
-      renderPrelimGroups();
+      renderPrelimViews();
       renderFinalBracket();
     }, (err) => reportError("코트 목록 구독", err)),
     onSnapshot(collection(db, ...root, "auditEvents"), (snap) => {
@@ -509,7 +509,7 @@ async function reloadWorkflowAuthoritativeState({ preserveDraft = false } = {}) 
   }
   renderWorkflowCourtPlanner();
   renderScoreReviews();
-  renderPrelimGroups();
+  renderPrelimViews();
   renderFinalBracket();
 }
 
@@ -1550,7 +1550,7 @@ async function handleSetMatchMode(group, mode) {
 
 async function applyRingOrderChange(group, nextRingOrder) {
   if (!confirmIfResultsWillReset(group.id, group.name)) {
-    renderPrelimGroups(); // 취소 시에도 선택 상태가 이미 풀렸으므로 화면을 다시 그려 정리한다
+    renderPrelimSetupGroups(); // 취소 시에도 선택 상태가 이미 풀렸으므로 화면을 다시 그려 정리한다
     return;
   }
   try {
@@ -1605,14 +1605,14 @@ function handleVertexClick(group, ringOrder, index) {
   if (!ringSelection) {
     if (ringOrder[index]) {
       ringSelection = { type: "vertex", index, groupId: group.id };
-      renderPrelimGroups();
+      renderPrelimSetupGroups();
     }
     return;
   }
   // 이미 선택된 꼭짓점을 다시 클릭 -> 선택 취소
   if (ringSelection.type === "vertex" && ringSelection.index === index) {
     ringSelection = null;
-    renderPrelimGroups();
+    renderPrelimSetupGroups();
     return;
   }
   const data = ringSelection;
@@ -1627,7 +1627,7 @@ function handlePoolChipClick(group, ringOrder, teamId) {
   } else {
     ringSelection = { type: "pool", teamId, groupId: group.id };
   }
-  renderPrelimGroups();
+  renderPrelimSetupGroups();
 }
 
 function buildRoundRobinControls(g, groupTeams) {
@@ -1754,6 +1754,83 @@ async function handleMatchReorderDrop(groupId, groupMatches, draggedId, targetId
   }
 }
 
+/** 예선 관련 화면(대회설정 탭의 생성 컨트롤 + 예선 탭의 대진표)을 함께 다시 그린다 */
+function renderPrelimViews() {
+  renderPrelimSetupGroups();
+  renderPrelimGroups();
+}
+
+/** [대회설정] 탭: 조별 대진 방식 선택과 대진 생성 컨트롤 (링크제 배치 / 라운드로빈 생성) */
+function renderPrelimSetupGroups() {
+  const el = document.getElementById("prelimSetupGroups");
+  if (!el) return;
+  if (!groups.length) {
+    el.innerHTML = '<div class="empty-hint">먼저 위에서 조를 만들고 팀을 등록하세요.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  groups.forEach((g) => {
+    const groupTeams = teams.filter((t) => t.groupId === g.id);
+    const mode = g.matchMode || "ring";
+
+    const box = document.createElement("div");
+    box.className = "settings-box";
+    box.style.marginBottom = "12px";
+
+    const head = document.createElement("div");
+    head.className = "row";
+    head.style.justifyContent = "space-between";
+    head.style.marginBottom = "10px";
+    const title = document.createElement("b");
+    title.textContent = `${g.name} · ${groupTeams.length}팀`;
+    head.appendChild(title);
+
+    const headRight = document.createElement("span");
+    headRight.className = "row";
+    const modeToggle = document.createElement("span");
+    modeToggle.className = "mode-toggle";
+    modeToggle.innerHTML = `
+      <button type="button" class="mode-btn ${mode === "ring" ? "active" : ""}" data-mode="ring">링크제</button>
+      <button type="button" class="mode-btn ${mode === "roundrobin" ? "active" : ""}" data-mode="roundrobin">라운드로빈</button>`;
+    modeToggle.querySelectorAll(".mode-btn").forEach((btn) => {
+      btn.addEventListener("click", () => handleSetMatchMode(g, btn.dataset.mode));
+    });
+    headRight.appendChild(modeToggle);
+
+    const resetGroupBtn = document.createElement("button");
+    resetGroupBtn.type = "button";
+    resetGroupBtn.className = "btn danger small";
+    resetGroupBtn.title = `${g.name}의 예선 대진과 결과, 도형(링크제) 배치를 모두 삭제합니다`;
+    resetGroupBtn.textContent = "초기화";
+    resetGroupBtn.addEventListener("click", () => handleResetGroupPrelim(g));
+    headRight.appendChild(resetGroupBtn);
+    head.appendChild(headRight);
+    box.appendChild(head);
+
+    if (groupTeams.length < 2) {
+      const hint = document.createElement("div");
+      hint.className = "empty-hint";
+      hint.style.padding = "0";
+      hint.textContent = "이 조에 팀이 2팀 이상 등록되면 대진을 만들 수 있습니다.";
+      box.appendChild(hint);
+    } else if (mode === "ring") {
+      box.appendChild(buildRingControls(g, groupTeams));
+    } else {
+      box.appendChild(buildRoundRobinControls(g, groupTeams));
+    }
+
+    const madeHint = document.createElement("div");
+    madeHint.className = "empty-hint";
+    madeHint.style.padding = "6px 0 0";
+    const madeCount = prelimMatches.filter((m) => m.groupId === g.id).length;
+    madeHint.textContent = madeCount ? `생성된 경기 ${madeCount}개 — [예선] 탭에서 대진표와 순위표를 확인하세요.` : "아직 생성된 경기가 없습니다.";
+    box.appendChild(madeHint);
+
+    el.appendChild(box);
+  });
+}
+
+/** [예선] 탭: 조별 대진표·순위표 출력과 점수 입력 (대진 생성은 대회설정 탭에서 한다) */
 function renderPrelimGroups() {
   const el = document.getElementById("prelimGroups");
   if (!groups.length) {
@@ -1771,39 +1848,19 @@ function renderPrelimGroups() {
     const card = document.createElement("div");
     card.className = "card";
     const heading = document.createElement("h2");
-    heading.innerHTML = `📋 ${escapeHtml(g.name)} 예선`;
-    const resetGroupBtn = document.createElement("button");
-    resetGroupBtn.type = "button";
-    resetGroupBtn.className = "btn danger small";
-    resetGroupBtn.style.marginLeft = "auto";
-    resetGroupBtn.title = `${g.name}의 예선 대진과 결과, 도형(링크제) 배치를 모두 삭제합니다`;
-    resetGroupBtn.textContent = "초기화";
-    resetGroupBtn.addEventListener("click", () => handleResetGroupPrelim(g));
-    heading.appendChild(resetGroupBtn);
+    heading.innerHTML = `📋 ${escapeHtml(g.name)} 예선 <span style="margin-left:auto; font-weight:400; color:var(--muted); font-size:13px;">${mode === "ring" ? "링크제" : "라운드로빈"}</span>`;
     card.appendChild(heading);
 
-    // 방식 토글
-    const modeRow = document.createElement("div");
-    modeRow.className = "row";
-    modeRow.style.marginBottom = "12px";
-    modeRow.innerHTML = `<span class="mode-toggle">
-      <button type="button" class="mode-btn ${mode === "ring" ? "active" : ""}" data-mode="ring">링크제</button>
-      <button type="button" class="mode-btn ${mode === "roundrobin" ? "active" : ""}" data-mode="roundrobin">라운드로빈</button>
-    </span>`;
-    modeRow.querySelectorAll(".mode-btn").forEach((btn) => {
-      btn.addEventListener("click", () => handleSetMatchMode(g, btn.dataset.mode));
-    });
-    card.appendChild(modeRow);
-
-    if (groupTeams.length < 2) {
-      const hint = document.createElement("div");
-      hint.className = "empty-hint";
-      hint.textContent = "이 조에 팀이 2팀 이상 등록되면 대진을 만들 수 있습니다.";
-      card.appendChild(hint);
-    } else if (mode === "ring") {
-      card.appendChild(buildRingControls(g, groupTeams));
-    } else {
-      card.appendChild(buildRoundRobinControls(g, groupTeams));
+    // 링크제는 배치된 도형 자체가 대진표이므로 읽기 전용으로 함께 보여준다
+    if (mode === "ring" && (g.ringOrder || []).some(Boolean)) {
+      const diagramHost = document.createElement("div");
+      diagramHost.style.margin = "4px auto 10px";
+      renderRingDiagram(diagramHost, {
+        ringOrder: normalizeRingOrder(g.ringOrder, groupTeams.map((t) => t.id)),
+        teamNameById: (id) => teamName(id),
+        editable: false,
+      });
+      card.appendChild(diagramHost);
     }
 
     // 순위표
@@ -1834,7 +1891,7 @@ function renderPrelimGroups() {
     const matchList = document.createElement("div");
     matchList.style.marginTop = "14px";
     if (!groupMatches.length) {
-      matchList.innerHTML = '<div class="empty-hint">생성된 경기가 없습니다. 위에서 대진을 생성하세요.</div>';
+      matchList.innerHTML = '<div class="empty-hint">생성된 경기가 없습니다. 대회설정 탭의 \'예선 대진 방식·생성\'에서 대진을 생성하세요.</div>';
     } else {
       const reorderable = mode === "roundrobin" && groupMatches.length > 1;
       if (reorderable) {

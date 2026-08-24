@@ -120,6 +120,12 @@
     </div>
 
     <div class="card">
+      <h2>🗓️ 예선 대진 방식·생성 <button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="모든 조의 예선 대진과 결과를 삭제합니다">전체 초기화</button></h2>
+      <p class="empty-hint" style="margin:0 0 12px;">조마다 <b>라운드로빈</b>(모든 팀이 한 번씩 대결) 또는 <b>링크제</b>(도형 꼭짓점에 배치해 인접한 팀끼리만 대결) 방식을 선택하고 대진을 생성하세요. 생성된 대진과 순위표는 <b>[예선]</b> 탭에서 확인합니다.</p>
+      <div id="prelimSetupGroups"></div>
+    </div>
+
+    <div class="card">
       <h2>🏟️ 코트 설정</h2>
       <p class="empty-hint">코트 표시 이름과 담당 기록관을 설정하세요. 코트를 삭제하면 해당 경기는 미배정으로 이동합니다.</p>
       <div id="courtSettingsList" class="court-settings-list"></div>
@@ -163,8 +169,8 @@
   <!-- 예선 -->
   <section class="tab-panel" id="tab-prelim">
     <div class="card">
-      <h2>📋 예선 대진 설정 <button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="모든 조의 예선 대진과 결과를 삭제합니다">초기화</button></h2>
-      <p class="empty-hint" style="margin:0;">조마다 <b>라운드로빈</b>(모든 팀이 한 번씩 대결) 또는 <b>링크제</b>(도형 꼭짓점에 배치해 인접한 팀끼리만 대결) 방식을 선택하세요. 방식과 대진 생성은 아래 각 조 카드에서 진행합니다.</p>
+      <h2>📋 예선 대진표</h2>
+      <p class="empty-hint" style="margin:0;">대진 방식 선택과 대진 생성은 <b>[대회설정]</b> 탭의 '예선 대진 방식·생성'에서 합니다. 여기서는 조별 대진과 순위표를 확인하고 점수를 입력하세요.</p>
     </div>
     <div id="prelimGroups"></div>
   </section>

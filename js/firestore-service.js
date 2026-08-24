@@ -115,7 +115,7 @@ export async function setGroupRingOrder(groupId, ringOrder) {
   await updateDoc(doc(groupsCol(), groupId), { ringOrder });
 }
 
-/** 모든 조의 링크제 꼭짓점 배치(ringOrder)를 비운다 ('예선 대진 설정' 전체 초기화 버튼용).
+/** 모든 조의 링크제 꼭짓점 배치(ringOrder)를 비운다 (대회설정 탭 '예선 대진 방식·생성'의 전체 초기화 버튼용).
  *  예선 경기 자체는 clearAllPrelimMatches가 지우므로, 이 함수는 도형에 남아있는 팀 배치만 정리한다. */
 export async function resetAllRingOrders(division) {
   const existing = await getDocs(groupsCol());
@@ -231,7 +231,7 @@ export async function clearPrelimMatchesForGroup(groupId) {
   await batch.commit();
 }
 
-/** 모든 조의 예선 경기(대진+결과)를 전부 삭제한다 ('예선 대진 설정' 초기화 버튼용). */
+/** 모든 조의 예선 경기(대진+결과)를 전부 삭제한다 (대회설정 탭 '예선 대진 방식·생성'의 전체 초기화 버튼용). */
 export async function clearAllPrelimMatches(division) {
   const existing = await getDocs(prelimCol());
   const batch = writeBatch(db);
