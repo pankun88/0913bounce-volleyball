@@ -9,7 +9,7 @@
 <body>
   <main class="recorder-shell">
     <header class="app-header">
-      <div><p class="eyebrow">BOUNCE VOLLEYBALL</p><h1>기록관 입력</h1></div>
+      <div class="header-title"><p class="eyebrow">BOUNCE VOLLEYBALL</p><h1>기록관 입력</h1><p class="header-subtitle">현장 경기 점수 기록</p></div>
       <button id="logoutButton" class="quiet-button" type="button" hidden>로그아웃</button>
     </header>
 
@@ -27,8 +27,8 @@
     </section>
 
     <section id="courtPanel" class="panel" hidden aria-labelledby="courtTitle">
-      <h2 id="courtTitle">기록관 이름 선택</h2>
-      <label for="courtSelect">기록관 이름</label>
+      <h2 id="courtTitle">기록관 · 코트 선택</h2>
+      <label for="courtSelect">담당 기록관</label>
       <select id="courtSelect"><option value="">이름을 선택하세요</option></select>
       <p id="courtMessage" role="status" aria-live="polite"></p>
     </section>
@@ -54,7 +54,7 @@
     <section id="confirmPanel" class="panel" hidden aria-labelledby="confirmTitle">
       <h2 id="confirmTitle">제출 전 확인</h2>
       <p>아래 점수로 제출하면 관리자 승인 대기 상태가 되며, 코트는 다음 경기로 진행됩니다.</p>
-      <p id="confirmScore" class="confirm-score"></p>
+      <div id="confirmScore" class="confirm-score"></div>
       <div class="actions">
         <button id="backToEditButton" class="secondary-button" type="button">수정</button>
         <button id="submitButton" class="primary-button" type="button">제출</button>

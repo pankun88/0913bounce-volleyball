@@ -4,6 +4,36 @@ const READY = 'ready';
 const ACTIVE_STATUS = 'in_progress';
 const NORMAL_STATUS = 'scheduled';
 
+/**
+ * 코트 배정 초안을 편집하는 동안 새 대진이 생성돼도 기존 선택을 보존하면서
+ * 새 경기를 초안에 합친다. 공식 기록이 있는 경기는 서버 배정이 있을 때만 넣는다.
+ */
+export function reconcilePlannerAssignments(currentAssignments, matchOptions, persistedAssignments = []) {
+  const persisted = new Map(persistedAssignments.map((assignment) => [
+    assignment.matchKey || assignment.id,
+    { ...assignment, matchKey: assignment.matchKey || assignment.id },
+  ]));
+  const merged = currentAssignments.map((assignment) => {
+    const option = matchOptions.find((item) => item.matchKey === assignment.matchKey);
+    return option ? { ...assignment, ...option, matchKey: option.matchKey } : assignment;
+  });
+  const mergedKeys = new Set(merged.map((assignment) => assignment.matchKey));
+
+  matchOptions.forEach((option) => {
+    if (mergedKeys.has(option.matchKey)) return;
+    const saved = persisted.get(option.matchKey);
+    if (!saved && option.hasOfficialHistory) return;
+    merged.push({
+      ...option,
+      ...(saved || {}),
+      matchKey: option.matchKey,
+      courtId: saved?.courtId || null,
+    });
+    mergedKeys.add(option.matchKey);
+  });
+  return merged;
+}
+
 function cloneQueue(queue, changes = {}) {
   return {
     ...queue,

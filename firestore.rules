@@ -15,6 +15,10 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/tournaments/$(tournamentId));
     }
 
+    function isNotMaintained(tournamentId) {
+      return tournament(tournamentId).data.get('maintenance', {}).get('enabled', false) != true;
+    }
+
     function accessConfig(tournamentId) {
       return get(/databases/$(database)/documents/tournaments/$(tournamentId)/recorderAccess/config);
     }
@@ -208,26 +212,26 @@ service cloud.firestore {
     match /tournaments/{tournamentId} {
       allow read: if isMain(tournamentId);
       allow create, delete: if false;
-      allow update: if isMain(tournamentId) && isAdmin();
+      allow update: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
 
       match /groups/{groupId} {
         allow read: if isMain(tournamentId);
-        allow write: if isMain(tournamentId) && isAdmin();
+        allow write: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
       }
       match /teams/{teamId} {
         allow read: if isMain(tournamentId);
-        allow write: if isMain(tournamentId) && isAdmin();
+        allow write: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
       }
       match /prelimMatches/{matchId} {
         allow read: if isMain(tournamentId);
         allow create: if isMain(tournamentId)
-          && isAdmin()
+          && isAdmin() && isNotMaintained(tournamentId)
           && request.resource.data.sets.size() == 0
           && request.resource.data.status == 'pending'
           && request.resource.data.result == null;
-        allow delete: if isMain(tournamentId) && isAdmin();
+        allow delete: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
         allow update: if isMain(tournamentId)
-          && isAdmin()
+          && isAdmin() && isNotMaintained(tournamentId)
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'round'
           ]);
@@ -306,6 +310,7 @@ service cloud.firestore {
         allow update, delete: if false;
         allow create: if isMain(tournamentId)
           && request.auth != null
+          && isNotMaintained(tournamentId)
           && request.resource.data.transitionId == transitionId
           && request.resource.data.actor.uid == request.auth.uid
           && request.resource.data.createdAt == request.time
@@ -321,7 +326,14 @@ service cloud.firestore {
       }
       match /recorderAccess/{document=**} { allow read, write: if false; }
       match /migrationManifests/{manifestId} { allow read, write: if false; }
-      match /restoreManifests/{manifestId} { allow read, write: if false; }
+      match /officialRevisions/{revisionId} {
+        allow read: if isMain(tournamentId) && isAdmin();
+        allow write: if false;
+      }
+      match /restoreManifests/{document=**} {
+        allow read: if isMain(tournamentId) && isAdmin();
+        allow write: if false;
+      }
       match /{document=**} { allow read, write: if false; }
     }
   }

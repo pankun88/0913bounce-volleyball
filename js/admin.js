@@ -17,8 +17,12 @@ import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam,
 import { renderBracket } from "./bracket-render.js";
 import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
 import { normalizeRingOrder, getRingMatchPairs, renderRingDiagram } from "./ring-bracket.js";
+import { orderExistingRoundRobinMatchIds } from "./schedule.js";
 import { adminWorkflowCallable } from "./workflow-service.js";
-import { courtMatchSummary, courtTeamNames } from "./court-display.js";
+import { reconcilePlannerAssignments } from "./score-workflow.js";
+import {
+  courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
+} from "./court-display.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
 
 // ---------------- 상태 ----------------
@@ -56,9 +60,39 @@ let workflowDraftAssignments = [];
 let workflowDraftCourts = [];
 let workflowDirty = false;
 let workflowSaveInProgress = false;
+let tournamentResetInProgress = false;
+let tournamentResetState = null;
+const TOURNAMENT_RESET_STATE_KEY = "bounce-volleyball:tournament-reset";
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
+
+function syncDivisionThemeScopes() {
+  ["divisionSetupSession", "tab-prelim", "tab-final"].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.dataset.divisionTheme = activeDivision;
+  });
+}
+
+function loadTournamentResetState() {
+  if (tournamentResetState) return tournamentResetState;
+  try {
+    tournamentResetState = JSON.parse(sessionStorage.getItem(TOURNAMENT_RESET_STATE_KEY) || "null");
+  } catch {
+    tournamentResetState = null;
+  }
+  return tournamentResetState;
+}
+
+function saveTournamentResetState(state) {
+  tournamentResetState = state;
+  try {
+    if (state) sessionStorage.setItem(TOURNAMENT_RESET_STATE_KEY, JSON.stringify(state));
+    else sessionStorage.removeItem(TOURNAMENT_RESET_STATE_KEY);
+  } catch {
+    // 현재 페이지에서는 메모리 상태로 재시도를 이어간다.
+  }
+}
 
 function refreshActiveDivisionData() {
   groups = allGroups.filter((group) => group.division === activeDivision);
@@ -100,11 +134,12 @@ window.addEventListener("beforeunload", (e) => {
 // ---------------- 부트스트랩 ----------------
 
 if (!isFirebaseConfigured) {
-  showToast("⚠️ firebase-config.js 에 Firebase 설정값을 입력해야 동기화가 동작합니다.", 6000);
+  showToast("firebase-config.js 에 Firebase 설정값을 입력해야 동기화가 동작합니다.", 6000);
 }
 
 initAuthGate();
 initTabs();
+initHelpTooltips();
 bindStaticHandlers();
 initConnectionWatch();
 
@@ -156,12 +191,12 @@ function initConnectionWatch() {
     const { label, err } = e.detail;
     setConnStatus(false);
     const code = err && err.code ? ` (${err.code})` : "";
-    showErrorBanner(`⚠️ ${label} 실패${code}: ${err && err.message ? err.message : err}\nFirestore 보안 규칙이 게시되어 있는지 Firebase 콘솔에서 확인해주세요.`);
+    showErrorBanner(`${label} 실패${code}: ${err && err.message ? err.message : err}\nFirestore 보안 규칙이 게시되어 있는지 Firebase 콘솔에서 확인해주세요.`);
   });
   window.addEventListener("firestore-timeout", (e) => {
     setConnStatus(false);
     showErrorBanner(
-      `⚠️ "${e.detail.label}" 실시간 연결이 응답하지 않습니다.\n` +
+      `"${e.detail.label}" 실시간 연결이 응답하지 않습니다.\n` +
       `광고 차단/보안 확장 프로그램이 Firestore 실시간 연결을 막고 있을 수 있습니다 — 확장 프로그램을 끄거나 시크릿창에서 다시 열어보세요.\n` +
       `그래도 안 되면 다른 네트워크(예: 휴대폰 테더링)에서 시도해보세요.`
     );
@@ -171,7 +206,7 @@ function initConnectionWatch() {
 function setConnStatus(ok) {
   const el = document.getElementById("connStatus");
   if (!el) return;
-  el.textContent = ok ? "동기화중" : "❌ 연결 오류";
+  el.textContent = ok ? "동기화중" : "연결 오류";
   el.style.color = ok ? "" : "#c0392b";
 }
 
@@ -292,7 +327,7 @@ function openChangePasswordModal() {
   overlay.className = "modal-overlay";
   const box = document.createElement("div");
   box.className = "modal-box";
-  box.innerHTML = `<h3>🔑 비밀번호 변경</h3>`;
+  box.innerHTML = `<h3>비밀번호 변경</h3>`;
 
   const errorMsg = document.createElement("div");
   errorMsg.className = "modal-error-msg";
@@ -356,7 +391,7 @@ function openChangePasswordModal() {
     try {
       await changePassword(current, next);
       overlay.remove();
-      showToast("✅ 비밀번호가 변경되었습니다");
+      showToast("비밀번호가 변경되었습니다");
     } catch (err) {
       saveBtn.disabled = false;
       errorMsg.textContent = describeAuthError(err);
@@ -384,6 +419,32 @@ function initTabs() {
   });
 }
 
+function initHelpTooltips() {
+  const closeAll = (except = null) => {
+    document.querySelectorAll(".help-trigger.is-open").forEach((button) => {
+      if (button === except) return;
+      button.classList.remove("is-open");
+      button.setAttribute("aria-expanded", "false");
+    });
+  };
+  document.querySelectorAll(".help-trigger").forEach((button) => button.setAttribute("aria-expanded", "false"));
+  document.addEventListener("click", (event) => {
+    const trigger = event.target.closest?.(".help-trigger");
+    if (!trigger) {
+      closeAll();
+      return;
+    }
+    event.stopPropagation();
+    const opening = !trigger.classList.contains("is-open");
+    closeAll(trigger);
+    trigger.classList.toggle("is-open", opening);
+    trigger.setAttribute("aria-expanded", String(opening));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeAll();
+  });
+}
+
 function subscribeWorkflowReviews() {
   const root = ["tournaments", TOURNAMENT_ID];
   unsubscribeWorkflowReviews = [
@@ -398,6 +459,7 @@ function subscribeWorkflowReviews() {
     onSnapshot(collection(db, ...root, "scoreWorkflows"), (snap) => {
       reviewWorkflows = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
       renderScoreReviews();
+      renderPrelimViews();
     }, (err) => reportError("워크플로 구독", err)),
     onSnapshot(collection(db, ...root, "courtQueues"), (snap) => {
       reviewQueues = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
@@ -470,11 +532,17 @@ function workflowMatchOptions() {
 }
 
 function resetWorkflowDraft() {
-  workflowDraftCourts = [...reviewCourts.entries()].map(([id, court]) => ({
-    id,
-    name: court.name || court.displayName || "이름 없는 코트",
-    recorderName: court.recorderName || "",
-  }));
+  // Firestore는 orderBy 없이 읽으면 문서 ID(=랜덤 UUID) 순으로 돌려준다.
+  // 관리자가 만든 순서를 유지하려면 저장해둔 order로 정렬해야 한다.
+  workflowDraftCourts = [...reviewCourts.entries()]
+    .map(([id, court]) => ({
+      id,
+      name: normalizeCourtName(court.name || court.displayName),
+      recorderName: court.recorderName || "",
+      order: Number(court.order) || 0,
+    }))
+    .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name, "ko"))
+    .map(({ id, name, recorderName }) => ({ id, name, recorderName }));
   const persisted = new Map(reviewAssignments.map((assignment) => [assignment.matchKey || assignment.id, {
     ...assignment, matchKey: assignment.matchKey || assignment.id,
   }]));
@@ -514,25 +582,29 @@ async function reloadWorkflowAuthoritativeState({ preserveDraft = false } = {}) 
 }
 
 function refreshWorkflowMatchMetadata() {
-  const options = new Map(workflowMatchOptions().map((option) => [option.matchKey, option]));
-  workflowDraftAssignments.forEach((assignment) => {
-    const option = options.get(assignment.matchKey);
-    if (!option) return;
-    assignment.label = option.label;
-    assignment.teams = option.teams;
-    assignment.dependencyReady = option.dependencyReady;
-    assignment.hasOfficialHistory = option.hasOfficialHistory;
-    assignment.nextMatchId = option.nextMatchId;
-    assignment.nextSlot = option.nextSlot;
-  });
+  workflowDraftAssignments = reconcilePlannerAssignments(
+    workflowDraftAssignments,
+    workflowMatchOptions(),
+    reviewAssignments,
+  );
+}
+
+function nextCourtName() {
+  const used = new Set(workflowDraftCourts.map((court) => normalizeCourtName(court.name)));
+  for (let index = 1; ; index += 1) {
+    const candidate = String(index);
+    if (!used.has(candidate)) return candidate;
+  }
 }
 
 function createWorkflowCourt() {
   const courtId = `court-${crypto.randomUUID().slice(0, 8)}`;
-  workflowDraftCourts.push({ id: courtId, name: "", recorderName: "" });
+  workflowDraftCourts.push({ id: courtId, name: nextCourtName(), recorderName: "" });
   workflowDirty = true;
   renderWorkflowCourtPlanner();
-  document.querySelector("#courtSettingsList input")?.focus();
+  const input = document.querySelector(`[data-court-id="${courtId}"] input`);
+  input?.focus();
+  input?.select();
 }
 
 function normalizeWorkflowOrders(courtId) {
@@ -579,67 +651,205 @@ function assignmentFor(matchKey) {
   return workflowDraftAssignments.find((assignment) => assignment.matchKey === matchKey);
 }
 
+/**
+ * 입력 중인 코트 이름/기록관 칸만 다시 그리지 않는다. 버튼(코트 추가·삭제)에 포커스가
+ * 있을 때까지 건너뛰면 새 코트 행이 화면에 나타나지 않으므로 대상은 input으로 한정한다.
+ */
 function renderWorkflowCourtPlanner() {
-  if (!document.activeElement?.closest?.("#courtSettingsList")) renderCourtSettings();
+  if (!document.activeElement?.matches?.("#courtSettingsList input")) renderCourtSettings();
   renderCourtBoard();
-  const hint = document.getElementById("workflowPlannerHint");
-  if (hint) hint.textContent = workflowDirty ? "저장하지 않은 코트 설정·배정·순서 변경이 있습니다." : "변경한 코트 설정과 배정을 저장하세요.";
-  const save = document.getElementById("setupWorkflowBtn");
-  if (save) save.disabled = !workflowDirty;
+  syncPrelimCourtSelects();
+  syncPrelimCourtBadges();
+  syncWorkflowSaveControls();
+}
+
+function syncWorkflowSaveControls() {
+  ["courtSettingsHint", "workflowPlannerHint"].forEach((id) => {
+    const hint = document.getElementById(id);
+    if (!hint) return;
+    hint.hidden = !workflowDirty;
+    hint.textContent = workflowDirty ? "저장되지 않은 변경사항" : "";
+  });
+  ["setupCourtsBtn", "setupWorkflowBtn"].forEach((id) => {
+    const save = document.getElementById(id);
+    if (save) save.disabled = !workflowDirty;
+  });
+}
+
+function markWorkflowDirty() {
+  workflowDirty = true;
+  syncWorkflowSaveControls();
+}
+
+function fillPrelimCourtSelect(select, matchKey) {
+  const assignment = assignmentFor(matchKey);
+  select.replaceChildren(new Option("미배정", ""));
+  workflowDraftCourts.forEach((court) => {
+    select.append(new Option(formatCourtName(court.name, "이름 없는 코트"), court.id));
+  });
+  select.value = assignment?.courtId || "";
+  select.disabled = !assignment;
+  select.title = assignment ? "이 경기의 코트를 선택하세요." : "결과가 기록된 경기는 코트에 새로 배정할 수 없습니다.";
+}
+
+function syncPrelimCourtSelects() {
+  document.querySelectorAll("[data-prelim-court-match]").forEach((select) => {
+    fillPrelimCourtSelect(select, select.dataset.prelimCourtMatch);
+  });
+}
+
+function prelimCourtDisplay(matchKey) {
+  const assignment = assignmentFor(matchKey);
+  if (!assignment?.courtId) return { label: "미배정", recorderName: "" };
+  const court = workflowDraftCourts.find((item) => item.id === assignment.courtId);
+  if (!court) return { label: "미배정", recorderName: "" };
+  return {
+    label: formatCourtName(court.name),
+    recorderName: court.recorderName?.trim() || "",
+  };
+}
+
+function syncPrelimCourtBadges() {
+  document.querySelectorAll("[data-prelim-court-badge]").forEach((badge) => {
+    const court = prelimCourtDisplay(badge.dataset.prelimCourtBadge);
+    badge.textContent = court.label;
+    badge.classList.toggle("unassigned", court.label === "미배정");
+    badge.title = court.recorderName ? `담당 기록관: ${court.recorderName}` : "";
+  });
 }
 
 function renderCourtSettings() {
   const root = document.getElementById("courtSettingsList");
   if (!root) return;
   root.replaceChildren();
-  workflowDraftCourts.forEach((court) => {
+  if (!workflowDraftCourts.length) {
+    const empty = document.createElement("p");
+    empty.className = "workflow-empty";
+    empty.textContent = "아직 코트가 없습니다. '+ 코트 추가'로 사용할 코트를 만드세요.";
+    root.appendChild(empty);
+  }
+  workflowDraftCourts.forEach((court, courtIndex) => {
     const row = document.createElement("div");
     row.className = "court-settings-row";
+    row.dataset.courtId = court.id;
+    const order = document.createElement("span");
+    order.className = "court-settings-order";
+    order.textContent = `${courtIndex + 1}`;
     const name = document.createElement("input");
-    name.placeholder = "코트 표시 이름";
+    name.type = "text";
+    name.placeholder = "예: A";
     name.value = court.name;
-    name.setAttribute("aria-label", "코트 표시 이름");
+    resizeCourtNameInput(name);
+    name.setAttribute("aria-label", `${courtIndex + 1}번째 코트 이름, 코트 제외`);
     name.addEventListener("input", () => {
       court.name = name.value;
-      workflowDirty = true;
-      document.getElementById("setupWorkflowBtn").disabled = false;
-      document.getElementById("workflowPlannerHint").textContent = "저장하지 않은 코트 설정·배정·순서 변경이 있습니다.";
+      resizeCourtNameInput(name);
+      markWorkflowDirty();
     });
     name.addEventListener("change", () => {
+      court.name = normalizeCourtName(name.value);
+      name.value = court.name;
+      resizeCourtNameInput(name);
       renderCourtBoard();
+      syncPrelimCourtSelects();
     });
+    const nameField = document.createElement("label");
+    nameField.className = "court-setting-field";
+    const nameLabel = document.createElement("span");
+    nameLabel.className = "court-setting-label";
+    nameLabel.textContent = "코트 이름";
+    const nameInputWrap = document.createElement("span");
+    nameInputWrap.className = "court-name-input";
+    const nameSuffix = document.createElement("b");
+    nameSuffix.textContent = "코트";
+    nameInputWrap.append(name, nameSuffix);
+    nameField.append(nameLabel, nameInputWrap);
     const recorder = document.createElement("input");
-    recorder.placeholder = "기록관 이름";
+    recorder.type = "text";
+    recorder.placeholder = "담당 기록관 이름";
     recorder.value = court.recorderName || "";
-    recorder.setAttribute("aria-label", `${court.name || "새 코트"} 기록관 이름`);
+    recorder.setAttribute("aria-label", `${formatCourtName(court.name, `${courtIndex + 1}번째 코트`)} 담당 기록관 이름`);
     recorder.addEventListener("input", () => {
       court.recorderName = recorder.value;
-      workflowDirty = true;
-      document.getElementById("setupWorkflowBtn").disabled = false;
-      document.getElementById("workflowPlannerHint").textContent = "저장하지 않은 코트 설정·배정·순서 변경이 있습니다.";
+      markWorkflowDirty();
     });
+    const recorderField = document.createElement("label");
+    recorderField.className = "court-setting-field";
+    const recorderLabel = document.createElement("span");
+    recorderLabel.className = "court-setting-label";
+    recorderLabel.textContent = "담당 기록관";
+    recorderField.append(recorderLabel, recorder);
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "btn danger small";
     remove.textContent = "삭제";
     remove.addEventListener("click", () => {
-      if (!confirm(`'${court.name || "이 코트"}'를 삭제할까요? 배정된 경기는 미배정으로 이동합니다.`)) return;
+      if (!confirm(`'${formatCourtName(court.name, "이 코트")}'를 삭제할까요? 배정된 경기는 미배정으로 이동합니다.`)) return;
       workflowDraftAssignments.filter((assignment) => assignment.courtId === court.id)
         .forEach((assignment) => { assignment.courtId = null; });
       workflowDraftCourts = workflowDraftCourts.filter((item) => item !== court);
       normalizeWorkflowOrders(null);
-      workflowDirty = true;
+      markWorkflowDirty();
       renderWorkflowCourtPlanner();
     });
-    row.append(name, recorder, remove);
+    row.append(order, nameField, recorderField, remove);
     root.appendChild(row);
   });
-  const add = document.createElement("button");
-  add.type = "button";
-  add.className = "btn small";
-  add.textContent = "+ 코트 추가";
-  add.addEventListener("click", createWorkflowCourt);
-  root.appendChild(add);
+}
+
+function resizeCourtNameInput(input) {
+  const length = Array.from(input.value.trim()).length;
+  input.style.width = `${length ? Math.min(Math.max(length + 1, 3), 18) : 7}ch`;
+}
+
+/** 코트 목록·기록관·경기 배정·순서를 한 번에 서버에 저장한다. 두 저장 버튼이 공유한다. */
+async function saveCourtWorkflow(button) {
+  const unnamed = workflowDraftCourts.find((court) => !normalizeCourtName(court.name));
+  if (unnamed) return showToast("모든 코트의 표시 이름을 입력하세요.");
+  const duplicated = workflowDraftCourts
+    .map((court) => normalizeCourtName(court.name))
+    .find((name, index, names) => names.indexOf(name) !== index);
+  if (duplicated) return showToast(`코트 이름 '${duplicated}'이(가) 중복됩니다. 기록관이 헷갈리지 않게 다르게 지어주세요.`);
+  if (workflowSaveInProgress) return;
+  const assignmentsByCourt = {};
+  const unassignedAssignments = [];
+  workflowDraftAssignments.forEach((assignment) => {
+    const normalized = {
+      matchKey: assignment.matchKey,
+      matchId: assignment.matchId || assignment.matchKey,
+      matchType: assignment.matchType || "prelim",
+      courtOrder: assignment.courtOrder || 1,
+      dependencyReady: assignment.dependencyReady !== false,
+    };
+    if (normalized.matchType === "final") {
+      normalized.divisionId = assignment.divisionId || activeDivision;
+      if (assignment.nextMatchId) normalized.nextMatchId = assignment.nextMatchId;
+      if (assignment.nextSlot) normalized.nextSlot = assignment.nextSlot;
+    } else {
+      normalized.division = assignment.division || activeDivision;
+    }
+    if (assignment.courtId) (assignmentsByCourt[assignment.courtId] ||= []).push(normalized);
+    else unassignedAssignments.push(normalized);
+  });
+  Object.values(assignmentsByCourt).forEach((assignments) => assignments.sort((a, b) => a.courtOrder - b.courtOrder));
+  workflowSaveInProgress = true;
+  try {
+    const result = await runWorkflowButton(button, "코트 배정·순서 저장", () => adminWorkflowCallable("replaceCourtWorkflows", {
+      courts: workflowDraftCourts.map((court) => ({ id: court.id, name: normalizeCourtName(court.name), recorderName: court.recorderName.trim() })),
+      assignmentsByCourt,
+      unassignedAssignments,
+      expectedTopologyRevision: Number(tournamentInfo.courtTopologyRevision || 0),
+      expectedQueueRevisions: Object.fromEntries(
+        [...reviewQueues].map(([courtId, queue]) => [courtId, Number(queue.queueRevision || 0)]),
+      ),
+    }));
+    if (result) {
+      await reloadWorkflowAuthoritativeState();
+      showToast("코트 설정과 경기 배정을 저장했습니다.");
+    }
+  } finally {
+    workflowSaveInProgress = false;
+  }
 }
 
 function workflowStatusBadge(matchKey) {
@@ -655,7 +865,7 @@ function renderCourtBoard() {
   if (!root) return;
   const options = workflowDraftAssignments;
   root.replaceChildren();
-  const columns = [[null, "미배정"], ...workflowDraftCourts.map((court) => [court.id, court.name || "이름 없는 코트"])];
+  const columns = [[null, "미배정"], ...workflowDraftCourts.map((court) => [court.id, formatCourtName(court.name, "이름 없는 코트")])];
   columns.forEach(([courtId, name]) => {
     const column = document.createElement("section");
     column.className = "court-board-column";
@@ -678,6 +888,7 @@ function renderCourtBoard() {
         const assignment = assignmentFor(option.matchKey);
         const card = document.createElement("article");
         card.className = "court-board-card";
+        card.dataset.divisionTheme = option.divisionId || option.division || "men";
         card.draggable = true;
         card.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", option.matchKey); e.dataTransfer.effectAllowed = "move"; });
         card.addEventListener("dragover", (e) => e.preventDefault());
@@ -692,7 +903,7 @@ function renderCourtBoard() {
         const select = document.createElement("select");
         select.setAttribute("aria-label", `${option.teams} 코트 선택`);
         select.append(new Option("미배정", ""));
-        workflowDraftCourts.forEach((court) => select.append(new Option(court.name || "이름 없는 코트", court.id)));
+        workflowDraftCourts.forEach((court) => select.append(new Option(formatCourtName(court.name, "이름 없는 코트"), court.id)));
         select.value = assignment?.courtId || "";
         select.addEventListener("change", () => setMatchCourt(option.matchKey, select.value));
         controls.appendChild(select);
@@ -767,12 +978,20 @@ function scoreReviewDisplay(assignment) {
   });
   const names = courtTeamNames(officialMatch, teamsById);
   const court = reviewCourts.get(assignment.courtId);
+  const courtName = formatCourtName(court?.name || court?.displayName, "코트 미정");
+  const divisionName = DIVISION_LABELS[division] || division;
+  const matchParts = String(view.label || "경기 정보 불러오는 중")
+    .split(" · ")
+    .filter(Boolean);
   return {
     heading: [
-      court?.name || court?.displayName || "코트 미정",
-      DIVISION_LABELS[division] || division,
+      courtName,
+      divisionName,
       view.label,
     ].filter(Boolean).join(" · "),
+    courtName,
+    divisionName,
+    matchParts,
     teams: view.teams || "대진 정보를 불러오는 중입니다.",
     teamA: names?.a || "A팀",
     teamB: names?.b || "B팀",
@@ -783,26 +1002,64 @@ function renderScoreReviews() {
   const root = document.getElementById("scoreReviewList");
   if (!root) return;
   renderCorrectionMatchOptions();
+  const pendingReviews = reviewAssignments.filter((item) => {
+    const workflow = reviewWorkflows.get(item.id);
+    return item.publicStatus === "under_review" && workflow?.draftState === "submitted";
+  });
   const submitted = reviewAssignments.filter((item) => {
     const workflow = reviewWorkflows.get(item.id);
     return (item.publicStatus === "under_review" && workflow?.draftState === "submitted") || workflow?.lock;
   });
+  const reviewTab = document.querySelector('.tab-btn[data-tab="workflow"]');
+  if (reviewTab) reviewTab.textContent = pendingReviews.length ? `기록·검수 (${pendingReviews.length})` : "기록·검수";
   root.replaceChildren();
+  root.className = "review-list";
   if (!submitted.length) {
     root.textContent = "검수 대기 제출이 없습니다.";
-    root.className = "empty-hint";
+    root.className = "review-list empty-hint";
     return;
   }
   submitted.forEach((assignment) => {
     const workflow = reviewWorkflows.get(assignment.id);
     const display = scoreReviewDisplay(assignment);
-    const row = document.createElement("div");
-    row.className = "row";
-    row.style.cssText = "padding:10px 0; border-bottom:1px solid var(--line); gap:8px; flex-wrap:wrap;";
+    const isSubmitted = assignment.publicStatus === "under_review" && workflow.draftState === "submitted";
+    const row = document.createElement("article");
+    row.className = "review-card";
+    row.dataset.reviewMatch = assignment.id;
+    row.dataset.divisionTheme = assignment.divisionId || assignment.division || "men";
     const audit = reviewAudits.get(assignment.id);
-    const submittedAt = audit?.createdAt?.toDate?.()?.toLocaleString?.() || workflow.submittedAt?.toDate?.()?.toLocaleString?.() || workflow.updatedAt?.toDate?.()?.toLocaleString?.() || "시간 정보 없음";
-    const author = audit?.actor?.name || workflow.submittedBy?.name || "기록관";
-    row.innerHTML = `<div style="flex:1; min-width:220px;"><b>${escapeHtml(display.heading)}</b><br><span>${escapeHtml(display.teams)}</span><br><span class="empty-hint">작성자: ${escapeHtml(author)} · ${escapeHtml(submittedAt)} · ${escapeHtml(formatSets(workflow.submittedSnapshot || workflow.draft))}</span></div>`;
+    const submittedAt = audit?.createdAt?.toDate?.()?.toLocaleString?.()
+      || workflow.submittedAt?.toDate?.()?.toLocaleString?.()
+      || workflow.updatedAt?.toDate?.()?.toLocaleString?.()
+      || "";
+    const author = isSubmitted
+      ? (audit?.actor?.name || workflow.submittedBy?.name || workflow.lock?.recorderName || "기록관")
+      : (workflow.lock?.recorderName || "기록관");
+    const scoreText = formatSets(workflow.submittedSnapshot || workflow.draft);
+    const header = document.createElement("div");
+    header.className = "review-card-header";
+    const tags = document.createElement("div");
+    tags.className = "review-tags";
+    tags.innerHTML = [
+      `<span class="review-tag court">${escapeHtml(display.courtName)}</span>`,
+      `<span class="review-tag division">${escapeHtml(display.divisionName)}</span>`,
+      ...display.matchParts.map((part) => `<span class="review-tag">${escapeHtml(part)}</span>`),
+    ].join("");
+    const state = document.createElement("span");
+    state.className = `review-state ${isSubmitted ? "submitted" : "editing"}`;
+    state.textContent = isSubmitted ? "검수 대기" : "입력 중";
+    header.append(tags, state);
+    const matchup = document.createElement("div");
+    matchup.className = "review-matchup";
+    matchup.innerHTML = `<strong><small>A팀</small>${escapeHtml(display.teamA)}</strong><span>VS</span><strong><small>B팀</small>${escapeHtml(display.teamB)}</strong>`;
+    const meta = document.createElement("div");
+    meta.className = "review-meta";
+    meta.innerHTML = `<span class="review-info-chip"><small>기록관</small><strong>${escapeHtml(author)}</strong></span>`
+      + (submittedAt ? `<span class="review-info-chip"><small>제출 시간</small><strong>${escapeHtml(submittedAt)}</strong></span>` : "")
+      + (scoreText !== "점수 없음" ? `<span class="review-info-chip score"><small>입력 점수</small><strong>${escapeHtml(scoreText)}</strong></span>` : "");
+    const actions = document.createElement("div");
+    actions.className = "review-actions";
+    row.append(header, matchup, meta, actions);
     const approve = document.createElement("button");
     approve.className = "btn primary small";
     approve.textContent = "승인";
@@ -831,11 +1088,8 @@ function renderScoreReviews() {
     edit.className = "btn small";
     edit.textContent = "수정·승인";
     edit.addEventListener("click", () => openAdminScoreModal(assignment, workflow));
-    if (assignment.publicStatus === "under_review" && workflow.draftState === "submitted") row.append(approve, reject, edit);
+    if (isSubmitted) actions.append(approve, reject, edit);
     if (workflow.lock) {
-      const lock = document.createElement("span");
-      lock.className = "empty-hint";
-      lock.textContent = `입력 중: ${workflow.lock.recorderName || "기록관"}`;
       const release = document.createElement("button");
       release.className = "btn danger small";
       release.textContent = "잠금 강제 해제";
@@ -850,7 +1104,7 @@ function renderScoreReviews() {
         }));
         if (ok) showToast("잠금을 강제 해제했습니다.");
       });
-      row.append(lock, release);
+      actions.append(release);
     }
     root.appendChild(row);
   });
@@ -913,11 +1167,15 @@ function bindStaticHandlers() {
       if (bracketPublishPending && !confirm(`${divisionLabel()}의 공개하지 않은 본선 대진 변경사항을 버리고 ${DIVISION_LABELS[nextDivision]}로 전환할까요?`)) return;
       activeDivision = nextDivision;
       document.body.dataset.division = activeDivision;
+      syncDivisionThemeScopes();
       bracketPublishPending = false;
       seedSelection = [];
       seedAutoMode = true;
       ringSelection = null;
-      document.querySelectorAll("[data-division]").forEach((item) => item.classList.toggle("active", item === button));
+      // 대회설정·예선·본선에 각각 같은 부문 스위치가 있으므로 모두 같은 상태로 맞춘다.
+      document.querySelectorAll("[data-division]").forEach((item) => {
+        item.classList.toggle("active", item.dataset.division === activeDivision);
+      });
       refreshActiveDivisionData();
       rebindFinalMatches();
       document.getElementById("qualifyPerGroupInput").value = tournamentInfo.qualifyPerGroup?.[activeDivision] || 2;
@@ -1028,6 +1286,63 @@ function bindStaticHandlers() {
 
   // 데이터 백업/복원 — 다음 학기에 이어서 쓰거나, 실수로 초기화했을 때 되돌리기 위함
   document.getElementById("backupBtn").addEventListener("click", (e) => runWorkflowButton(e.currentTarget, "백업", handleBackup));
+  document.getElementById("resetTournamentBtn").addEventListener("click", async (e) => {
+    if (tournamentResetInProgress) return;
+    const button = e.currentTarget;
+    const expectedName = tournamentInfo.name?.trim() || "바운스발리볼";
+    const typedName = prompt(`대회 전체 초기화를 계속하려면 현재 대회명 "${expectedName}"을(를) 정확히 입력하세요.`);
+    if (typedName !== expectedName) return showToast("대회명이 일치하지 않아 전체 초기화를 취소했습니다.");
+    if (!confirm("대회의 모든 운영 데이터를 초기화할까요? 백업을 저장한 뒤 되돌릴 수 없이 초기화합니다.")) return;
+    tournamentResetInProgress = true;
+    const result = await runWorkflowButton(button, "대회 전체 초기화", async () => {
+      let resetState = loadTournamentResetState();
+      if (!resetState?.token) {
+        let prepared;
+        try {
+          prepared = await adminWorkflowCallable("prepareTournamentReset", { expectedName });
+        } catch (prepareError) {
+          const code = String(prepareError?.code || "").split("/").at(-1);
+          if (code !== "failed-precondition") throw prepareError;
+          prepared = await adminWorkflowCallable("recoverTournamentReset");
+        }
+        const token = prepared.data?.token;
+        if (typeof token !== "string" || !token) throw new Error("초기화 준비 토큰을 받지 못했습니다.");
+        resetState = { token, backupCompleted: prepared.data?.phase === "deleting" };
+        saveTournamentResetState(resetState);
+      }
+      if (!resetState.backupCompleted) {
+        try {
+          await handleBackup();
+          resetState.backupCompleted = true;
+          saveTournamentResetState(resetState);
+        } catch (backupError) {
+          try {
+            await adminWorkflowCallable("cancelTournamentReset", { token: resetState.token });
+            saveTournamentResetState(null);
+          } catch (cancelError) {
+            console.error("[대회 전체 초기화 취소 실패]", cancelError);
+          }
+          throw backupError;
+        }
+      }
+      return adminWorkflowCallable("resetTournament", { token: resetState.token });
+    });
+    tournamentResetInProgress = false;
+    if (!result?.reset) {
+      showToast("초기화가 완료되지 않았습니다. 같은 브라우저에서 다시 실행하면 안전하게 이어서 처리합니다.", 6000);
+      return;
+    }
+    saveTournamentResetState(null);
+    bracketPublishPending = false;
+    workflowDirty = false;
+    workflowSaveInProgress = false;
+    seedSelection = [];
+    seedAutoMode = true;
+    ringSelection = null;
+    correctionPreview = null;
+    showToast("대회 전체 초기화가 완료되었습니다. 최신 상태를 불러옵니다.", 3000);
+    window.setTimeout(() => window.location.reload(), 300);
+  });
   document.getElementById("restoreBtn").addEventListener("click", () => {
     document.getElementById("restoreFileInput").click();
   });
@@ -1045,49 +1360,9 @@ function bindStaticHandlers() {
     const result = await runWorkflowButton(e.currentTarget, "접근 코드 폐기", () => adminWorkflowCallable("revokeRecorderAccessCode"));
     if (result?.revoked) showToast("기록관 접근 코드를 폐기했습니다.");
   });
-  document.getElementById("setupWorkflowBtn").addEventListener("click", async (e) => {
-    const unnamed = workflowDraftCourts.find((court) => !court.name.trim());
-    if (unnamed) return showToast("모든 코트의 표시명을 입력하세요.");
-    if (workflowSaveInProgress) return;
-    const assignmentsByCourt = {};
-    const unassignedAssignments = [];
-    workflowDraftAssignments.forEach((assignment) => {
-      const normalized = {
-        matchKey: assignment.matchKey,
-        matchId: assignment.matchId || assignment.matchKey,
-        matchType: assignment.matchType || "prelim",
-        courtOrder: assignment.courtOrder || 1,
-        dependencyReady: assignment.dependencyReady !== false,
-      };
-      if (normalized.matchType === "final") {
-        normalized.divisionId = assignment.divisionId || activeDivision;
-        if (assignment.nextMatchId) normalized.nextMatchId = assignment.nextMatchId;
-        if (assignment.nextSlot) normalized.nextSlot = assignment.nextSlot;
-      } else {
-        normalized.division = assignment.division || activeDivision;
-      }
-      if (assignment.courtId) (assignmentsByCourt[assignment.courtId] ||= []).push(normalized);
-      else unassignedAssignments.push(normalized);
-    });
-    Object.values(assignmentsByCourt).forEach((assignments) => assignments.sort((a, b) => a.courtOrder - b.courtOrder));
-    workflowSaveInProgress = true;
-    try {
-      const result = await runWorkflowButton(e.currentTarget, "코트 배정·순서 저장", () => adminWorkflowCallable("replaceCourtWorkflows", {
-        courts: workflowDraftCourts.map((court) => ({ id: court.id, name: court.name.trim(), recorderName: court.recorderName.trim() })),
-        assignmentsByCourt,
-        unassignedAssignments,
-        expectedTopologyRevision: Number(tournamentInfo.courtTopologyRevision || 0),
-        expectedQueueRevisions: Object.fromEntries(
-          [...reviewQueues].map(([courtId, queue]) => [courtId, Number(queue.queueRevision || 0)]),
-        ),
-      }));
-      if (result) {
-        await reloadWorkflowAuthoritativeState();
-        showToast("코트 배정과 경기 순서를 저장했습니다.");
-      }
-    } finally {
-      workflowSaveInProgress = false;
-    }
+  document.getElementById("addCourtBtn").addEventListener("click", createWorkflowCourt);
+  ["setupCourtsBtn", "setupWorkflowBtn"].forEach((id) => {
+    document.getElementById(id).addEventListener("click", (e) => saveCourtWorkflow(e.currentTarget));
   });
   document.getElementById("previewCorrectionBtn").addEventListener("click", async (e) => {
     const matchKeys = [...document.getElementById("correctionMatchKeys").selectedOptions]
@@ -1494,9 +1769,24 @@ async function persistTeamDrop(draggedId, targetGroupId, targetId = null, insert
   if (sameGroup && targetIds.every((id, index) => id === currentIds[index])) return;
   try {
     await moveAndReorderTeam(draggedId, targetGroupId, targetIds);
+    if (sameGroup) await syncRoundRobinOrderAfterTeamReorder(targetGroupId, targetIds);
   } catch (err) {
     reportError("팀 순서 변경", err);
   }
+}
+
+async function syncRoundRobinOrderAfterTeamReorder(groupId, orderedTeamIds) {
+  const group = groups.find((item) => item.id === groupId);
+  if ((group?.matchMode || "ring") !== "roundrobin") return;
+  const groupMatches = prelimMatches.filter((match) => match.groupId === groupId);
+  if (groupMatches.length < 2) return;
+
+  const orderedMatchIds = orderExistingRoundRobinMatchIds(groupMatches, orderedTeamIds);
+  await reorderPrelimMatches(groupId, orderedMatchIds);
+  syncCourtOrderWithPrelimOrder(workflowDraftAssignments, orderedMatchIds);
+  workflowDirty = true;
+  renderWorkflowCourtPlanner();
+  showToast("참가팀 순서에 맞춰 예선 대진과 코트 경기 순서를 반영했습니다. 코트 설정·배정 저장을 눌러 확정하세요.", 5000);
 }
 
 // ---------------- 예선 ----------------
@@ -1673,11 +1963,11 @@ function buildRingControls(g, groupTeams) {
   hint.className = "empty-hint";
   hint.style.padding = "0";
   hint.textContent = filled
-    ? "✅ 대진이 확정되었습니다. 다시 배치하면 결과가 초기화됩니다."
+    ? "대진이 확정되었습니다. 다시 배치하면 결과가 초기화됩니다."
     : `팀을 도형의 꼭짓점으로 드래그하거나, 팀을 클릭한 뒤 꼭짓점을 클릭하세요 (${placedCount}/${ringOrder.length} 배치됨)`;
   const shuffleBtn = document.createElement("button");
   shuffleBtn.className = "btn small ghost";
-  shuffleBtn.textContent = "🎲 무작위 배치";
+  shuffleBtn.textContent = "무작위 배치";
   shuffleBtn.addEventListener("click", () => handleRingShuffle(g, groupTeams));
   toolbar.appendChild(hint);
   toolbar.appendChild(shuffleBtn);
@@ -1749,6 +2039,10 @@ async function handleMatchReorderDrop(groupId, groupMatches, draggedId, targetId
   ids.splice(toIdx, 0, ids.splice(fromIdx, 1)[0]);
   try {
     await reorderPrelimMatches(groupId, ids);
+    syncCourtOrderWithPrelimOrder(workflowDraftAssignments, ids);
+    workflowDirty = true;
+    renderWorkflowCourtPlanner();
+    showToast("경기 순서를 코트 설정에도 반영했습니다. 코트 설정·배정 저장을 눌러 확정하세요.", 5000);
   } catch (err) {
     reportError("경기 순서 변경", err);
   }
@@ -1819,12 +2113,81 @@ function renderPrelimSetupGroups() {
       box.appendChild(buildRoundRobinControls(g, groupTeams));
     }
 
+    const groupMatches = prelimMatches.filter((m) => m.groupId === g.id).sort((a, b) => (a.round || 0) - (b.round || 0));
     const madeHint = document.createElement("div");
-    madeHint.className = "empty-hint";
-    madeHint.style.padding = "6px 0 0";
-    const madeCount = prelimMatches.filter((m) => m.groupId === g.id).length;
-    madeHint.textContent = madeCount ? `생성된 경기 ${madeCount}개 — [예선] 탭에서 대진표와 순위표를 확인하세요.` : "아직 생성된 경기가 없습니다.";
+    madeHint.className = "prelim-match-status";
+    if (!groupMatches.length) {
+      madeHint.textContent = "경기 없음";
+    } else {
+      madeHint.textContent = `${groupMatches.length}경기 생성됨`;
+    }
     box.appendChild(madeHint);
+
+    if (groupMatches.length) {
+      const reorderable = mode === "roundrobin" && groupMatches.length > 1;
+      const matchList = document.createElement("div");
+      matchList.className = `prelim-match-list${reorderable ? " is-reorderable" : ""}`;
+      groupMatches.forEach((m, idx) => {
+        const row = document.createElement("div");
+        row.className = `prelim-match-row${reorderable ? " is-draggable" : ""}`;
+        if (reorderable) {
+          row.title = "드래그하여 경기 순서 변경";
+          const handle = document.createElement("span");
+          handle.className = "prelim-drag-handle";
+          handle.setAttribute("aria-hidden", "true");
+          handle.textContent = "⠿";
+          row.appendChild(handle);
+        }
+        const order = document.createElement("span");
+        order.className = "prelim-match-order";
+        order.textContent = String(idx + 1);
+        const matchup = document.createElement("span");
+        matchup.className = "prelim-matchup";
+        matchup.innerHTML = `<strong>${escapeHtml(teamName(m.teamA))}</strong><b>VS</b><strong>${escapeHtml(teamName(m.teamB))}</strong>`;
+        row.append(order, matchup);
+        const courtControl = document.createElement("label");
+        courtControl.className = "prelim-court-control";
+        const courtLabel = document.createElement("span");
+        courtLabel.textContent = "배정 코트";
+        const courtSelect = document.createElement("select");
+        courtSelect.draggable = false;
+        courtSelect.dataset.prelimCourtMatch = m.id;
+        courtSelect.setAttribute("aria-label", `${teamName(m.teamA)} 대 ${teamName(m.teamB)} 코트 선택`);
+        fillPrelimCourtSelect(courtSelect, m.id);
+        courtSelect.addEventListener("mousedown", (e) => e.stopPropagation());
+        courtSelect.addEventListener("click", (e) => e.stopPropagation());
+        courtSelect.addEventListener("change", () => {
+          const laterMatchOnCourt = groupMatches
+            .slice(idx + 1)
+            .find((match) => (assignmentFor(match.id)?.courtId || "") === courtSelect.value);
+          setMatchCourt(m.id, courtSelect.value, laterMatchOnCourt?.id || null);
+        });
+        courtControl.append(courtLabel, courtSelect);
+        row.appendChild(courtControl);
+        if (reorderable) {
+          row.draggable = true;
+          row.addEventListener("dragstart", (e) => {
+            e.dataTransfer.setData("text/plain", m.id);
+            e.dataTransfer.effectAllowed = "move";
+            row.classList.add("dragging");
+          });
+          row.addEventListener("dragend", () => row.classList.remove("dragging"));
+          row.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            row.classList.add("drag-over-row");
+          });
+          row.addEventListener("dragleave", () => row.classList.remove("drag-over-row"));
+          row.addEventListener("drop", (e) => {
+            e.preventDefault();
+            row.classList.remove("drag-over-row");
+            const draggedId = e.dataTransfer.getData("text/plain");
+            handleMatchReorderDrop(g.id, groupMatches, draggedId, m.id);
+          });
+        }
+        matchList.appendChild(row);
+      });
+      box.appendChild(matchList);
+    }
 
     el.appendChild(box);
   });
@@ -1848,7 +2211,7 @@ function renderPrelimGroups() {
     const card = document.createElement("div");
     card.className = "card";
     const heading = document.createElement("h2");
-    heading.innerHTML = `📋 ${escapeHtml(g.name)} 예선 <span style="margin-left:auto; font-weight:400; color:var(--muted); font-size:13px;">${mode === "ring" ? "링크제" : "라운드로빈"}</span>`;
+    heading.innerHTML = `${escapeHtml(g.name)} 예선 <span style="margin-left:auto; font-weight:400; color:var(--muted); font-size:13px;">${mode === "ring" ? "링크제" : "라운드로빈"}</span>`;
     card.appendChild(heading);
 
     // 링크제는 배치된 도형 자체가 대진표이므로 읽기 전용으로 함께 보여준다
@@ -1909,21 +2272,48 @@ function renderPrelimGroups() {
         row.style.borderBottom = "1px solid var(--line)";
         const evald = evaluatePrelimMatch(m.sets || []);
         const scoreText = (m.sets || []).filter((s) => Number(s.a) > 0 || Number(s.b) > 0).map((s) => `${s.a}:${s.b}`).join(" / ");
+        const submittedWorkflow = reviewWorkflows.get(m.id);
+        const pendingSets = submittedWorkflow?.draftState === "submitted"
+          && Array.isArray(submittedWorkflow.submittedSnapshot?.sets)
+          ? submittedWorkflow.submittedSnapshot.sets
+          : [];
+        const pendingScoreText = pendingSets.map((s) => `${s.a}:${s.b}`).join(" / ");
         const resultBadge = evald.result === "A" ? `<span class="badge win">${teamName(m.teamA)} 승</span>`
           : evald.result === "B" ? `<span class="badge win">${teamName(m.teamB)} 승</span>`
           : evald.result === "draw" ? '<span class="badge draw">무승부</span>'
           : evald.status === "in_progress" ? '<span class="badge">경기중</span>'
           : '<span class="badge">경기전</span>';
         const left = document.createElement("span");
-        left.innerHTML = `<span class="match-order-badge">${idx + 1}</span>${escapeHtml(teamName(m.teamA))} <b>vs</b> ${escapeHtml(teamName(m.teamB))} <span style="color:var(--muted); font-size:12px;">${scoreText}</span>`;
+        left.innerHTML = `<span class="match-order-badge">${idx + 1}</span>${escapeHtml(teamName(m.teamA))} <b>vs</b> ${escapeHtml(teamName(m.teamB))} <span style="color:var(--muted); font-size:12px;">${scoreText}</span>${pendingScoreText ? `<br><span style="color:var(--red); font-size:12px; margin-left:34px;">검수 대기 점수: ${escapeHtml(pendingScoreText)}</span>` : ""}`;
         row.appendChild(left);
         const right = document.createElement("span");
         right.className = "row";
-        right.innerHTML = resultBadge;
+        right.innerHTML = resultBadge + (pendingScoreText ? '<span class="badge">검수 대기</span>' : "");
+        if (pendingScoreText) {
+          const reviewBtn = document.createElement("button");
+          reviewBtn.className = "btn primary small";
+          reviewBtn.textContent = "검수하기";
+          reviewBtn.addEventListener("click", () => {
+            document.querySelector('.tab-btn[data-tab="workflow"]')?.click();
+            requestAnimationFrame(() => {
+              const reviewRow = [...document.querySelectorAll("[data-review-match]")]
+                .find((item) => item.dataset.reviewMatch === m.id);
+              reviewRow?.scrollIntoView({ behavior: "smooth", block: "center" });
+            });
+          });
+          right.appendChild(reviewBtn);
+        }
         const editBtn = document.createElement("button");
         editBtn.className = "btn small";
         editBtn.textContent = evald.status === "done" ? "점수 수정" : "점수 입력";
         editBtn.addEventListener("click", () => openPrelimScoreModal(m));
+        const court = prelimCourtDisplay(m.id);
+        const courtBadge = document.createElement("span");
+        courtBadge.className = `badge court${court.label === "미배정" ? " unassigned" : ""}`;
+        courtBadge.dataset.prelimCourtBadge = m.id;
+        courtBadge.textContent = court.label;
+        courtBadge.title = court.recorderName ? `담당 기록관: ${court.recorderName}` : "";
+        right.appendChild(courtBadge);
         right.appendChild(editBtn);
         row.appendChild(right);
 
@@ -2187,8 +2577,8 @@ function updateBracketPublishBar() {
 
   if (msg) {
     msg.textContent = bracketPublishPending
-      ? "⚠️ 공개하지 않은 변경/기록이 있습니다. 버튼을 눌러야 관객 화면에 반영됩니다."
-      : "✅ 모든 변경사항이 관객 화면에 공개되어 있습니다.";
+      ? "공개하지 않은 변경/기록이 있습니다. 버튼을 눌러야 관객 화면에 반영됩니다."
+      : "모든 변경사항이 관객 화면에 공개되어 있습니다.";
   }
   if (btn) {
     btn.disabled = !bracketPublishPending;
@@ -2418,7 +2808,7 @@ function showToast(msg, duration = 2200) {
 function reportError(action, err) {
   console.error(`[${action} 실패]`, err);
   const code = err && err.code ? ` (${err.code})` : "";
-  showToast(`❌ ${action} 실패${code}: ${err && err.message ? err.message : err}`, 5000);
+  showToast(`${action} 실패${code}: ${err && err.message ? err.message : err}`, 5000);
 }
 
 function escapeHtml(str) {

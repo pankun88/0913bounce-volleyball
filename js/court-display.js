@@ -9,6 +9,17 @@
 
 const UNKNOWN_TEAM = "대진 미정";
 
+/** 저장·입력용 코트 식별 이름. 사용자가 과거 방식으로 붙인 끝의 "코트"는 제거한다. */
+export function normalizeCourtName(value) {
+  return String(value || "").trim().replace(/\s*코트$/u, "").trim();
+}
+
+/** 모든 화면에서 코트 식별 이름 뒤에 "코트"를 정확히 한 번 붙인다. */
+export function formatCourtName(value, fallback = "미배정") {
+  const name = normalizeCourtName(typeof value === "object" ? (value?.name || value?.label) : value);
+  return name ? `${name}코트` : fallback;
+}
+
 /** Map과 일반 객체를 모두 받아 id로 이름을 찾는다. */
 function lookupName(source, id) {
   if (!id || !source) return null;
@@ -52,4 +63,39 @@ export function courtMatchSummary(assignment, officialMatch, lookups = {}) {
     label: courtMatchLabel(assignment, officialMatch, lookups.groupsById),
     teams: teams ? `${teams.a} vs ${teams.b}` : null,
   };
+}
+
+/**
+ * 조별 예선 순서가 바뀌면 각 코트에서 그 조 경기들이 차지하던 자리는 유지하고,
+ * 그 자리 안의 경기만 새 예선 순서대로 다시 배치한다.
+ * 다른 조와 본선 경기의 코트 순서는 건드리지 않는다.
+ */
+export function syncCourtOrderWithPrelimOrder(assignments, orderedMatchKeys) {
+  const prelimOrder = new Map(orderedMatchKeys.map((matchKey, index) => [matchKey, index]));
+  const courtIds = new Set(assignments.map((assignment) => assignment.courtId || null));
+
+  courtIds.forEach((courtId) => {
+    const courtAssignments = assignments
+      .map((assignment, index) => ({ assignment, index }))
+      .filter(({ assignment }) => (assignment.courtId || null) === courtId)
+      .sort((a, b) => (
+        (a.assignment.courtOrder ?? Number.MAX_SAFE_INTEGER)
+        - (b.assignment.courtOrder ?? Number.MAX_SAFE_INTEGER)
+        || a.index - b.index
+      ));
+    const reorderedPrelim = courtAssignments
+      .map(({ assignment }) => assignment)
+      .filter((assignment) => prelimOrder.has(assignment.matchKey))
+      .sort((a, b) => prelimOrder.get(a.matchKey) - prelimOrder.get(b.matchKey));
+
+    let prelimIndex = 0;
+    courtAssignments.forEach(({ assignment }, index) => {
+      const nextAssignment = prelimOrder.has(assignment.matchKey)
+        ? reorderedPrelim[prelimIndex++]
+        : assignment;
+      nextAssignment.courtOrder = index + 1;
+    });
+  });
+
+  return assignments;
 }

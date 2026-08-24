@@ -99,6 +99,10 @@ function setActiveDivision(division, { updateUrl = false, announce = true } = {}
   const changed = division !== activeDivision;
   activeDivision = division;
   document.body.dataset.division = division;
+  ["dashDivisionBadge", "dashPrelim", "dashBracketCard", "venueSwitcher"].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.dataset.divisionTheme = division;
+  });
   document.querySelectorAll("#dashDivisionSwitch [data-division]").forEach((button) => {
     const active = button.dataset.division === division;
     button.classList.toggle("active", active);

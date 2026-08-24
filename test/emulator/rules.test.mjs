@@ -30,6 +30,13 @@ export async function runRulesSuite() {
       await updateDoc(doc(admin, 'tournaments/main'), { maintenance: { enabled: true } });
     });
     await assertFails(getDoc(doc(db, path('scoreWorkflows', 'M1'))));
+    const seededAdmin = f.admin();
+    await assertSucceeds(getDoc(doc(seededAdmin, path('groups', 'reset-read-remains-allowed'))));
+    await assertSucceeds(getDoc(doc(seededAdmin, path('officialRevisions', 'backup-readable-during-reset'))));
+    await assertSucceeds(getDoc(doc(seededAdmin, path('restoreManifests', 'backup-readable-during-reset'))));
+    await assertSucceeds(getDoc(doc(seededAdmin, 'tournaments/main/restoreManifests/backup-readable-during-reset/chunks/0')));
+    await assertFails(updateDoc(doc(seededAdmin, 'tournaments/main'), { name: 'blocked during reset' }));
+    await assertFails(setDoc(doc(seededAdmin, path('groups', 'reset-write-blocked')), { name: 'blocked' }));
     await f.seed(async (admin) => {
       await updateDoc(doc(admin, 'tournaments/main'), { maintenance: { enabled: false } });
     });

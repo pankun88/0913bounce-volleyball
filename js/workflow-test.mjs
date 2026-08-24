@@ -8,6 +8,7 @@ import {
   planRejectedRework,
   projectCancel,
   projectForceRelease,
+  reconcilePlannerAssignments,
   selectQueueView,
 } from './score-workflow.js';
 
@@ -28,6 +29,40 @@ const queue = (changes = {}) => ({
   queueRevision: 7, currentMatchKey: 'M2', nextMatchKey: 'M3', normalCursorMatchKey: 'M2',
   priorityEntries: [], nextPrioritySequence: 0, ...changes,
 });
+
+// 코트 초안을 먼저 편집한 뒤 다른 조·여자부 대진을 생성해도 새 경기가 합쳐져야 한다.
+{
+  const current = [{
+    matchKey: 'men-halla-1',
+    matchType: 'prelim',
+    division: 'men',
+    courtId: 'court-a',
+    label: '이전 한라 표기',
+  }];
+  const options = [
+    { matchKey: 'men-halla-1', matchType: 'prelim', division: 'men', label: '남자부 · 한라 · 1경기', hasOfficialHistory: false },
+    { matchKey: 'men-baekdu-1', matchType: 'prelim', division: 'men', label: '남자부 · 백두 · 1경기', hasOfficialHistory: false },
+    { matchKey: 'women-cheonha-1', matchType: 'prelim', division: 'women', label: '여자부 · 천하 · 1경기', hasOfficialHistory: false },
+    { matchKey: 'official-saved', matchType: 'prelim', division: 'women', label: '여자부 · 저장된 공식 경기', hasOfficialHistory: true },
+    { matchKey: 'official-unsaved', matchType: 'prelim', division: 'women', label: '여자부 · 미배정 공식 경기', hasOfficialHistory: true },
+  ];
+  const persisted = [{
+    id: 'official-saved',
+    matchKey: 'official-saved',
+    courtId: 'court-b',
+    courtOrder: 2,
+  }];
+  const merged = reconcilePlannerAssignments(current, options, persisted);
+  assert.deepEqual(
+    merged.map((assignment) => assignment.matchKey),
+    ['men-halla-1', 'men-baekdu-1', 'women-cheonha-1', 'official-saved'],
+  );
+  assert.equal(merged[0].courtId, 'court-a', '기존 한라 코트 선택 보존');
+  assert.equal(merged[0].label, '남자부 · 한라 · 1경기', '기존 경기 메타데이터 갱신');
+  assert.equal(merged[1].courtId, null, '새 백두 경기 활성 초안 생성');
+  assert.equal(merged[2].division, 'women', '새 여자부 경기 활성 초안 생성');
+  assert.equal(merged[3].courtId, 'court-b', '공식 경기의 서버 배정 복원');
+}
 
 // pass-4: review history is excluded and submit advances without approval.
 {

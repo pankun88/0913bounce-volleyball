@@ -7,10 +7,12 @@ import {
   validateSetScore,
 } from './match-logic.js';
 import { generateBracket, recordMatchResult, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, roundLabel } from './bracket.js';
-import { generateRoundRobin } from './schedule.js';
+import { generateRoundRobin, orderExistingRoundRobinMatchIds } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
 import { normalizeBackupData } from './backup-format.js';
-import { courtMatchSummary, courtTeamNames } from './court-display.js';
+import {
+  courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
+} from './court-display.js';
 
 let pass = 0, fail = 0;
 function check(label, cond) {
@@ -19,6 +21,10 @@ function check(label, cond) {
 }
 
 // ---- court display ----
+check('court input stores only identifier', normalizeCourtName(' A코트 ') === 'A');
+check('court display appends suffix once', formatCourtName('A') === 'A코트');
+check('court display never duplicates suffix', formatCourtName('A코트') === 'A코트');
+check('empty court display uses fallback', formatCourtName('', '코트 미정') === '코트 미정');
 const courtTeams = new Map([
   ['team-a', { name: '강남 스파이크' }],
   ['team-b', { name: '서초 블로커스' }],
@@ -38,6 +44,23 @@ const finalCourtView = courtMatchSummary(
 check('final court display resolves embedded team names', finalCourtView.teams === '남자 1위 vs 남자 2위');
 check('final court display resolves round label', finalCourtView.label === '결승 1경기');
 check('unresolved final teams are explicit', courtTeamNames({ teamA: null, teamB: null }).a === '대진 미정');
+const reorderedCourtAssignments = [
+  { matchKey: 'group-a-1', courtId: 'court-1', courtOrder: 1 },
+  { matchKey: 'other-group', courtId: 'court-1', courtOrder: 2 },
+  { matchKey: 'group-a-2', courtId: 'court-1', courtOrder: 3 },
+  { matchKey: 'group-a-3', courtId: 'court-2', courtOrder: 1 },
+];
+syncCourtOrderWithPrelimOrder(reorderedCourtAssignments, ['group-a-2', 'group-a-3', 'group-a-1']);
+check(
+  'prelim reorder updates matching games within each court while preserving unrelated slots',
+  reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-2').courtOrder === 1
+    && reorderedCourtAssignments.find((item) => item.matchKey === 'other-group').courtOrder === 2
+    && reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-1').courtOrder === 3,
+);
+check(
+  'prelim reorder normalizes independently assigned courts',
+  reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-3').courtOrder === 1,
+);
 
 // ---- backup format migration ----
 const legacyBackup = {
@@ -556,6 +579,23 @@ function validateRoundRobin(n) {
   check(`roundRobin(${n}) each team plays ${n - 1} matches`, allCorrect);
 }
 [3, 4, 5, 6, 7].forEach(validateRoundRobin);
+const existingRoundRobinMatches = [
+  { id: 'bc', teamA: 'B', teamB: 'C' },
+  { id: 'ac', teamA: 'A', teamB: 'C' },
+  { id: 'ab', teamA: 'A', teamB: 'B' },
+];
+check(
+  'team reorder also reorders existing round-robin matches without replacing match ids',
+  JSON.stringify(orderExistingRoundRobinMatchIds(existingRoundRobinMatches, ['C', 'A', 'B']))
+    === JSON.stringify(['ab', 'ac', 'bc']),
+);
+check(
+  'round-robin match reorder keeps unmatched existing documents at the end',
+  JSON.stringify(orderExistingRoundRobinMatchIds(
+    [...existingRoundRobinMatches, { id: 'legacy', teamA: 'A', teamB: 'D' }],
+    ['C', 'A', 'B'],
+  )) === JSON.stringify(['ab', 'ac', 'bc', 'legacy']),
+);
 
 // ---- 링크제(ring/link bracket) ----
 

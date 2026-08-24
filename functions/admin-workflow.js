@@ -15,11 +15,23 @@ const bounded = (value) => JSON.parse(JSON.stringify(value ?? null, (_key, item)
 const transitionId = (matchKey, event, revision = 0) => `${matchKey}:${event}:${revision}`;
 function hash(code, salt) { return crypto.scryptSync(code, salt, 32).toString('base64url'); }
 function randomCode() { return crypto.randomBytes(18).toString('base64url'); }
-async function admin(context, data) {
+function resetTokenHash(token) { return crypto.createHash('sha256').update(token).digest('base64url'); }
+async function admin(context, data, { allowResetMaintenance = false } = {}) {
   requireMain(data);
   if (!context.auth?.uid) throw new HttpsError('unauthenticated', 'Authentication required.');
   if (!(await ref('admins', context.auth.uid).get()).exists) throw new HttpsError('permission-denied', 'Seeded administrator required.');
+  const tournament = await root().get();
+  if (!allowResetMaintenance && tournament.data()?.maintenance?.enabled === true) {
+    throw new HttpsError('failed-precondition', 'Tournament maintenance is active.');
+  }
   return context.auth.uid;
+}
+async function assertTournamentWritable(tx) {
+  const tournament = await tx.get(root());
+  if (tournament.data()?.maintenance?.enabled === true) {
+    throw new HttpsError('failed-precondition', 'Tournament maintenance is active.');
+  }
+  return tournament;
 }
 function audit(tx, id, eventType, matchKey, identity, before, after, reason = eventType) {
   const actor = typeof identity === 'object' ? bounded(identity) : { uid: identity };
@@ -69,16 +81,156 @@ export async function createRecorderAccessCode(request) {
   const uid = await admin(request, request.data); const code = randomCode(); const salt = crypto.randomBytes(24).toString('base64url');
   let version;
   await db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
     const config = await tx.get(ref('recorderAccess', 'config'));
     version = config.exists ? (config.data().version || 0) + 1 : 1;
     const data = { enabled:true, version, salt, codeHash:hash(code,salt), hashVersion:1, updatedBy:uid, updatedAt:FieldValue.serverTimestamp() };
     if (config.exists) tx.update(config.ref, data);
     else tx.create(ref('recorderAccess', 'config'), data);
     tx.set(ref('recorderAccessChallenge', 'current'), { enabled:true, version });
+    tx.set(root(), { recorderFeatureEnabled: true }, { merge: true });
   });
   return { version, code };
 }
-export async function revokeRecorderAccessCode(request) { const uid=await admin(request,request.data); await db().runTransaction(async(tx)=>{const snap=await tx.get(ref('recorderAccess','config')); if(!snap.exists) bad('Access code does not exist.'); const version=(snap.data().version||0)+1; tx.update(snap.ref,{enabled:false,version,updatedBy:uid,updatedAt:FieldValue.serverTimestamp()}); tx.set(ref('recorderAccessChallenge','current'),{enabled:false,version});}); return {revoked:true}; }
+export async function revokeRecorderAccessCode(request) {
+  const uid = await admin(request, request.data);
+  await db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
+    const snap = await tx.get(ref('recorderAccess', 'config'));
+    if (!snap.exists) bad('Access code does not exist.');
+    const version = (snap.data().version || 0) + 1;
+    tx.update(snap.ref, { enabled:false, version, updatedBy:uid, updatedAt:FieldValue.serverTimestamp() });
+    tx.set(ref('recorderAccessChallenge', 'current'), { enabled:false, version });
+    tx.set(root(), { recorderFeatureEnabled: false }, { merge: true });
+  });
+  return { revoked:true };
+}
+export async function prepareTournamentReset(request) {
+  const uid = await admin(request, request.data);
+  const expectedName = request.data?.expectedName;
+  if (typeof expectedName !== 'string' || !expectedName.trim()) {
+    throw new HttpsError('invalid-argument', 'Current tournament name required.');
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  let tournamentName;
+  await db().runTransaction(async (tx) => {
+    const tournament = await tx.get(root());
+    if (tournament.data()?.maintenance?.enabled === true) {
+      throw new HttpsError('failed-precondition', 'Tournament maintenance is already active.');
+    }
+    tournamentName = tournament.data()?.name?.trim() || '바운스발리볼';
+    if (tournamentName !== expectedName.trim()) {
+      throw new HttpsError('aborted', 'Tournament name changed. Refresh and confirm again.');
+    }
+    tx.set(root(), {
+      maintenance: {
+        enabled: true,
+        reset: {
+          ownerUid: uid,
+          tokenHash: resetTokenHash(token),
+          phase: 'prepared',
+          preparedAt: FieldValue.serverTimestamp(),
+        },
+      },
+    }, { merge: true });
+  });
+  return { prepared: true, token, tournamentName };
+}
+export async function recoverTournamentReset(request) {
+  const uid = await admin(request, request.data, { allowResetMaintenance: true });
+  const token = crypto.randomBytes(32).toString('base64url');
+  let phase;
+  await db().runTransaction(async (tx) => {
+    const tournament = await tx.get(root());
+    const reset = tournament.data()?.maintenance?.reset;
+    const preparedAt = reset?.preparedAt?.toMillis?.() || 0;
+    const stale = Date.now() - preparedAt >= 15 * 60 * 1000;
+    if (tournament.data()?.maintenance?.enabled !== true
+        || !reset
+        || (reset.ownerUid !== uid && !stale)) {
+      throw new HttpsError('failed-precondition', 'Active reset can only be recovered by its owner or after 15 minutes.');
+    }
+    phase = reset.phase;
+    tx.set(root(), {
+      maintenance: {
+        ...tournament.data().maintenance,
+        reset: {
+          ...reset,
+          ownerUid: uid,
+          tokenHash: resetTokenHash(token),
+          recoveredAt: FieldValue.serverTimestamp(),
+        },
+      },
+    }, { merge: true });
+  });
+  return { recovered: true, phase, token };
+}
+async function resetOwner(request) {
+  const uid = await admin(request, request.data, { allowResetMaintenance: true });
+  const token = request.data?.token;
+  if (typeof token !== 'string' || !token) throw new HttpsError('invalid-argument', 'Reset token required.');
+  const maintenance = (await root().get()).data()?.maintenance;
+  if (maintenance?.enabled !== true
+      || maintenance?.reset?.ownerUid !== uid
+      || maintenance?.reset?.tokenHash !== resetTokenHash(token)) {
+    throw new HttpsError('permission-denied', 'Current reset owner and token required.');
+  }
+  return { uid, token };
+}
+export async function cancelTournamentReset(request) {
+  const { uid, token } = await resetOwner(request);
+  await db().runTransaction(async (tx) => {
+    const tournament = await tx.get(root());
+    const reset = tournament.data()?.maintenance?.reset;
+    if (tournament.data()?.maintenance?.enabled !== true
+        || reset?.ownerUid !== uid
+        || reset?.tokenHash !== resetTokenHash(token)
+        || reset?.phase !== 'prepared') {
+      throw new HttpsError('permission-denied', 'Current reset owner and token required.');
+    }
+    // merge:true 는 중첩 맵을 병합하므로 enabled만 내리면 reset 리스가 문서에 남아
+    // 이후 복구(restore) 단계 callable이 영원히 maintenance로 차단된다. 명시적으로 지운다.
+    tx.set(root(), { maintenance: { enabled: false, reset: FieldValue.delete() } }, { merge: true });
+  });
+  return { cancelled: true };
+}
+export async function resetTournament(request) {
+  const { uid, token } = await resetOwner(request);
+  await db().runTransaction(async (tx) => {
+    const tournament = await tx.get(root());
+    const reset = tournament.data()?.maintenance?.reset;
+    if (tournament.data()?.maintenance?.enabled !== true
+        || reset?.ownerUid !== uid
+        || reset?.tokenHash !== resetTokenHash(token)
+        || !['prepared', 'deleting'].includes(reset?.phase)) {
+      throw new HttpsError('permission-denied', 'Current reset owner and token required.');
+    }
+    tx.set(root(), {
+      maintenance: {
+        ...tournament.data().maintenance,
+        reset: { ...reset, phase: 'deleting', deletionStartedAt: FieldValue.serverTimestamp() },
+      },
+    }, { merge: true });
+  });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const collections = await root().listCollections();
+    const operational = collections.filter((subcollection) => subcollection.id !== 'admins');
+    await Promise.all(operational.map((subcollection) => db().recursiveDelete(subcollection)));
+    const remaining = (await root().listCollections()).filter((subcollection) => subcollection.id !== 'admins');
+    if (!remaining.length) break;
+    if (attempt === 2) throw new HttpsError('internal', 'Tournament data deletion did not complete.');
+  }
+  await root().set({
+    tournamentId: TOURNAMENT_ID,
+    name: '',
+    qualifyPerGroup: { men: 2, women: 2 },
+    recorderFeatureEnabled: false,
+    maintenance: { enabled: false },
+    courtTopologyRevision: 0,
+    venueDisplay: { mode: 'auto', intervalSeconds: 15 },
+  });
+  return { reset: true };
+}
 export async function exchangeRecorderAccessCode(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;
@@ -88,6 +240,10 @@ export async function exchangeRecorderAccessCode(request) {
     throw new HttpsError('invalid-argument', 'Code required.');
   }
   return db().runTransaction(async (tx) => {
+    const tournament = await tx.get(root());
+    if (tournament.data()?.maintenance?.enabled === true) {
+      throw new HttpsError('failed-precondition', 'Tournament maintenance is active.');
+    }
     const config = await tx.get(ref('recorderAccess', 'config'));
     const data = config.data();
     const suppliedHash = data ? hash(code.trim(), data.salt) : '';
@@ -105,6 +261,9 @@ export async function exchangeRecorderAccessCode(request) {
       proofHash: data.codeHash,
       issuedAt: FieldValue.serverTimestamp(),
     });
+    // 과거 버전은 코드 생성 시 이 플래그를 켜지 않았다. 유효한 현재 코드를
+    // 증명한 경우 함께 복구해 기존 발급 코드도 다시 만들지 않고 사용할 수 있게 한다.
+    tx.set(root(), { recorderFeatureEnabled: true }, { merge: true });
     return { tournamentId: TOURNAMENT_ID, grantVersion: version };
   });
 }
@@ -120,13 +279,19 @@ export async function replaceCourtWorkflows(request) {
     throw new HttpsError('invalid-argument', 'courts, assignments, topology revision and queue revisions are required.');
   }
   const courtIds = new Set();
-  const normalizedCourts = courts.map((court) => {
+  const courtNames = new Set();
+  // 문서 ID는 랜덤이라 읽는 순서가 관리자가 만든 순서와 무관하다. 순서를 문서에 명시적으로 박는다.
+  const normalizedCourts = courts.map((court, index) => {
+    const name = typeof court?.name === 'string'
+      ? court.name.trim().replace(/\s*코트$/u, '').trim()
+      : '';
     if (!court || typeof court.id !== 'string' || !court.id || typeof court.name !== 'string'
-        || !court.name.trim() || typeof court.recorderName !== 'string' || courtIds.has(court.id)) {
+        || !name || typeof court.recorderName !== 'string' || courtIds.has(court.id) || courtNames.has(name)) {
       bad('Every court needs a unique id, display name and recorder name.');
     }
     courtIds.add(court.id);
-    return { id: court.id, name: court.name.trim(), recorderName: court.recorderName.trim() };
+    courtNames.add(name);
+    return { id: court.id, name, recorderName: court.recorderName.trim(), order: index + 1 };
   });
   const desired = new Map();
   const normalizeAssignment = (item, courtId, order, nextCourtMatchKey) => {
@@ -161,6 +326,9 @@ export async function replaceCourtWorkflows(request) {
       tx.get(root().collection('courtQueues')),
       tx.get(root().collection('courts')),
     ]);
+    if (tournamentSnap.data()?.maintenance?.enabled === true) {
+      throw new HttpsError('failed-precondition', 'Tournament maintenance is active.');
+    }
     const currentTopologyRevision = tournamentSnap.data()?.courtTopologyRevision || 0;
     if (currentTopologyRevision !== expectedTopologyRevision) {
       throw new HttpsError('aborted', 'Court topology revision changed.');
@@ -334,6 +502,7 @@ export async function publishFinalStructure(request) {
   const collectionRef = root().collection('divisions').doc(division).collection('finalMatches');
   const transition = `final_structure:${division}:${crypto.randomUUID()}`;
   await db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
     const existing = await tx.get(collectionRef);
     const keep = new Set();
     for (const match of matches) {
@@ -367,6 +536,7 @@ async function approve(request, direct = false) {
   const { matchKey, score, reason, expectedSubmissionVersion, expectedOfficialRevision } = request.data;
   if (!matchKey) throw new HttpsError('invalid-argument', 'matchKey required.');
   return db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
     const assignmentSnap = await tx.get(ref('courtAssignments', matchKey)); const workflowSnap = await tx.get(ref('scoreWorkflows', matchKey));
     if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match workflow not found.');
     const assignment = assignmentSnap.data(); const workflow = workflowSnap.data();
@@ -491,6 +661,7 @@ export async function rejectScoreReview(request) {
     throw new HttpsError('invalid-argument', 'Reason and submission revision are required.');
   }
   return db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
     const [assignmentSnap, workflowSnap] = await Promise.all([
       tx.get(ref('courtAssignments', matchKey)),
       tx.get(ref('scoreWorkflows', matchKey)),
@@ -647,6 +818,7 @@ export async function forceReleaseWorkflow(request) {
     throw new HttpsError('invalid-argument', 'A release reason and lock token are required.');
   }
   return db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
     const assignmentSnap = await tx.get(ref('courtAssignments', matchKey)); const workflowSnap = await tx.get(ref('scoreWorkflows', matchKey));
     if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match not found.');
     const assignment = assignmentSnap.data(); const workflow = workflowSnap.data(); if (!workflow.lock) bad('No active lock to release.');
@@ -711,6 +883,7 @@ export async function applyApprovedCorrection(request) {
     throw new HttpsError('invalid-argument', 'matchKeys, reason and expectedQueueRevision are required.');
   }
   return db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
     const first = await tx.get(ref('courtAssignments', targets[0])); if (!first.exists) bad('Unknown correction target.'); const courtId = first.data().courtId;
     const state = await courtState(tx, courtId); if (targets.some((key) => !state.assignments[key] || state.assignments[key].courtId !== courtId)) bad('Correction targets must share one court.');
     if (state.queue.queueRevision !== expectedQueueRevision) throw new HttpsError('aborted', 'Queue revision changed.');

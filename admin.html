@@ -10,7 +10,7 @@
 <body>
 <div id="loginScreen" class="login-screen">
   <div class="login-card">
-    <div class="brand" style="justify-content:center; margin-bottom:4px;"><span class="emoji">🏐</span> 바운스발리볼 관리자</div>
+    <div class="brand" style="justify-content:center; margin-bottom:4px;">바운스발리볼 관리자</div>
     <p class="empty-hint" style="margin:0 0 18px; text-align:center;">관리자 계정으로 로그인하세요.</p>
     <div id="loginError" class="error-banner"></div>
     <input type="email" id="loginEmail" placeholder="이메일" autocomplete="username" style="width:100%; margin-bottom:10px;" />
@@ -22,25 +22,17 @@
 <div class="app-shell" id="appShell" style="display:none;">
 
   <div class="top-bar">
-    <div class="brand"><span class="emoji">🏐</span> 바운스발리볼 관리자 페이지</div>
+    <div class="brand">바운스발리볼 관리자 페이지</div>
     <div class="row">
       <span id="connStatus" class="live-dot">동기화중</span>
-      <button class="btn ghost small" id="exportCsvBtn" title="예선·본선 전체 결과를 CSV 파일로 다운로드">⬇️ CSV</button>
-      <button class="btn ghost small" id="changePasswordBtn" title="비밀번호 변경">🔑 비밀번호 변경</button>
-      <button class="btn ghost small" id="logoutBtn" title="로그아웃">🚪 로그아웃</button>
-      <a class="btn ghost small" href="dashboard.html" target="_blank">대시보드 열기 ↗</a>
+      <button class="btn ghost small" id="exportCsvBtn" title="예선·본선 전체 결과를 CSV 파일로 다운로드">CSV</button>
+      <button class="btn ghost small" id="changePasswordBtn" title="비밀번호 변경">비밀번호 변경</button>
+      <button class="btn ghost small" id="logoutBtn" title="로그아웃">로그아웃</button>
+      <a class="btn ghost small" href="dashboard.html" target="_blank">대시보드 열기</a>
     </div>
   </div>
 
   <div id="errorBanner" class="error-banner"></div>
-
-  <div class="card" style="margin-bottom:12px;">
-    <h2 style="margin-bottom:10px;">🏐 경기 부문 선택</h2>
-    <div class="division-switch" role="group" aria-label="경기 부문">
-      <button type="button" class="division-btn active" data-division="men">남자부</button>
-      <button type="button" class="division-btn" data-division="women">여자부</button>
-    </div>
-  </div>
 
   <div class="tabs">
     <button class="tab-btn active" data-tab="setup">대회설정</button>
@@ -52,7 +44,7 @@
   <!-- 대회설정 -->
   <section class="tab-panel active" id="tab-setup">
     <div class="card">
-      <h2>🏷️ 대회 정보</h2>
+      <h2>대회 정보</h2>
       <div class="row">
         <input type="text" id="tournamentNameInput" placeholder="대회명 (예: 2026 바운스발리볼)" style="flex:1; min-width:240px;" />
         <button class="btn primary" id="saveTournamentNameBtn">저장</button>
@@ -60,89 +52,126 @@
     </div>
 
     <div class="card">
-      <h2>📺 경기장 송출 설정</h2>
-      <div class="row" style="gap:8px; flex-wrap:wrap;">
-        <label>표시 부문
-          <select id="venueDisplayMode">
-            <option value="auto">자동 교대</option>
-            <option value="men">남자부</option>
-            <option value="women">여자부</option>
-          </select>
-        </label>
-        <label>교대 간격
-          <select id="venueDisplayInterval">
-            <option value="10">10초</option>
-            <option value="15" selected>15초</option>
-            <option value="20">20초</option>
-            <option value="30">30초</option>
-          </select>
-        </label>
-        <button class="btn primary" id="saveVenueDisplayBtn">송출 설정 저장</button>
-        <a class="btn" href="dashboard.html?display=venue&amp;tab=prelim" target="_blank">경기장 화면 열기 ↗</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>💾 데이터 백업 / 복원</h2>
-      <p class="empty-hint" style="margin:0 0 12px;">v3 백업에는 대진·코트 대기열·워크플로 manifest가 포함됩니다. 복원은 서버 manifest 검증 후 적용합니다.</p>
-      <div class="row" style="gap:8px; flex-wrap:wrap;">
-        <button class="btn primary" id="backupBtn">⬇️ 백업 파일 저장</button>
-        <button class="btn" id="restoreBtn">⬆️ 백업 파일에서 복원</button>
-        <input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none;" />
-      </div>
-      <div class="row" style="gap:8px; flex-wrap:wrap; margin-top:12px;">
-        <input id="migrationManifestId" placeholder="migration manifest ID" />
-        <button class="btn" id="createMigrationBtn">migration manifest 생성</button>
-        <button class="btn primary" id="applyMigrationBtn">manifest 적용</button>
-      </div>
-      <div id="workflowStatus" class="empty-hint" style="margin-top:8px;"></div>
-      <p class="empty-hint" style="margin:10px 0 0; color:#c0392b;">⚠️ 복원하면 현재 입력된 데이터가 백업 파일 내용으로 <b>전부 대체</b>됩니다.</p>
-    </div>
-
-    <div class="card">
-      <h2>📁 조 편성 <button class="btn danger small" id="resetGroupsBtn" style="margin-left:auto;" title="등록된 모든 조를 삭제합니다">초기화</button></h2>
-      <div class="row" style="margin-bottom:12px;">
-        <input type="text" id="groupNameInput" placeholder="조 이름 (예: 1조)" />
-        <button class="btn" id="addGroupBtn">조 추가</button>
-      </div>
-      <div id="groupList" class="row"></div>
-    </div>
-
-    <div class="card">
-      <h2>🙋 참가팀 등록 <span style="font-weight:400; color:var(--muted); font-size:13px;">(총 <span id="teamCount">0</span>팀)</span><button class="btn danger small" id="resetTeamsBtn" style="margin-left:auto;" title="등록된 모든 팀을 삭제합니다">초기화</button></h2>
-      <div class="row" style="margin-bottom:14px;">
-        <select id="teamGroupSelect"><option value="">① 조 선택</option></select>
-        <input type="text" id="teamNameInput" placeholder="먼저 조를 선택하세요" style="flex:1; min-width:160px;" disabled />
-        <button class="btn" id="addTeamBtn" disabled>팀 추가</button>
-      </div>
-      <div id="groupTeamLists" class="grid-auto"></div>
-      <p class="empty-hint" style="margin:8px 0 0;">조·팀 카드를 드래그해 순서를 바꾸거나, 팀을 다른 조로 옮길 수 있어요.</p>
-    </div>
-
-    <div class="card">
-      <h2>🗓️ 예선 대진 방식·생성 <button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="모든 조의 예선 대진과 결과를 삭제합니다">전체 초기화</button></h2>
-      <p class="empty-hint" style="margin:0 0 12px;">조마다 <b>라운드로빈</b>(모든 팀이 한 번씩 대결) 또는 <b>링크제</b>(도형 꼭짓점에 배치해 인접한 팀끼리만 대결) 방식을 선택하고 대진을 생성하세요. 생성된 대진과 순위표는 <b>[예선]</b> 탭에서 확인합니다.</p>
-      <div id="prelimSetupGroups"></div>
-    </div>
-
-    <div class="card">
-      <h2>🏟️ 코트 설정</h2>
-      <p class="empty-hint">코트 표시 이름과 담당 기록관을 설정하세요. 코트를 삭제하면 해당 경기는 미배정으로 이동합니다.</p>
+      <h2>코트 설정 · 기록관 배정 <button type="button" class="help-trigger" aria-label="코트 설정 설명" data-help="남자부·여자부가 함께 사용하는 코트입니다. 코트 이름과 담당 기록관을 입력하세요. 코트를 삭제하면 배정된 경기는 미배정으로 이동합니다.">설명</button></h2>
       <div id="courtSettingsList" class="court-settings-list"></div>
-      <h3>통합 경기 배정·순서</h3>
-      <p class="empty-hint">예선·본선 전체 경기 카드를 드래그해 코트를 배정하고 실제 진행 순서를 정하세요.</p>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" id="addCourtBtn">+ 코트 추가</button>
+      </div>
+      <div class="workflow-save-row">
+        <span id="courtSettingsHint" class="unsaved-change" hidden></span>
+        <button class="btn primary" id="setupCourtsBtn">코트 설정 저장</button>
+      </div>
+    </div>
+
+    <section class="division-session" id="divisionSetupSession" data-division-theme="men" aria-labelledby="divisionSetupTitle">
+      <div class="division-session-heading">
+        <div>
+          <h2 id="divisionSetupTitle">부문별 참가 · 예선 설정 <button type="button" class="help-trigger" aria-label="부문별 설정 설명" data-help="조 편성, 참가팀 등록, 예선 대진만 남자부·여자부를 나눠 설정합니다.">설명</button></h2>
+        </div>
+        <div class="division-switch" role="group" aria-label="대회설정 경기 부문">
+          <button type="button" class="division-btn active" data-division="men">남자부</button>
+          <button type="button" class="division-btn" data-division="women">여자부</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>조 편성 <button class="btn danger small" id="resetGroupsBtn" style="margin-left:auto;" title="현재 부문의 모든 조를 삭제합니다">초기화</button></h2>
+        <div class="row" style="margin-bottom:12px;">
+          <input type="text" id="groupNameInput" placeholder="조 이름 (예: 1조)" />
+          <button class="btn" id="addGroupBtn">조 추가</button>
+        </div>
+        <div id="groupList" class="row"></div>
+      </div>
+
+      <div class="card">
+        <h2>참가팀 등록 <button type="button" class="help-trigger" aria-label="참가팀 등록 설명" data-help="조·팀 카드를 드래그해 순서를 바꾸거나 팀을 다른 조로 옮길 수 있습니다.">설명</button> <span style="font-weight:400; color:var(--muted); font-size:13px;">(총 <span id="teamCount">0</span>팀)</span><button class="btn danger small" id="resetTeamsBtn" style="margin-left:auto;" title="현재 부문의 모든 팀을 삭제합니다">초기화</button></h2>
+        <div class="row" style="margin-bottom:14px;">
+          <select id="teamGroupSelect"><option value="">① 조 선택</option></select>
+          <input type="text" id="teamNameInput" placeholder="먼저 조를 선택하세요" style="flex:1; min-width:160px;" disabled />
+          <button class="btn" id="addTeamBtn" disabled>팀 추가</button>
+        </div>
+        <div id="groupTeamLists" class="grid-auto"></div>
+      </div>
+
+      <div class="card">
+        <h2>예선 대진 방식·생성 <button type="button" class="help-trigger" aria-label="예선 대진 설정 설명" data-help="조마다 라운드로빈 또는 링크제 방식을 선택해 대진을 생성하고 경기별 코트를 지정합니다. 순위표와 점수 입력은 예선 탭에서 합니다.">설명</button><button class="btn danger small" id="resetPrelimBtn" style="margin-left:auto;" title="현재 부문의 모든 조 예선 대진과 결과를 삭제합니다">전체 초기화</button></h2>
+        <div id="prelimSetupGroups"></div>
+      </div>
+    </section>
+
+    <div class="card">
+      <h2>통합 경기 배정·순서 <button type="button" class="help-trigger" aria-label="통합 경기 배정 설명" data-help="남자부·여자부 예선·본선 전체 경기 카드를 한 화면에서 코트에 배정하고 실제 진행 순서를 정합니다.">설명</button></h2>
       <div id="allCourtBoard" class="court-board"></div>
       <div class="workflow-save-row">
-        <span id="workflowPlannerHint" class="empty-hint">변경한 코트 설정과 배정을 저장하세요.</span>
-        <button class="btn primary" id="setupWorkflowBtn">코트 설정·배정 저장</button>
+        <span id="workflowPlannerHint" class="unsaved-change" hidden></span>
+        <button class="btn primary" id="setupWorkflowBtn">코트 배정·순서 저장</button>
       </div>
     </div>
+
+    <details class="advanced-settings">
+      <summary>
+        <span class="advanced-settings-title">
+          <b>기타 관리 기능</b>
+          <small>경기장 송출 · 백업/복원 · 대회 전체 초기화</small>
+        </span>
+        <span class="advanced-settings-toggle">
+          <span class="when-closed">펼치기</span>
+          <span class="when-open">접기</span>
+        </span>
+      </summary>
+      <div class="advanced-settings-content">
+        <div class="card">
+          <h2>경기장 송출 설정</h2>
+          <div class="row" style="gap:8px; flex-wrap:wrap;">
+            <label>표시 부문
+              <select id="venueDisplayMode">
+                <option value="auto">자동 교대</option>
+                <option value="men">남자부</option>
+                <option value="women">여자부</option>
+              </select>
+            </label>
+            <label>교대 간격
+              <select id="venueDisplayInterval">
+                <option value="10">10초</option>
+                <option value="15" selected>15초</option>
+                <option value="20">20초</option>
+                <option value="30">30초</option>
+              </select>
+            </label>
+            <button class="btn primary" id="saveVenueDisplayBtn">송출 설정 저장</button>
+            <a class="btn" href="dashboard.html?display=venue&amp;tab=prelim" target="_blank">경기장 화면 열기</a>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>데이터 백업 / 복원</h2>
+          <p class="empty-hint" style="margin:0 0 12px;">v3 백업에는 대진·코트 대기열·워크플로 manifest가 포함됩니다. 복원은 서버 manifest 검증 후 적용합니다.</p>
+          <div class="row" style="gap:8px; flex-wrap:wrap;">
+            <button class="btn primary" id="backupBtn">백업 파일 저장</button>
+            <button class="btn" id="restoreBtn">백업 파일에서 복원</button>
+            <input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none;" />
+          </div>
+          <div class="row" style="gap:8px; flex-wrap:wrap; margin-top:12px;">
+            <input type="text" id="migrationManifestId" placeholder="migration manifest ID" />
+            <button class="btn" id="createMigrationBtn">migration manifest 생성</button>
+            <button class="btn primary" id="applyMigrationBtn">manifest 적용</button>
+          </div>
+          <div id="workflowStatus" class="empty-hint" style="margin-top:8px;"></div>
+          <p class="empty-hint" style="margin:10px 0 0; color:#c0392b;">복원하면 현재 입력된 데이터가 백업 파일 내용으로 <b>전부 대체</b>됩니다.</p>
+        </div>
+
+        <div class="card danger-zone">
+          <h2>대회 전체 초기화</h2>
+          <p class="empty-hint" style="margin:0 0 12px;">남자부·여자부, 팀, 대진·결과, 코트, 기록관/워크플로 데이터, 접근 코드, 송출·대회 설정을 모두 초기화합니다. 관리자 로그인 권한은 유지됩니다.</p>
+          <button class="btn danger" id="resetTournamentBtn">대회 전체 초기화</button>
+        </div>
+      </div>
+    </details>
   </section>
 
   <section class="tab-panel" id="tab-workflow">
     <div class="card">
-      <h2>🔐 기록관 접근 코드</h2>
-      <p class="empty-hint">코드는 생성·재발급 때만 표시됩니다. 안전한 방법으로 기록관에게 전달하세요.</p>
+      <h2>기록관 접근 코드 <button type="button" class="help-trigger" aria-label="기록관 접근 코드 설명" data-help="코드는 생성·재발급할 때만 표시됩니다. 안전한 방법으로 기록관에게 전달하세요.">설명</button></h2>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
         <button class="btn primary" id="createRecorderCodeBtn">접근 코드 생성/재발급</button>
         <button class="btn danger" id="revokeRecorderCodeBtn">접근 코드 폐기</button>
@@ -150,13 +179,11 @@
       <pre id="recorderCodeOutput" class="empty-hint" style="display:none; margin-top:10px;"></pre>
     </div>
     <div class="card">
-      <h2>📝 제출 결과 검수</h2>
-      <p class="empty-hint">제출 검수는 코트의 current/next와 독립적으로 표시됩니다.</p>
+      <h2>제출 결과 검수 <button type="button" class="help-trigger" aria-label="제출 결과 검수 설명" data-help="기록관이 제출한 결과를 승인·반려합니다. 검수 대기 항목은 현재 코트 진행 순서와 별도로 표시됩니다.">설명</button></h2>
       <div id="scoreReviewList"></div>
     </div>
     <div class="card">
-      <h2>🔁 승인 결과 정정</h2>
-      <p class="empty-hint">적용 전 replay와 대기열 변경을 미리 확인합니다. 활성 경기 충돌은 적용할 수 없습니다.</p>
+      <h2>승인 결과 정정 <button type="button" class="help-trigger" aria-label="승인 결과 정정 설명" data-help="적용 전에 재경기와 대기열 변경을 미리 확인합니다. 현재 진행 중인 경기와 충돌하면 적용할 수 없습니다.">설명</button></h2>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
         <select id="correctionMatchKeys" multiple size="4" style="flex:1; min-width:280px;" aria-label="정정할 경기 선택"></select>
         <button class="btn" id="previewCorrectionBtn">정정 미리보기</button>
@@ -167,27 +194,36 @@
   </section>
 
   <!-- 예선 -->
-  <section class="tab-panel" id="tab-prelim">
+  <section class="tab-panel" id="tab-prelim" data-division-theme="men">
     <div class="card">
-      <h2>📋 예선 대진표</h2>
-      <p class="empty-hint" style="margin:0;">대진 방식 선택과 대진 생성은 <b>[대회설정]</b> 탭의 '예선 대진 방식·생성'에서 합니다. 여기서는 조별 대진과 순위표를 확인하고 점수를 입력하세요.</p>
+      <h2>예선 대진표 <button type="button" class="help-trigger" aria-label="예선 대진표 설명" data-help="대진 생성은 대회설정 탭에서 합니다. 기록관 제출 점수는 검수 대기로 표시되고 기록·검수 탭에서 승인한 뒤 공식 결과와 순위에 반영됩니다.">설명</button></h2>
+      <div class="division-switch section-division-switch" role="group" aria-label="예선 경기 부문">
+        <button type="button" class="division-btn active" data-division="men">남자부</button>
+        <button type="button" class="division-btn" data-division="women">여자부</button>
+      </div>
     </div>
     <div id="prelimGroups"></div>
   </section>
 
   <!-- 본선 -->
-  <section class="tab-panel" id="tab-final">
+  <section class="tab-panel" id="tab-final" data-division-theme="men">
     <div class="card">
-      <h2>🏆 본선 진출팀 선택 &amp; 시드 배정</h2>
+      <h2>본선 경기 부문</h2>
+      <div class="division-switch" role="group" aria-label="본선 경기 부문">
+        <button type="button" class="division-btn active" data-division="men">남자부</button>
+        <button type="button" class="division-btn" data-division="women">여자부</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>본선 진출팀 선택 &amp; 시드 배정 <button type="button" class="help-trigger" aria-label="본선 시드 배정 설명" data-help="예선 순위 기준으로 진출팀이 자동 선택됩니다. 체크박스로 팀을 바꾸거나 화살표로 시드 순서를 조정할 수 있습니다.">설명</button></h2>
       <div class="settings-box row" style="margin-bottom:12px; align-items:center; justify-content:space-between;">
         <label style="font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px;">
-          ⚙️ 조별 본선 진출 팀 수
+          조별 본선 진출 팀 수
           <input type="number" id="qualifyPerGroupInput" min="1" max="16" value="2" style="width:64px;" />
           팀
         </label>
         <button class="btn primary small" id="saveQualifyPerGroupBtn" title="저장해야 적용돼요">저장</button>
       </div>
-      <p class="empty-hint" style="margin:0 0 12px;">예선 순위(승점→세트득실→득실차→승자승) 기준으로 자동 체크됩니다. 체크박스로 직접 바꾸거나 화살표로 시드 순서를 조정하세요.</p>
       <div id="finalTeamPicker"></div>
       <div class="row" style="margin-top:14px;">
         <button class="btn primary" id="generateBracketBtn">대진표 생성</button>
@@ -195,17 +231,17 @@
       </div>
     </div>
     <div class="card" id="byeUnassignedCard" style="display:none;">
-      <h3 style="margin:0 0 8px;">⏳ 미배정 팀 (부전승 대상)</h3>
+      <h3 style="margin:0 0 8px;">미배정 팀 (부전승 대상)</h3>
       <p class="empty-hint" style="margin:0 0 10px; padding:0;">상대가 없어 대진표에는 보이지 않는 자리입니다. 부전승으로 진출시킬 팀을 직접 선택해서 배치하세요.</p>
       <div id="byeUnassignedList"></div>
     </div>
 
     <div class="card">
       <div class="bracket-header">
-        <div class="bracket-banner"><span>🏆</span> <span id="bracketTitle">본선 대진표</span></div>
+        <div class="bracket-banner"><span id="bracketTitle">본선 대진표</span></div>
       </div>
       <div class="bracket-publish-bar" id="bracketPublishBar" style="display:none;">
-        <span id="bracketPublishMsg">✅ 모든 변경사항이 관객 화면에 공개되어 있습니다.</span>
+        <span id="bracketPublishMsg">모든 변경사항이 관객 화면에 공개되어 있습니다.</span>
         <button type="button" class="btn primary small" id="publishBracketBtn">관객 화면에 공개</button>
       </div>
       <div class="bracket-wrap" id="finalBracketContainer"></div>

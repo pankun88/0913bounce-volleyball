@@ -5,15 +5,21 @@
       "firebase.json",
       "firestore.rules",
       "firestore.indexes.json",
+      "firebase.safe-rollback.json",
+      "firestore.safe-rollback.rules",
       ".firebaserc",
-      "README.md",
+      "**/*.md",
       "package.json",
       "package-lock.json",
       "functions/**",
       "test/**",
+      "artifacts/**",
+      "0627경기결과/**",
       "**/.*",
       "**/node_modules/**",
-      "js/test.mjs"
+      "**/*.mjs",
+      "**/*.png",
+      "**/*.command"
     ],
     "headers": [
       {

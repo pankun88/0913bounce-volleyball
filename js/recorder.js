@@ -3,7 +3,7 @@ import { db } from "./firebase-init.js";
 import { TOURNAMENT_ID, describeRecorderAuthError, exchangeRecorderAccessCode, loginWithGoogle, logoutRecorder, watchRecorderAuthState } from "./recorder-auth-service.js";
 import { cancelDraft, claimCurrentMatch, saveDraft, submitDraft, subscribeAssignment, subscribeCourt, subscribeWorkflow } from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, validateSetScore } from "./match-logic.js";
-import { courtMatchSummary, courtTeamNames } from "./court-display.js";
+import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-display.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries(["logoutButton", "connectionStatus", "authPanel", "authMessage", "identity", "googleLoginButton", "accessCodeForm", "accessCode", "accessCodeButton", "courtPanel", "courtSelect", "courtMessage", "workflowPanel", "matchSummary", "rejectionNotice", "lockNotice", "claimButton", "scoreForm", "scoreFields", "scoreLegend", "scoreError", "saveButton", "reviewButton", "cancelButton", "confirmPanel", "confirmScore", "backToEditButton", "submitButton"].map((id) => [id, $(id)]));
@@ -52,7 +52,7 @@ function teamName(side) {
   const names = courtTeamNames(officialMatch, teamsById);
   return names ? names[side] : (side === "a" ? "A팀" : "B팀");
 }
-function courtDisplayName(court) { return court?.name || court?.label || "이름 없는 코트"; }
+function courtDisplayName(court) { return formatCourtName(court, "이름 없는 코트"); }
 function recorderName(court) { return typeof court?.recorderName === "string" ? court.recorderName.trim() : ""; }
 function scoreFromForm() { return [...ui.scoreFields.querySelectorAll(".score-row")].map((row) => ({ a: Number(row.querySelector('[name$="-a"]').value), b: Number(row.querySelector('[name$="-b"]').value) })); }
 function validateScore(forSubmit) {
@@ -72,16 +72,22 @@ function renderScoreForm() {
   if (officialMatchState !== "ready" || !workflow || workflow.draftState !== "editing" || !editToken) { ui.scoreForm.hidden = true; return; }
   const existing = workflow.draft?.sets || [];
   ui.scoreLegend.textContent = `${teamName("a")} vs ${teamName("b")} 점수`;
-  ui.scoreFields.replaceChildren();
+  ui.scoreFields.replaceChildren(ui.scoreLegend);
   const targets = isFinal() ? [10, 10, 7] : [10, 10];
   targets.forEach((target, index) => {
     const row = document.createElement("div"); row.className = "score-row";
-    const label = document.createElement("label"); label.htmlFor = `set-${index}-a`; label.textContent = `${index + 1}세트 (${target}점)`;
+    const label = document.createElement("label"); label.htmlFor = `set-${index}-a`; label.textContent = `${index + 1}세트 · ${target}점`;
     const a = document.createElement("input"); a.id = `set-${index}-a`; a.name = `set-${index}-a`; a.type = "number"; a.min = "0"; a.max = "15"; a.inputMode = "numeric"; a.value = existing[index]?.a ?? 0; a.setAttribute("aria-label", `${index + 1}세트 ${teamName("a")} 점수`);
     const colon = document.createElement("span"); colon.textContent = ":";
     const b = document.createElement("input"); b.id = `set-${index}-b`; b.name = `set-${index}-b`; b.type = "number"; b.min = "0"; b.max = "15"; b.inputMode = "numeric"; b.value = existing[index]?.b ?? 0; b.setAttribute("aria-label", `${index + 1}세트 ${teamName("b")} 점수`);
+    const aEntry = document.createElement("div"); aEntry.className = "score-entry";
+    const aName = document.createElement("span"); aName.textContent = teamName("a");
+    aEntry.append(aName, a);
+    const bEntry = document.createElement("div"); bEntry.className = "score-entry";
+    const bName = document.createElement("span"); bName.textContent = teamName("b");
+    bEntry.append(bName, b);
     if (isFinal() && index === 2 && !finalNeedsThirdSet(existing)) { a.disabled = true; b.disabled = true; }
-    row.append(label, a, colon, b); ui.scoreFields.append(row);
+    row.append(label, aEntry, colon, bEntry); ui.scoreFields.append(row);
   });
   if (isFinal()) {
     const updateThirdSet = () => {
@@ -96,6 +102,52 @@ function renderScoreForm() {
   }
   ui.scoreForm.hidden = false;
 }
+
+function renderMatchSummary(view) {
+  const names = courtTeamNames(officialMatch, teamsById);
+  const court = courts.find((item) => item.id === selectedCourtId);
+  ui.matchSummary.replaceChildren();
+  const meta = document.createElement("div");
+  meta.className = "match-meta";
+  [view.label, courtDisplayName(court)].filter(Boolean).forEach((text) => {
+    const badge = document.createElement("span");
+    badge.textContent = text;
+    meta.appendChild(badge);
+  });
+  const matchup = document.createElement("div");
+  matchup.className = "matchup";
+  const teamA = document.createElement("strong"); teamA.textContent = names?.a || "대진 미정";
+  const versus = document.createElement("span"); versus.textContent = "VS";
+  const teamB = document.createElement("strong"); teamB.textContent = names?.b || "대진 미정";
+  matchup.append(teamA, versus, teamB);
+  ui.matchSummary.append(meta, matchup);
+  if (queue?.nextMatchKey) {
+    const next = document.createElement("p");
+    next.className = "next-match-note";
+    next.textContent = "다음 경기가 이 코트에서 대기 중입니다.";
+    ui.matchSummary.appendChild(next);
+  }
+}
+
+function renderConfirmScore(score) {
+  ui.confirmScore.replaceChildren();
+  const teams = document.createElement("div");
+  teams.className = "confirm-teams";
+  const teamA = document.createElement("strong"); teamA.textContent = teamName("a");
+  const versus = document.createElement("span"); versus.textContent = "VS";
+  const teamB = document.createElement("strong"); teamB.textContent = teamName("b");
+  teams.append(teamA, versus, teamB);
+  const sets = document.createElement("div");
+  sets.className = "confirm-sets";
+  score.sets.forEach((set, index) => {
+    const row = document.createElement("div");
+    row.className = "confirm-set-row";
+    row.innerHTML = `<span>${index + 1}세트</span><strong>${set.a}</strong><b>:</b><strong>${set.b}</strong>`;
+    sets.appendChild(row);
+  });
+  ui.confirmScore.append(teams, sets);
+}
+
 function renderWorkflow() {
   ui.confirmPanel.hidden = true;
   const currentMatchKey = queue?.currentMatchKey || (editToken ? activeMatchKey : null);
@@ -110,7 +162,7 @@ function renderWorkflow() {
     return;
   }
   const view = courtMatchSummary(assignment, officialMatch, { teamsById, groupsById });
-  ui.matchSummary.textContent = [view.label, view.teams || "경기 정보를 불러오는 중입니다.", queue?.nextMatchKey ? "다음 경기가 대기 중입니다." : ""].filter(Boolean).join("\n");
+  renderMatchSummary(view);
   const rejected = workflow?.draftState === "rejected";
   const reason = workflow?.rejectionReason || workflow?.reviewReason || workflow?.rejectedReason;
   ui.rejectionNotice.hidden = !rejected; ui.rejectionNotice.textContent = rejected ? `반려됨${reason ? `: ${reason}` : ". 점수를 수정해 다시 제출하세요."}` : "";
@@ -202,7 +254,11 @@ function startReadySubscriptions() {
   }, (error) => { setStatus(describeError(error)); });
   stopCourts();
   stopCourts = onSnapshot(collection(db, "tournaments", TOURNAMENT_ID, "courts"), (snapshot) => {
-    courts = snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id), "ko"));
+    // 관리자가 코트 설정에서 만든 순서(order)를 그대로 따른다. order가 같을 때만 이름으로 가른다.
+    courts = snapshot.docs
+      .map((item) => ({ id: item.id, ...item.data() }))
+      .sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0)
+        || String(a.name || a.id).localeCompare(String(b.name || b.id), "ko"));
     const namedCourts = courts.filter((court) => recorderName(court) || (editToken && court.id === selectedCourtId));
     ui.courtSelect.replaceChildren(new Option("이름을 선택하세요", ""), ...namedCourts.map((court) => {
       const displayRecorder = editToken && court.id === selectedCourtId ? selectedRecorderName : recorderName(court);
@@ -215,16 +271,30 @@ function startReadySubscriptions() {
 
 watchRecorderAuthState((state) => {
   ui.logoutButton.hidden = !state.user; ui.identity.hidden = !state.user; ui.identity.textContent = state.user ? (state.user.displayName || "기록관") : "";
-  if (!state.user) { resetPrivateSession(); ui.googleLoginButton.hidden = false; ui.accessCodeForm.hidden = true; ui.authMessage.textContent = "Google 로그인 후 대회 공용 코드를 입력하세요."; return; }
+  ui.authPanel.hidden = Boolean(state.ready);
+  if (!state.user) { ui.authPanel.hidden = false; resetPrivateSession(); ui.googleLoginButton.hidden = false; ui.accessCodeForm.hidden = true; ui.authMessage.textContent = "Google 로그인 후 대회 공용 코드를 입력하세요."; return; }
   ui.googleLoginButton.hidden = true;
-  if (!state.ready) { resetPrivateSession(); ui.accessCodeForm.hidden = false; ui.authMessage.textContent = "권한 대기 중입니다. 공용 코드를 확인하거나 대회 점검·권한 폐기 여부를 관리자에게 문의하세요."; return; }
+  if (!state.ready) { ui.authPanel.hidden = false; resetPrivateSession(); ui.accessCodeForm.hidden = false; ui.authMessage.textContent = "권한 대기 중입니다. 공용 코드를 확인하거나 대회 점검·권한 폐기 여부를 관리자에게 문의하세요."; return; }
   ui.accessCodeForm.hidden = true; ui.authMessage.textContent = "기록관 권한이 확인되었습니다."; ui.courtPanel.hidden = false; startReadySubscriptions();
 });
 
 window.addEventListener("online", () => setStatus("온라인 상태입니다."));
 window.addEventListener("offline", () => setStatus("오프라인 상태입니다. 저장과 제출은 연결 후 다시 시도하세요."));
 ui.googleLoginButton.addEventListener("click", async () => { setBusy(true); try { await loginWithGoogle(); } catch (error) { ui.authMessage.textContent = describeRecorderAuthError(error); } finally { setBusy(false); } });
-ui.accessCodeForm.addEventListener("submit", async (event) => { event.preventDefault(); setBusy(true); try { await exchangeRecorderAccessCode(ui.accessCode.value); ui.accessCode.value = ""; } catch (error) { ui.authMessage.textContent = describeRecorderAuthError(error); } finally { setBusy(false); } });
+ui.accessCodeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  setBusy(true);
+  ui.authMessage.textContent = "접근 코드를 확인하고 있습니다…";
+  try {
+    await exchangeRecorderAccessCode(ui.accessCode.value);
+    ui.accessCode.value = "";
+    ui.authMessage.textContent = "접근 코드가 확인되었습니다. 기록관 권한을 불러오는 중입니다…";
+  } catch (error) {
+    ui.authMessage.textContent = describeRecorderAuthError(error);
+  } finally {
+    setBusy(false);
+  }
+});
 ui.logoutButton.addEventListener("click", async () => { setBusy(true); try { await logoutRecorder(); } catch (error) { ui.authMessage.textContent = describeRecorderAuthError(error); } finally { setBusy(false); } });
 ui.courtSelect.addEventListener("change", () => {
   const court = courts.find((item) => item.id === ui.courtSelect.value);
@@ -233,7 +303,7 @@ ui.courtSelect.addEventListener("change", () => {
 });
 ui.claimButton.addEventListener("click", async () => { if (!queue?.currentMatchKey || !selectedCourtId || !selectedRecorderName || busy) return; setBusy(true); try { const result = await claimCurrentMatch({ matchKey: queue.currentMatchKey, courtId: selectedCourtId, queueRevision: queue.queueRevision, recorderName: selectedRecorderName }); editToken = result.token; setStatus("배정이 완료되었습니다. 경기 입력을 시작했습니다."); } catch (error) { setStatus(describeError(error)); } finally { setBusy(false); } });
 ui.scoreForm.addEventListener("submit", async (event) => { event.preventDefault(); if (busy) return; const check = validateScore(false); ui.scoreError.textContent = check.ok ? "" : check.message; if (!check.ok) return; setBusy(true); try { await saveDraft({ matchKey: activeMatchKey, token: editToken, score: check.score }); setStatus("임시 저장되었습니다."); } catch (error) { ui.scoreError.textContent = describeError(error); } finally { setBusy(false); } });
-ui.reviewButton.addEventListener("click", () => { const check = validateScore(true); ui.scoreError.textContent = check.ok ? "" : check.message; if (!check.ok) return; ui.confirmScore.textContent = check.score.sets.map((set, index) => `${index + 1}세트 ${set.a}:${set.b}`).join(" / "); ui.confirmPanel.hidden = false; ui.confirmPanel.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
+ui.reviewButton.addEventListener("click", () => { const check = validateScore(true); ui.scoreError.textContent = check.ok ? "" : check.message; if (!check.ok) return; renderConfirmScore(check.score); ui.confirmPanel.hidden = false; ui.confirmPanel.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
 ui.backToEditButton.addEventListener("click", () => { ui.confirmPanel.hidden = true; });
-ui.submitButton.addEventListener("click", async () => { if (busy) return; const check = validateScore(true); if (!check.ok) { ui.confirmPanel.hidden = true; ui.scoreError.textContent = check.message; return; } setBusy(true); try { await submitDraft({ matchKey: activeMatchKey, courtId: selectedCourtId, token: editToken, queueRevision: queue?.queueRevision, score: check.score }); editToken = null; selectedRecorderName = ""; ui.confirmPanel.hidden = true; attachCourt(""); ui.courtSelect.value = ""; setStatus("제출되었습니다. 다음 경기는 해당 코트에 배정된 기록관 이름을 새로 선택하세요."); } catch (error) { ui.scoreError.textContent = describeError(error); ui.confirmPanel.hidden = true; } finally { setBusy(false); } });
+ui.submitButton.addEventListener("click", async () => { if (busy) return; const check = validateScore(true); if (!check.ok) { ui.confirmPanel.hidden = true; ui.scoreError.textContent = check.message; return; } setBusy(true); try { await submitDraft({ matchKey: activeMatchKey, courtId: selectedCourtId, token: editToken, queueRevision: queue?.queueRevision, score: check.score }); editToken = null; selectedRecorderName = ""; ui.confirmPanel.hidden = true; attachCourt(""); ui.courtSelect.value = ""; setStatus("제출되었습니다. 관리자가 [기록·검수]에서 승인하면 공식 예선 결과와 순위에 반영됩니다. 다음 경기는 기록관 이름을 새로 선택하세요."); } catch (error) { ui.scoreError.textContent = describeError(error); ui.confirmPanel.hidden = true; } finally { setBusy(false); } });
 ui.cancelButton.addEventListener("click", async () => { if (busy) return; setBusy(true); try { await cancelDraft({ matchKey: activeMatchKey, courtId: selectedCourtId, token: editToken, queueRevision: queue?.queueRevision }); editToken = null; setStatus("입력을 취소했습니다."); } catch (error) { ui.scoreError.textContent = describeError(error); } finally { setBusy(false); } });

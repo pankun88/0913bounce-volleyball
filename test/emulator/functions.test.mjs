@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { initializeApp, deleteApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator, signInAnonymously } from 'firebase/auth';
 import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/functions';
-import { deleteDoc, doc, getDoc, setDoc } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocs, setDoc } from 'firebase/firestore';
 import { createFixture, PROJECT_ID, path } from './fixtures.mjs';
 import { activateDependencyEntries, consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
 
@@ -17,23 +17,68 @@ export async function runFunctionsSuite() {
   try {
     const auth = getAuth(app); connectAuthEmulator(auth, `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST || '127.0.0.1:9099'}`, { disableWarnings: true });
     const credential = await signInAnonymously(auth);
+    const functions = getFunctions(app, 'asia-northeast3'); connectFunctionsEmulator(functions, functionsHost, Number(functionsPort));
+    const data = { tournamentId: 'main' };
+    const resetData = { ...data, expectedName: '바운스발리볼' };
+    await assert.rejects(call(functions, 'resetTournament', data), /Seeded administrator required/, 'reset-non-admin-rejected');
+    await assert.rejects(call(functions, 'prepareTournamentReset', resetData), /Seeded administrator required/, 'reset-prepare-non-admin-rejected');
+    const unauthenticatedApp = initializeApp({ projectId: PROJECT_ID, apiKey: 'emulator-only', appId: `unauthenticated-${Date.now()}` }, `unauthenticated-${Date.now()}`);
+    try {
+      const unauthenticatedFunctions = getFunctions(unauthenticatedApp, 'asia-northeast3');
+      connectFunctionsEmulator(unauthenticatedFunctions, functionsHost, Number(functionsPort));
+      await assert.rejects(call(unauthenticatedFunctions, 'resetTournament', data), /Authentication required/, 'reset-unauthenticated-rejected');
+      await assert.rejects(call(unauthenticatedFunctions, 'prepareTournamentReset', resetData), /Authentication required/, 'reset-prepare-unauthenticated-rejected');
+    } finally {
+      await deleteApp(unauthenticatedApp);
+    }
     await f.seed(async (db) => {
       await setDoc(doc(db, path('admins', credential.user.uid)), { uid: credential.user.uid });
       await deleteDoc(doc(db, path('recorderAccess', 'config')));
       await deleteDoc(doc(db, path('recorderAccessChallenge', 'current')));
     });
-    const functions = getFunctions(app, 'asia-northeast3'); connectFunctionsEmulator(functions, functionsHost, Number(functionsPort));
-    const data = { tournamentId: 'main' };
+    const preparedCancellation = await call(functions, 'prepareTournamentReset', resetData);
+    assert.equal(preparedCancellation.prepared, true, 'reset-prepare-seeded-admin-succeeds');
+    await assert.rejects(call(functions, 'createRecorderAccessCode', data), /maintenance/i, 'reset-maintenance-rejects-admin-callables');
+    await assert.rejects(call(functions, 'createMigrationManifest', { ...data, manifestId: 'blocked-reset-migration' }), /maintenance/i, 'reset-maintenance-rejects-migration');
+    await assert.rejects(call(functions, 'beginRestore', { ...data, manifestId: 'blocked-reset-restore', chunks: [] }), /maintenance/i, 'reset-maintenance-rejects-restore');
+    await assert.rejects(call(functions, 'resetTournament', { ...data, token: 'wrong-token' }), /owner and token/i, 'reset-token-mismatch-rejected');
+    await assert.rejects(call(functions, 'cancelTournamentReset', { ...data, token: 'wrong-token' }), /owner and token/i, 'reset-cancel-token-mismatch-rejected');
+    const recoveredCancellation = await call(functions, 'recoverTournamentReset', data);
+    assert.equal(recoveredCancellation.recovered, true, 'reset-owner-can-recover-lost-token');
+    await assert.rejects(call(functions, 'cancelTournamentReset', { ...data, token: preparedCancellation.token }), /owner and token/i, 'reset-recovery-invalidates-old-token');
+    assert.deepEqual(
+      await call(functions, 'cancelTournamentReset', { ...data, token: recoveredCancellation.token }),
+      { cancelled: true },
+      'reset-cancel-clears-maintenance',
+    );
 
+    await f.seed((db) => setDoc(
+      doc(db, 'tournaments/main'),
+      { recorderFeatureEnabled: false },
+      { merge: true },
+    ));
     const created = await call(functions, 'createRecorderAccessCode', data);
     assert.equal(created.version, 1, 'access-code-create');
+    let recorderRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(recorderRoot.data().recorderFeatureEnabled, true, 'access-code-create-enables-recorder-feature');
     const reissued = await call(functions, 'createRecorderAccessCode', data);
     assert.equal(reissued.version, 2, 'access-code-reissue');
     await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: created.code }), /Invalid access code/);
+    await f.seed((db) => setDoc(
+      doc(db, 'tournaments/main'),
+      { recorderFeatureEnabled: false },
+      { merge: true },
+    ));
     const exchanged = await call(functions, 'exchangeRecorderAccessCode', { ...data, code: reissued.code });
     assert.equal(exchanged.grantVersion, 2, 'access-code-exchange-reissued');
+    recorderRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(recorderRoot.data().recorderFeatureEnabled, true, 'valid-code-self-heals-recorder-feature');
     assert.deepEqual(await call(functions, 'revokeRecorderAccessCode', data), { revoked: true }, 'access-code-revoke');
+    recorderRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(recorderRoot.data().recorderFeatureEnabled, false, 'access-code-revoke-disables-recorder-feature');
     const resumedAccess = await call(functions, 'createRecorderAccessCode', data);
+    recorderRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(recorderRoot.data().recorderFeatureEnabled, true, 'access-code-reissue-reenables-recorder-feature');
     await call(functions, 'exchangeRecorderAccessCode', { ...data, code: resumedAccess.code });
 
     const initialTopology = await call(functions, 'replaceCourtWorkflows', {
@@ -50,6 +95,8 @@ export async function runFunctionsSuite() {
       unassignedAssignments: [],
     });
     assert.deepEqual(initialTopology, { replaced: true, topologyRevision: 1 }, 'replace-court-workflows-cas-response');
+    const normalizedCourtName = await f.seed((db) => getDoc(doc(db, path('courts', 'callable-court'))));
+    assert.equal(normalizedCourtName.data().name, 'A', 'court-name-stores-identifier-without-suffix');
     const reorderedQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'callable-court'))));
     assert.equal(reorderedQueue.data().currentMatchKey, 'M2', 'replace-court-workflows-current');
     assert.equal(reorderedQueue.data().nextMatchKey, 'M1', 'replace-court-workflows-next');
@@ -385,6 +432,125 @@ export async function runFunctionsSuite() {
     assert.equal(restoring.data().maintenance.enabled, true, 'restore-maintenance');
     await call(functions, 'verifyRestore', { ...data, manifestId: 'restore-maintenance' });
     await assert.rejects(call(functions, 'verifyRestore', { ...data, manifestId: 'missing' }), /not found|restore/i, 'restore-verify');
+    await call(functions, 'promoteRestore', { ...data, manifestId: 'restore-maintenance' });
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('prelimMatches', 'approval-prelim')), {
+        teamA: 'approval-a',
+        teamB: 'approval-b',
+        sets: [],
+        status: 'pending',
+        result: null,
+      });
+      await setDoc(doc(db, path('courtAssignments', 'approval-prelim')), {
+        matchKey: 'approval-prelim',
+        matchType: 'prelim',
+        matchId: 'approval-prelim',
+        courtId: null,
+        publicStatus: 'under_review',
+        officialRevision: 0,
+      });
+      await setDoc(doc(db, path('scoreWorkflows', 'approval-prelim')), {
+        draftState: 'submitted',
+        submittedSnapshot: { sets: [{ a: 10, b: 8 }, { a: 7, b: 10 }] },
+        submissionVersion: 1,
+        officialRevision: 0,
+        lock: null,
+      });
+    });
+    await call(functions, 'approveScoreReview', {
+      ...data,
+      matchKey: 'approval-prelim',
+      expectedSubmissionVersion: 1,
+    });
+    const approvedPrelim = await f.seed((db) => getDoc(doc(db, path('prelimMatches', 'approval-prelim'))));
+    assert.deepEqual(approvedPrelim.data().sets, [{ a: 10, b: 8 }, { a: 7, b: 10 }], 'approved-recorder-score-updates-prelim');
+    assert.equal(approvedPrelim.data().result, 'draw', 'approved-recorder-score-updates-prelim-result');
+    assert.equal(approvedPrelim.data().officialRevision, 1, 'approved-recorder-score-increments-official-revision');
+    await f.seed(async (db) => {
+      await setDoc(doc(db, 'tournaments/main'), {
+        tournamentId: 'main',
+        name: '초기화 대상 대회',
+        legacySetting: true,
+        recorderFeatureEnabled: true,
+        maintenance: { enabled: false },
+        courtTopologyRevision: 99,
+        venueDisplay: { mode: 'women', intervalSeconds: 30 },
+      });
+      await setDoc(doc(db, path('groups', 'reset-group')), { division: 'men' });
+      await setDoc(doc(db, path('teams', 'reset-team')), { division: 'women' });
+      await setDoc(doc(db, path('prelimMatches', 'reset-prelim')), { division: 'men' });
+      await setDoc(doc(db, 'tournaments/main/divisions/women/finalMatches/reset-final'), { status: 'done' });
+      await setDoc(doc(db, path('courts', 'reset-court')), { name: '초기화 코트' });
+      await setDoc(doc(db, path('courtAssignments', 'reset-assignment')), { matchKey: 'reset-assignment' });
+      await setDoc(doc(db, path('scoreWorkflows', 'reset-workflow')), { draftState: 'submitted' });
+      await setDoc(doc(db, path('recorderAccess', 'reset-access')), { enabled: true });
+      await setDoc(doc(db, path('recorderGrants', 'reset-grant')), { uid: 'reset-grant' });
+      await setDoc(doc(db, path('auditEvents', 'reset-audit')), { eventType: 'reset-test' });
+      await setDoc(doc(db, path('restoreManifests', 'reset-restore')), { status: 'staged' });
+      await setDoc(doc(db, 'tournaments/main/restoreManifests/reset-restore/chunks/0'), { index: 0 });
+    });
+    const preparedReset = await call(functions, 'prepareTournamentReset', { ...data, expectedName: '초기화 대상 대회' });
+    assert.deepEqual(
+      await call(functions, 'resetTournament', { ...data, token: preparedReset.token }),
+      { reset: true },
+      'reset-seeded-admin-succeeds',
+    );
+    const resetRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.deepEqual(resetRoot.data(), {
+      tournamentId: 'main',
+      name: '',
+      qualifyPerGroup: { men: 2, women: 2 },
+      recorderFeatureEnabled: false,
+      maintenance: { enabled: false },
+      courtTopologyRevision: 0,
+      venueDisplay: { mode: 'auto', intervalSeconds: 15 },
+    }, 'reset-root-defaults');
+    const resetDocs = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('groups', 'reset-group'))),
+      getDoc(doc(db, path('teams', 'reset-team'))),
+      getDoc(doc(db, path('prelimMatches', 'reset-prelim'))),
+      getDoc(doc(db, 'tournaments/main/divisions/women/finalMatches/reset-final')),
+      getDoc(doc(db, path('courts', 'reset-court'))),
+      getDoc(doc(db, path('courtAssignments', 'reset-assignment'))),
+      getDoc(doc(db, path('scoreWorkflows', 'reset-workflow'))),
+      getDoc(doc(db, path('recorderAccess', 'reset-access'))),
+      getDoc(doc(db, path('recorderGrants', 'reset-grant'))),
+      getDoc(doc(db, path('auditEvents', 'reset-audit'))),
+      getDoc(doc(db, path('restoreManifests', 'reset-restore'))),
+      getDoc(doc(db, 'tournaments/main/restoreManifests/reset-restore/chunks/0')),
+      getDoc(doc(db, path('admins', credential.user.uid))),
+    ]));
+    resetDocs.slice(0, -1).forEach((snap) => assert.equal(snap.exists(), false, `reset-deletes-${snap.ref.path}`));
+    assert.equal(resetDocs.at(-1).exists(), true, 'reset-preserves-seeded-admin');
+    // 코트 문서 ID는 랜덤이라 getDocs 기본 순서(문서 ID 오름차순)는 관리자가 만든 순서와 무관하다.
+    // 만든 순서가 order 필드로 보존되는지 확인한다. 전체 초기화 직후라 topologyRevision은 0이다.
+    const madeOrder = [
+      { id: 'court-zzz', name: 'C', recorderName: '오수연' },
+      { id: 'court-aaa', name: 'A', recorderName: '강지언' },
+      { id: 'court-mmm', name: 'B', recorderName: '김수빈' },
+    ];
+    await call(functions, 'replaceCourtWorkflows', {
+      ...data,
+      expectedTopologyRevision: 0,
+      expectedQueueRevisions: {},
+      courts: madeOrder,
+      assignmentsByCourt: {},
+      unassignedAssignments: [],
+    });
+    const storedCourts = await f.seed((db) => getDocs(collection(db, 'tournaments/main/courts')));
+    const byDocId = storedCourts.docs.map((snap) => snap.data().name);
+    const byOrder = storedCourts.docs
+      .map((snap) => ({ name: snap.data().name, order: snap.data().order }))
+      .sort((a, b) => a.order - b.order)
+      .map((court) => court.name);
+    assert.deepEqual(byOrder, ['C', 'A', 'B'], 'court-order-preserves-creation-sequence');
+    assert.deepEqual(byDocId, ['A', 'B', 'C'], 'court-doc-id-order-differs-from-creation-order');
+    assert.deepEqual(
+      storedCourts.docs.map((snap) => snap.data().order).sort((a, b) => a - b),
+      [1, 2, 3],
+      'court-order-is-dense-one-based',
+    );
+
     assert.ok(score.length === 2);
   } finally { await deleteApp(app); await f.cleanup(); }
 }
