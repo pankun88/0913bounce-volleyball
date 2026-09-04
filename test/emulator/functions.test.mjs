@@ -1536,11 +1536,38 @@ export async function runFunctionsSuite() {
         issuedAt: Timestamp.fromMillis(Date.now() - 1_000),
         expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),
       });
+      await setDoc(doc(db, path('recorderGrants', credential.user.uid)), {
+        uid: credential.user.uid,
+        version: access.data().version,
+        status: 'active',
+        issuedAt: Timestamp.fromMillis(Date.now() - 1_000),
+        expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),
+      });
+      await setDoc(doc(db, path('courts', 'direct-current-court')), {
+        id: 'direct-current-court',
+        name: 'A',
+        recorderName: 'Recorder One',
+      });
     });
     await assert.doesNotReject(
       getDoc(doc(f.recorder(), path('scoreWorkflows', 'direct-current-next'))),
       'recorder-can-read-next-workflow-after-admin-scores-current-match',
     );
+    await f.seed((db) => setDoc(doc(db, path('courtQueues', 'direct-current-court')), {
+      currentMatchKey: 'direct-current',
+      nextMatchKey: 'direct-current-next',
+      normalCursorMatchKey: 'direct-current',
+      queueRevision: 5,
+    }, { merge: true }));
+    const reconciledQueue = await call(functions, 'reconcileRecorderCourtQueue', {
+      ...data,
+      courtId: 'direct-current-court',
+      staleMatchKey: 'direct-current',
+      recorderName: 'Recorder One',
+      expectedQueueRevision: 5,
+    });
+    assert.equal(reconciledQueue.currentMatchKey, 'direct-current-next', 'recorder-reconciles-stale-completed-current-match');
+    assert.equal(reconciledQueue.queueRevision, 6, 'recorder-reconcile-increments-queue-once');
     await call(functions, 'directEditOfficialScore', {
       ...data, matchKey: 'direct-future', score: { sets: score }, reason: 'future first score',
       expectedOfficialRevision: 0, expectedQueueRevision: 7,

@@ -5,7 +5,7 @@ import { TOURNAMENT_ID } from "./firebase-config.js";
 import {
   canResumeCurrentMatch, claimRecorderDraft, recorderReason, resumeRecorderDraft, saveRecorderDraft,
   submitRecorderDraft, cancelRecorderDraft, operationId, recorderSessionId, rotateRecorderSessionId,
-  startLeaseHeartbeat, subscribeAssignment, subscribeCourt, subscribeWorkflow,
+  reconcileRecorderCourtQueue, startLeaseHeartbeat, subscribeAssignment, subscribeCourt, subscribeWorkflow,
 } from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, normalizePlayedSets, validateSetScore } from "./match-logic.js";
 import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-display.js";
@@ -13,7 +13,7 @@ import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-disp
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","courtMessage","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","backToEditButton","submitButton","successPanel","successTitle","nextSameButton","switchRecorderButton"].map((id) => [id, $(id)]));
 let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "";
-let stop = [], courtStops = [], matchStops = [], officialStop = () => {}, heartbeat, channel;
+let stop = [], courtStops = [], matchStops = [], officialStop = () => {}, heartbeat, channel, reconcilingQueue = false;
 const tabInstanceId = crypto.randomUUID();
 let renderedFormKey = "";
 const edit = { token: null, serverDraft: null, localDraft: null, dirty: false, touched: new Set(), reviewedPayload: null, request: "idle", savedRevision: null, pendingSubmit: null, pendingEnd: null, pendingDiscard: null };
@@ -112,6 +112,13 @@ function handleMatchSubscriptionError(error) {
   }
   status(recorderReason(error));
 }
+function isStaleTerminalCurrent() {
+  return queue?.currentMatchKey === matchKey
+    && !workflow?.lock
+    && (assignment?.publicStatus === "completed"
+      || assignment?.publicStatus === "under_review"
+      || ["submitted", "approved"].includes(workflow?.draftState));
+}
 function render() {
   ui.confirmPanel.hidden = !edit.reviewedPayload;
   if (!matchKey) { ui.claimButton.hidden = true; ui.scoreForm.hidden = true; return; }
@@ -119,6 +126,15 @@ function render() {
   const correctingRejectedScore = workflow?.draftState === "rejected" || workflow?.resumeDraftState === "rejected";
   ui.rejectionNotice.hidden = !correctingRejectedScore; ui.rejectionNotice.textContent = reason ? `반려 사유: ${reason} · 관리자 요청을 반영해 수정한 뒤 다시 제출하세요.` : "반려됨: 점수를 수정해 다시 제출하세요.";
   const waiting = !resolved(); ui.lockNotice.hidden = !(waiting || (workflow?.lock && !edit.token)); ui.lockNotice.textContent = waiting ? "대진이 확정되기를 기다리고 있습니다. 팀과 이전 경기 결과가 확정되면 입력할 수 있습니다." : "다른 탭 또는 기록관이 입력 중입니다.";
+  if (isStaleTerminalCurrent()) {
+    ui.claimButton.hidden = false;
+    ui.claimButton.disabled = reconcilingQueue;
+    ui.claimButton.textContent = reconcilingQueue ? "다음 경기 확인 중…" : "다음 경기로 이동";
+    ui.scoreForm.hidden = true;
+    ui.lockNotice.hidden = false;
+    ui.lockNotice.textContent = "이 경기는 관리자가 확정했습니다. 다음 경기로 이동하세요.";
+    return;
+  }
   const resumable = canResumeCurrentMatch(workflow, recorder); ui.claimButton.hidden = Boolean(edit.token) || waiting || !(resumable || ["idle","rejected"].includes(workflow?.draftState));
   ui.claimButton.disabled = waiting; ui.claimButton.textContent = correctingRejectedScore ? "반려 점수 수정" : resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
   renderForm();
@@ -226,7 +242,28 @@ ui.logoutButton.onclick=async()=>{
   await logoutRecorder();
 };
 ui.courtSelect.onchange=()=>{recorder=courts.find((court)=>court.id===ui.courtSelect.value)?.recorderName?.trim()||"";attachCourt(ui.courtSelect.value);};
-ui.claimButton.onclick=async()=>{ if(!matchKey||busy)return; setBusy(true); try { const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft; let result; try { result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder}); } catch(error) { if (workflow?.lock?.uid === auth.currentUser?.uid && reasonCode(error) === "ownership_lost" && window.confirm("다른 탭에서 이 경기 입력을 열고 있습니다. 그 탭의 입력권을 이어받을까요? 다른 탭의 저장되지 않은 값은 자동으로 삭제되지 않습니다.")) result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder,takeover:true}); else throw error; } edit.token=result.token; edit.serverDraft=draftCopy(result.draft); edit.localDraft=edit.serverDraft; edit.savedRevision=result.draftRevision; const saved=localStorage.getItem(scoreKey()); if(saved){const parsed=JSON.parse(saved);if(parsed.revision===result.draftRevision){edit.localDraft=parsed.draft;edit.touched=new Set(parsed.touched||[]);edit.dirty=true;}else if(window.confirm("이 기기의 임시 점수가 서버의 최신 초안보다 오래되었습니다. 이전 기기 점수를 불러와 비교할까요?")){edit.localDraft=parsed.draft;edit.touched=new Set(parsed.touched||[]);edit.dirty=true;status("이전 기기 점수를 불러왔습니다. 확인 후 다시 저장하세요.");}else{status("서버의 최신 초안을 불러왔습니다.");}} channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId}); beginHeartbeat(); renderedFormKey=""; render(); focus(ui.scoreFields.querySelector("input")); } catch(error) { status(recorderReason(error)); } finally {setBusy(false);} };
+ui.claimButton.onclick=async()=>{
+  if(!matchKey||busy)return;
+  if (isStaleTerminalCurrent()) {
+    reconcilingQueue = true;
+    render();
+    try {
+      const result = await reconcileRecorderCourtQueue({
+        courtId,
+        staleMatchKey: matchKey,
+        recorderName: recorder,
+        expectedQueueRevision: queue.queueRevision,
+      });
+      status(result.currentMatchKey ? "다음 경기를 불러왔습니다." : "현재 대기 중인 다음 경기가 없습니다.");
+    } catch (error) {
+      status(recorderReason(error));
+    } finally {
+      reconcilingQueue = false;
+      render();
+    }
+    return;
+  }
+  setBusy(true); try { const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft; let result; try { result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder}); } catch(error) { if (workflow?.lock?.uid === auth.currentUser?.uid && reasonCode(error) === "ownership_lost" && window.confirm("다른 탭에서 이 경기 입력을 열고 있습니다. 그 탭의 입력권을 이어받을까요? 다른 탭의 저장되지 않은 값은 자동으로 삭제되지 않습니다.")) result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder,takeover:true}); else throw error; } edit.token=result.token; edit.serverDraft=draftCopy(result.draft); edit.localDraft=edit.serverDraft; edit.savedRevision=result.draftRevision; const saved=localStorage.getItem(scoreKey()); if(saved){const parsed=JSON.parse(saved);if(parsed.revision===result.draftRevision){edit.localDraft=parsed.draft;edit.touched=new Set(parsed.touched||[]);edit.dirty=true;}else if(window.confirm("이 기기의 임시 점수가 서버의 최신 초안보다 오래되었습니다. 이전 기기 점수를 불러와 비교할까요?")){edit.localDraft=parsed.draft;edit.touched=new Set(parsed.touched||[]);edit.dirty=true;status("이전 기기 점수를 불러왔습니다. 확인 후 다시 저장하세요.");}else{status("서버의 최신 초안을 불러왔습니다.");}} channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId}); beginHeartbeat(); renderedFormKey=""; render(); focus(ui.scoreFields.querySelector("input")); } catch(error) { status(recorderReason(error)); } finally {setBusy(false);} };
 ui.scoreForm.onsubmit=async(event)=>{event.preventDefault();const check=validate(false);ui.scoreError.textContent=check.ok?"":check.message;if(!check.ok)return;setBusy(true);action("저장 중");try{const result=await saveRecorderDraft({matchKey,token:edit.token,queueRevision:queue?.queueRevision,draft:check.score,expectedDraftRevision:edit.savedRevision,final:isFinal()});edit.serverDraft=draftCopy(check.score);edit.localDraft=draftCopy(check.score);edit.savedRevision=result.draftRevision;edit.dirty=false;clearStored();action(`저장됨 ${new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"})}`);}catch(error){action("오프라인 로컬 보관");storeDraft();ui.scoreError.textContent=recorderReason(error);}finally{setBusy(false);}};
 ui.reviewButton.onclick=()=>{
   const check=validate(true);

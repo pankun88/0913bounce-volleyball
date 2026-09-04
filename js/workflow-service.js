@@ -67,6 +67,8 @@ export const saveRecorderDraft = ({ matchKey, token, queueRevision, draft, expec
   callable("saveRecorderDraft", { matchKey, token, queueRevision, draft: normalizeScore(draft, final), expectedDraftRevision });
 export const renewRecorderLease = ({ matchKey, token, queueRevision }) =>
   callable("renewRecorderLease", { matchKey, token, queueRevision });
+export const reconcileRecorderCourtQueue = ({ courtId, staleMatchKey, recorderName, expectedQueueRevision }) =>
+  callable("reconcileRecorderCourtQueue", { courtId, staleMatchKey, recorderName, expectedQueueRevision });
 export const cancelRecorderDraft = ({ matchKey, courtId, token, queueRevision, discardDraft, operationId: id = operationId() }) =>
   callable("cancelRecorderDraft", { matchKey, courtId, token, queueRevision, discardDraft, operationId: id });
 export const submitRecorderDraft = ({ matchKey, courtId, token, queueRevision, score, final = false, operationId: id = operationId() }) =>

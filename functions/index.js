@@ -19,6 +19,7 @@ export const exchangeRecorderAccessCode = callable(adminWorkflow.exchangeRecorde
 export const claimRecorderDraft = callable(adminWorkflow.claimRecorderDraft);
 export const saveRecorderDraft = callable(adminWorkflow.saveRecorderDraft);
 export const renewRecorderLease = callable(adminWorkflow.renewRecorderLease);
+export const reconcileRecorderCourtQueue = callable(adminWorkflow.reconcileRecorderCourtQueue);
 export const replaceCourtWorkflows = callable(adminWorkflow.replaceCourtWorkflows);
 export const publishFinalStructure = callable(adminWorkflow.publishFinalStructure);
 export const clearFinalStructure = callable(adminWorkflow.clearFinalStructure);

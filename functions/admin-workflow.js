@@ -300,6 +300,61 @@ export async function renewRecorderLease(request) {
     return { leaseExpiresAt: lock.expiresAt.toMillis(), transitionId: id };
   });
 }
+export async function reconcileRecorderCourtQueue(request) {
+  requireMain(request.data);
+  const uid = request.auth?.uid;
+  const {
+    courtId, staleMatchKey, recorderName, expectedQueueRevision,
+  } = request.data || {};
+  if (!uid || typeof courtId !== 'string' || !courtId
+      || typeof staleMatchKey !== 'string' || !staleMatchKey
+      || typeof recorderName !== 'string' || !recorderName.trim()
+      || !Number.isInteger(expectedQueueRevision)) {
+    throw new HttpsError('invalid-argument', 'Court, stale match, recorder and queue revision required.');
+  }
+  const eventNonce = crypto.randomUUID();
+  return db().runTransaction(async (tx) => {
+    await recorder(tx, request);
+    const courtSnap = await tx.get(ref('courts', courtId));
+    if (!courtSnap.exists || courtSnap.data().recorderName?.trim() !== recorderName.trim()) {
+      callableError('recorder_name_changed', 'aborted');
+    }
+    const state = await courtState(tx, courtId);
+    if (state.queue.queueRevision !== expectedQueueRevision
+        || state.queue.currentMatchKey !== staleMatchKey) {
+      callableError('stale_queue', 'aborted');
+    }
+    const assignment = state.assignments[staleMatchKey];
+    const workflow = state.workflows[staleMatchKey];
+    const terminal = assignment?.publicStatus === 'completed'
+      || assignment?.publicStatus === 'under_review'
+      || ['submitted', 'approved'].includes(workflow?.draftState);
+    if (!assignment || !workflow || workflow.lock || !terminal) {
+      throw new HttpsError('failed-precondition', 'Current match is still recordable.');
+    }
+    const nextQueue = projectCourtQueue({
+      ...state.queue,
+      queueRevision: expectedQueueRevision + 1,
+    }, state.assignments, state.workflows);
+    if (nextQueue.currentMatchKey === staleMatchKey) {
+      throw new HttpsError('failed-precondition', 'Court queue could not advance.');
+    }
+    const id = recorderAuditId('queue_reconcile', uid, staleMatchKey, eventNonce);
+    touchRecorderGrant(tx, uid);
+    tx.update(ref('courtQueues', courtId), { ...nextQueue, lastTransitionId: id });
+    audit(tx, id, 'recorder_queue_reconciled', staleMatchKey, {
+      uid,
+      name: recorderName.trim(),
+      email: request.auth?.token?.email || null,
+    }, { queue: state.queue }, { queue: nextQueue });
+    return {
+      transitionId: id,
+      queueRevision: nextQueue.queueRevision,
+      currentMatchKey: nextQueue.currentMatchKey || null,
+      nextMatchKey: nextQueue.nextMatchKey || null,
+    };
+  });
+}
 export async function createRecorderAccessCode(request) {
   const uid = await admin(request, request.data); const code = randomCode(); const salt = crypto.randomBytes(24).toString('base64url');
   let version;
