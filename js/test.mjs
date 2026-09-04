@@ -5,6 +5,7 @@ import {
   evaluateFinalMatch,
   computeGroupStandings,
   computeAutomaticQualifiers,
+  normalizePlayedSets,
   validateSetScore,
 } from './match-logic.js';
 import { generateBracket, recordMatchResult, invalidateDescendantResults, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, publicMatchView, roundLabel } from './bracket.js';
@@ -294,6 +295,12 @@ r = evaluateFinalMatch([{ a: 10, b: 5 }, { a: 10, b: 6 }, { a: 7, b: 2 }]);
 check('final unreachable third set never completes', r.status !== 'done' && r.winner === null);
 r = evaluateFinalMatch([{ a: 10, b: 5 }, { a: 10, b: 6.5 }]);
 check('final decimal score never completes', r.status !== 'done' && r.winner === null);
+check('final 2-0 normalization removes unused third set', normalizePlayedSets(
+  [{ a: 10, b: 8 }, { a: 10, b: 7 }, { a: 0, b: 0 }], true,
+).length === 2);
+check('final 2-1 normalization preserves deciding set', normalizePlayedSets(
+  [{ a: 10, b: 8 }, { a: 8, b: 10 }, { a: 7, b: 5 }], true,
+).length === 3);
 
 // ---- computeGroupStandings ----
 const teams = [{ id: 't1', name: '1반' }, { id: 't2', name: '2반' }, { id: 't3', name: '3반' }];

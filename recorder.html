@@ -8,59 +8,23 @@
 </head>
 <body>
   <main class="recorder-shell">
-    <header class="app-header">
-      <div class="header-title"><p class="eyebrow">BOUNCE VOLLEYBALL</p><h1>기록관 입력</h1><p class="header-subtitle">현장 경기 점수 기록</p></div>
-      <button id="logoutButton" class="quiet-button" type="button" hidden>로그아웃</button>
-    </header>
-
+    <header class="app-header"><div><p class="eyebrow">BOUNCE VOLLEYBALL</p><h1>기록관 입력</h1><p>경기 확인을 위해 계정 식별정보와 제출 이력을 관리자 감사 기록에 보관합니다. 공용 코드는 저장하지 않습니다.</p></div><button id="logoutButton" class="quiet-button" type="button" hidden>로그아웃</button></header>
     <p id="connectionStatus" class="connection-status" role="status" aria-live="polite"></p>
+    <p id="actionStatus" class="action-status" role="status" aria-live="polite" hidden></p>
     <section id="authPanel" class="panel" aria-labelledby="authTitle">
-      <h2 id="authTitle">기록관 접근</h2>
-      <p id="authMessage" role="status" aria-live="polite">Google 로그인 후 대회 공용 코드를 입력하세요.</p>
-      <p id="identity" class="identity" hidden></p>
-      <button id="googleLoginButton" class="primary-button" type="button">Google로 로그인</button>
-      <form id="accessCodeForm" hidden>
-        <label for="accessCode">대회 공용 코드</label>
-        <input id="accessCode" name="accessCode" type="password" autocomplete="one-time-code" required>
-        <button id="accessCodeButton" class="primary-button" type="submit">접근 권한 확인</button>
-      </form>
+      <h2 id="authTitle" tabindex="-1">1. 기록관 접근</h2><p id="authMessage" role="status" aria-live="polite">Google 로그인 후 대회 공용 코드를 입력하세요.</p>
+      <ol class="onboarding-steps"><li>개인 Google 계정으로 로그인</li><li>운영진에게 받은 대회 공용 코드 입력</li><li>내 이름과 담당 코트 선택</li><li>현재 경기 점수 입력·확인·제출</li></ol>
+      <p id="identity" class="identity" hidden></p><button id="googleLoginButton" class="primary-button" type="button">Google로 로그인 / 계정 선택</button>
+      <form id="accessCodeForm" hidden><label for="accessCode">대회 공용 코드</label><input id="accessCode" type="password" inputmode="text" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" minlength="24" maxlength="24" pattern="[A-Za-z0-9_-]{24}" aria-describedby="codeHelp" required><p id="codeHelp">운영진에게 받은 24자 영문·숫자·-·_ 코드입니다. 공백 없이 붙여넣을 수 있으며 저장되지 않습니다.</p><button id="accessCodeButton" class="primary-button" type="submit">접근 권한 확인</button></form>
     </section>
-
-    <section id="courtPanel" class="panel" hidden aria-labelledby="courtTitle">
-      <h2 id="courtTitle">기록관 · 코트 선택</h2>
-      <label for="courtSelect">담당 기록관</label>
-      <select id="courtSelect"><option value="">이름을 선택하세요</option></select>
-      <p id="courtMessage" role="status" aria-live="polite"></p>
-    </section>
-
+    <section id="courtPanel" class="panel" hidden aria-labelledby="courtTitle"><h2 id="courtTitle" tabindex="-1">2. 담당 코트 선택</h2><label for="courtSelect">내 이름과 담당 코트</label><select id="courtSelect"><option value="">이름과 코트를 선택하세요</option></select><p id="courtMessage" role="status"></p></section>
     <section id="workflowPanel" class="panel" hidden aria-labelledby="workflowTitle">
-      <h2 id="workflowTitle">현재 경기</h2>
-      <div id="matchSummary" class="match-summary" role="status" aria-live="polite">기록관 이름을 선택하세요.</div>
-      <aside id="rejectionNotice" class="notice rejection" hidden aria-live="polite"></aside>
-      <div id="lockNotice" class="notice" hidden aria-live="polite"></div>
+      <h2 id="workflowTitle" tabindex="-1">3. 점수 입력</h2><div id="matchSummary" class="match-summary"></div><aside id="rejectionNotice" class="notice rejection" hidden></aside><aside id="lockNotice" class="notice" hidden></aside>
       <button id="claimButton" class="primary-button" type="button" hidden>경기 입력 시작</button>
-
-      <form id="scoreForm" hidden novalidate>
-        <fieldset id="scoreFields"><legend id="scoreLegend">세트 점수</legend></fieldset>
-        <p id="scoreError" class="error" role="alert"></p>
-        <div class="actions">
-          <button id="saveButton" class="secondary-button" type="submit">임시 저장</button>
-          <button id="reviewButton" class="primary-button" type="button">작성 완료 확인</button>
-          <button id="cancelButton" class="danger-button" type="button">입력 취소</button>
-        </div>
-      </form>
+      <form id="scoreForm" hidden novalidate><fieldset id="scoreFields"><legend id="scoreLegend">세트 점수</legend></fieldset><p id="scoreError" class="error" role="alert"></p><div class="actions"><button id="saveButton" class="secondary-button" type="submit">임시 저장</button><button id="reviewButton" class="primary-button" type="button">작성 완료 확인</button><button id="endButton" class="quiet-button" type="button">입력 종료(초안 유지)</button><button id="discardButton" class="danger-button" type="button">초안 폐기</button></div></form>
+      <section id="discardPanel" class="notice" hidden aria-labelledby="discardTitle"><h3 id="discardTitle" tabindex="-1">초안을 폐기할까요?</h3><p id="discardMessage"></p><div class="actions"><button id="keepDraftButton" class="secondary-button" type="button">계속 입력</button><button id="confirmDiscardButton" class="danger-button" type="button">초안 폐기</button></div></section>
     </section>
-
-    <section id="confirmPanel" class="panel" hidden aria-labelledby="confirmTitle">
-      <h2 id="confirmTitle">제출 전 확인</h2>
-      <p>아래 점수로 제출하면 관리자 승인 대기 상태가 되며, 코트는 다음 경기로 진행됩니다.</p>
-      <div id="confirmScore" class="confirm-score"></div>
-      <div class="actions">
-        <button id="backToEditButton" class="secondary-button" type="button">수정</button>
-        <button id="submitButton" class="primary-button" type="button">제출</button>
-      </div>
-    </section>
-  </main>
-  <script type="module" src="js/recorder.js"></script>
-</body>
-</html>
+    <section id="confirmPanel" class="panel" hidden aria-labelledby="confirmTitle"><h2 id="confirmTitle" tabindex="-1">4. 제출 전 확인</h2><p>확인한 점수 그대로 제출합니다. 제출 뒤에는 관리자 검수 대기 상태가 됩니다.</p><div id="confirmScore" class="confirm-score"></div><div class="actions"><button id="backToEditButton" class="secondary-button" type="button">수정</button><button id="submitButton" class="primary-button" type="button">제출</button></div></section>
+    <section id="successPanel" class="panel" hidden aria-labelledby="successTitle"><h2 id="successTitle" tabindex="-1">점수를 제출했습니다</h2><p>관리자 검수 전까지 경기 결과는 확정되지 않습니다.</p><div class="actions"><button id="nextSameButton" class="primary-button" type="button">같은 기록관으로 다음 경기</button><button id="switchRecorderButton" class="secondary-button" type="button">기록관 교대</button></div></section>
+  </main><script type="module" src="js/recorder.js"></script>
+</body></html>

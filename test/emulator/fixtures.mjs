@@ -1,5 +1,6 @@
 import { initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import { readFile } from 'node:fs/promises';
+import { Timestamp } from 'firebase/firestore';
 
 export const PROJECT_ID = 'demo-bounce-volleyball';
 export const TOURNAMENT_ID = 'main';
@@ -18,8 +19,10 @@ export async function createFixture() {
     await db.doc(`tournaments/main/admins/${IDS.admin}`).set({ uid: IDS.admin });
     await db.doc('tournaments/main/recorderAccess/config').set({ enabled: true, version: 2, salt: 'seed', codeHash: 'seed-hash' });
     await db.doc('tournaments/main/recorderAccessChallenge/current').set({ enabled: true, version: 2 });
-    await db.doc(`tournaments/main/recorderGrants/${IDS.recorder}`).set({ uid: IDS.recorder, version: 2, proofHash: 'seed-hash' });
-    await db.doc(`tournaments/main/recorderGrants/${IDS.stale}`).set({ uid: IDS.stale, version: 1, proofHash: 'old-hash' });
+    const issuedAt = Timestamp.fromMillis(Date.now() - 60_000);
+    const expiresAt = Timestamp.fromMillis(Date.now() + 3_600_000);
+    await db.doc(`tournaments/main/recorderGrants/${IDS.recorder}`).set({ uid: IDS.recorder, version: 2, proofHash: 'seed-hash', status: 'active', issuedAt, expiresAt });
+    await db.doc(`tournaments/main/recorderGrants/${IDS.stale}`).set({ uid: IDS.stale, version: 1, proofHash: 'old-hash', status: 'active', issuedAt, expiresAt });
     await db.doc('tournaments/main/courts/court-1').set({
       id: 'court-1',
       name: 'Court 1',

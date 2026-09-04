@@ -172,11 +172,25 @@
   <section class="tab-panel" id="tab-workflow">
     <div class="card">
       <h2>기록관 접근 코드 <button type="button" class="help-trigger" aria-label="기록관 접근 코드 설명" data-help="코드는 생성·재발급할 때만 표시됩니다. 안전한 방법으로 기록관에게 전달하세요.">설명</button></h2>
+      <p class="empty-hint recorder-code-guidance">접근 코드는 생성·재발급 때만 표시됩니다. 코드로 받은 권한은 계정 단위이며 12시간 후 만료됩니다. 재발급·전체 폐기는 모든 기록관의 기존 권한을 무효화하지만, 입력 중인 초안과 잠금은 유지됩니다.</p>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
         <button class="btn primary" id="createRecorderCodeBtn">접근 코드 생성/재발급</button>
         <button class="btn danger" id="revokeRecorderCodeBtn">접근 코드 폐기</button>
       </div>
       <pre id="recorderCodeOutput" class="empty-hint" style="display:none; margin-top:10px;"></pre>
+      <div class="recorder-runbook" aria-label="기록관 접근 코드 운영 안내">
+        <strong>운영 안내</strong>
+        <ul>
+          <li><b>기기 분실·계정 문제:</b> 해당 계정만 아래 목록에서 폐기한 뒤 새 코드로 다시 권한을 받게 하세요. 다른 기록관의 권한은 유지됩니다.</li>
+          <li><b>코드가 넓게 유출됨:</b> 접근 코드를 재발급하거나 폐기해 모든 기존 권한을 무효화하세요. 입력 중인 경기는 아래 검수 목록의 <b>잠금 강제 해제</b>로 별도로 처리하며, 코드 작업이 잠금을 자동 해제하지 않습니다.</li>
+        </ul>
+      </div>
+      <div class="recorder-grant-header">
+        <h3>계정별 접근 권한</h3>
+        <button class="btn small" id="refreshRecorderGrantsBtn">권한 목록 새로고침</button>
+      </div>
+      <div id="recorderGrantStatus" class="empty-hint" role="status" aria-live="polite">권한 목록을 불러오는 중입니다.</div>
+      <div id="recorderGrantList" class="recorder-grant-list" aria-live="polite" aria-label="기록관 계정별 접근 권한 목록"></div>
     </div>
     <div class="card">
       <h2>제출 결과 검수 <button type="button" class="help-trigger" aria-label="제출 결과 검수 설명" data-help="기록관이 제출한 결과를 승인·반려합니다. 검수 대기 항목은 현재 코트 진행 순서와 별도로 표시됩니다.">설명</button></h2>
@@ -253,7 +267,7 @@
 </div>
 
 <div id="modalRoot"></div>
-<div id="toastRoot" class="toast"></div>
+<div id="toastRoot" class="toast" role="status" aria-live="polite"></div>
 
 <script type="module" src="js/admin.js"></script>
 </body>

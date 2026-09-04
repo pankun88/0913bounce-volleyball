@@ -197,6 +197,14 @@ export function finalNeedsThirdSet(sets) {
   return r.setsWonA === 1 && r.setsWonB === 1;
 }
 
+/** 제출·저장 전에 본선의 미사용 3세트를 제거하되 2:1 경기는 보존한다. */
+export function normalizePlayedSets(sets, final = false) {
+  const source = Array.isArray(sets) ? sets.map(({ a, b }) => ({ a, b })) : [];
+  if (!final) return source;
+  const firstTwo = evaluateFinalMatch(source.slice(0, 2));
+  return source.slice(0, firstTwo.setsWonA === 2 || firstTwo.setsWonB === 2 ? 2 : 3);
+}
+
 // ---------- 예선 조 순위 산정 ----------
 
 /**

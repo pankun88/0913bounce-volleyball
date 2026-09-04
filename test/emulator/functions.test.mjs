@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { initializeApp, deleteApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator, signInAnonymously } from 'firebase/auth';
 import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/functions';
-import { collection, deleteDoc, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocs, setDoc, Timestamp } from 'firebase/firestore';
 import { createFixture, IDS, PROJECT_ID, path } from './fixtures.mjs';
 import { activateDependencyEntries, consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
 
@@ -802,7 +802,9 @@ export async function runFunctionsSuite() {
     assert.equal(preparedCancellation.prepared, true, 'reset-prepare-seeded-admin-succeeds');
     await assert.rejects(call(functions, 'createRecorderAccessCode', data), /maintenance/i, 'reset-maintenance-rejects-admin-callables');
     await assert.rejects(call(functions, 'createMigrationManifest', { ...data, manifestId: 'blocked-reset-migration' }), /maintenance/i, 'reset-maintenance-rejects-migration');
-    await assert.rejects(call(functions, 'beginRestore', { ...data, manifestId: 'blocked-reset-restore', chunks: [] }), /maintenance/i, 'reset-maintenance-rejects-restore');
+    await assert.rejects(call(functions, 'beginRestore', {
+      ...data, manifestId: 'blocked-reset-restore', rootData: {}, chunks: [],
+    }), /maintenance/i, 'reset-maintenance-rejects-restore');
     await assert.rejects(call(functions, 'resetTournament', { ...data, token: 'wrong-token' }), /owner and token/i, 'reset-token-mismatch-rejected');
     await assert.rejects(call(functions, 'cancelTournamentReset', { ...data, token: 'wrong-token' }), /owner and token/i, 'reset-cancel-token-mismatch-rejected');
     const recoveredCancellation = await call(functions, 'recoverTournamentReset', data);
@@ -825,7 +827,7 @@ export async function runFunctionsSuite() {
     assert.equal(recorderRoot.data().recorderFeatureEnabled, true, 'access-code-create-enables-recorder-feature');
     const reissued = await call(functions, 'createRecorderAccessCode', data);
     assert.equal(reissued.version, 2, 'access-code-reissue');
-    await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: created.code }), /Invalid access code/);
+    await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: created.code }), /code_invalid/);
     await f.seed((db) => setDoc(
       doc(db, 'tournaments/main'),
       { recorderFeatureEnabled: false },
@@ -1027,13 +1029,27 @@ export async function runFunctionsSuite() {
       expectedSubmissionVersion: 3,
       expectedQueueRevision: null,
     }), /Only submitted reviews can be rejected/i, 'approved-unassigned-stale-reject-denied');
+    const testSessionId = 'test-recorder-session-0001';
+    const now = Date.now();
     await f.seed(async (db) => {
       await setDoc(doc(db, path('scoreWorkflows', 'M1')), {
         draftState: 'editing',
-        lock: { uid: credential.user.uid, token: 'draft-lock', recorderName: '기록원' },
+        lock: {
+          uid: credential.user.uid,
+          token: 'draft-lock',
+          recorderName: '기록원',
+          sessionId: testSessionId,
+          acquiredAt: Timestamp.fromMillis(now),
+          renewedAt: Timestamp.fromMillis(now),
+          expiresAt: Timestamp.fromMillis(now + 180_000),
+        },
       }, { merge: true });
       await setDoc(doc(db, path('courtAssignments', 'M1')), {
         publicStatus: 'in_progress',
+      }, { merge: true });
+      await setDoc(doc(db, path('prelimMatches', 'M1')), {
+        teamA: 'test-team-a',
+        teamB: 'test-team-b',
       }, { merge: true });
     });
     const unassignedSubmit = await call(functions, 'submitRecorderDraft', {
@@ -1041,8 +1057,10 @@ export async function runFunctionsSuite() {
       matchKey: 'M1',
       courtId: null,
       token: 'draft-lock',
+      sessionId: testSessionId,
       queueRevision: null,
       score: { sets: score },
+      operationId: 'test-submit-operation-0001',
     });
     assert.equal(unassignedSubmit.queueRevision, null, 'unassigned-submit-has-no-queue-revision');
     const [submittedUnassignedAssignment, submittedUnassignedWorkflow] = await f.seed(async (db) => Promise.all([
@@ -1098,10 +1116,19 @@ export async function runFunctionsSuite() {
       unassignedAssignments: [],
     });
     await f.seed(async (db) => {
+      const cancelNow = Date.now();
       await setDoc(doc(db, path('scoreWorkflows', 'M1')), {
         draftState: 'editing',
         resumeDraftState: 'rejected',
-        lock: { uid: credential.user.uid, token: 'cancel-lock', recorderName: '기록원' },
+        lock: {
+          uid: credential.user.uid,
+          token: 'cancel-lock',
+          recorderName: '기록원',
+          sessionId: testSessionId,
+          acquiredAt: Timestamp.fromMillis(cancelNow),
+          renewedAt: Timestamp.fromMillis(cancelNow),
+          expiresAt: Timestamp.fromMillis(cancelNow + 180_000),
+        },
       }, { merge: true });
       await setDoc(doc(db, path('courtAssignments', 'M1')), {
         publicStatus: 'in_progress',
@@ -1112,7 +1139,10 @@ export async function runFunctionsSuite() {
       matchKey: 'M1',
       courtId: null,
       token: 'cancel-lock',
+      sessionId: testSessionId,
       queueRevision: null,
+      operationId: 'test-cancel-operation-0001',
+      discardDraft: false,
     });
     assert.equal(unassignedCancel.queueRevision, null, 'unassigned-cancel-has-no-queue-revision');
     const cancelledUnassigned = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'M1'))));
@@ -1211,6 +1241,7 @@ export async function runFunctionsSuite() {
       });
       await setDoc(doc(db, path('prelimMatches', 'P2')), {
         officialRevision: 1, lastTransitionId: 'server:P2:approved:1', status: 'done', result: 'B',
+        teamA: 'correction-team-a', teamB: 'correction-team-b',
       });
       await setDoc(doc(db, path('courtQueues', 'correction-court')), {
         courtId: 'correction-court',
@@ -1303,44 +1334,16 @@ export async function runFunctionsSuite() {
     assert.deepEqual(retractedP2.data().sets, [], 'correction-clears-public-score-fields');
     assert.equal(retractedP2.data().result, null, 'correction-clears-public-result');
     if (p2AfterCorrection.data().publicStatus === 'replay_required') {
-      await f.seed(async (db) => {
-        const access = await getDoc(doc(db, path('recorderAccess', 'config')));
-        await setDoc(doc(db, path('recorderGrants', IDS.recorder)), {
-          uid: IDS.recorder,
-          version: access.data().version,
-          proofHash: access.data().codeHash,
-        });
-      });
-      const recorderDb = f.recorder();
-      const reclaimId = 'recorder:P2:rejected_reclaim:replay-token-000001:1';
-      const reclaimLock = {
-        uid: IDS.recorder,
-        token: 'replay-token-000001',
-        recorderName: 'Recorder One',
-      };
-      const reclaim = writeBatch(recorderDb);
-      reclaim.set(doc(recorderDb, path('auditEvents', reclaimId)), {
-        transitionId: reclaimId,
-        eventType: 'rejected_reclaim',
-        reason: 'rejected_reclaim',
+      const replaySessionId = 'correction-replay-session-0001';
+      const reclaimedResult = await call(functions, 'claimRecorderDraft', {
+        ...data,
         matchKey: 'P2',
-        actor: { uid: IDS.recorder },
-        before: { lock: null, draftState: 'rejected' },
-        after: { lock: reclaimLock, draftState: 'editing' },
-        createdAt: serverTimestamp(),
+        courtId: 'correction-court',
+        recorderName: 'Recorder One',
+        sessionId: replaySessionId,
+        queueRevision: appliedCorrectionQueue.data().queueRevision,
       });
-      reclaim.update(doc(recorderDb, path('scoreWorkflows', 'P2')), {
-        draftState: 'editing',
-        resumeDraftState: 'rejected',
-        lock: reclaimLock,
-        lastTransitionId: reclaimId,
-      });
-      reclaim.update(doc(recorderDb, path('courtAssignments', 'P2')), {
-        publicStatus: 'in_progress',
-        attemptCount: 1,
-        lastTransitionId: reclaimId,
-      });
-      await reclaim.commit();
+      assert.equal(reclaimedResult.sessionId, replaySessionId, 'correction-replay-claim-binds-session');
       const reclaimed = await f.seed(async (db) => Promise.all([
         getDoc(doc(db, path('courtAssignments', 'P2'))),
         getDoc(doc(db, path('scoreWorkflows', 'P2'))),
@@ -1524,6 +1527,20 @@ export async function runFunctionsSuite() {
     const directCurrentQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'direct-current-court'))));
     assert.equal(directCurrentQueue.data().queueRevision, 5, 'direct-current-increments-queue-once');
     assert.equal(directCurrentQueue.data().currentMatchKey, 'direct-current-next', 'direct-current-advances-queue');
+    await f.seed(async (db) => {
+      const access = await getDoc(doc(db, path('recorderAccess', 'config')));
+      await setDoc(doc(db, path('recorderGrants', IDS.recorder)), {
+        uid: IDS.recorder,
+        version: access.data().version,
+        status: 'active',
+        issuedAt: Timestamp.fromMillis(Date.now() - 1_000),
+        expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),
+      });
+    });
+    await assert.doesNotReject(
+      getDoc(doc(f.recorder(), path('scoreWorkflows', 'direct-current-next'))),
+      'recorder-can-read-next-workflow-after-admin-scores-current-match',
+    );
     await call(functions, 'directEditOfficialScore', {
       ...data, matchKey: 'direct-future', score: { sets: score }, reason: 'future first score',
       expectedOfficialRevision: 0, expectedQueueRevision: 7,
@@ -1679,6 +1696,7 @@ export async function runFunctionsSuite() {
       matchKey: 'resume-match',
       courtId: 'resume-court',
       recorderName: '다른 기록관',
+      sessionId: 'resume-new-session-0001',
       queueRevision: 3,
     }), /same recorder/i, 'resume-different-recorder-rejected');
     const resumedDraft = await call(functions, 'resumeRecorderDraft', {
@@ -1686,6 +1704,7 @@ export async function runFunctionsSuite() {
       matchKey: 'resume-match',
       courtId: 'resume-court',
       recorderName: '재접속 기록관',
+      sessionId: 'resume-new-session-0001',
       queueRevision: 3,
     });
     assert.equal(resumedDraft.resumed, true, 'same-recorder-browser-reconnect-succeeds');
@@ -1695,6 +1714,278 @@ export async function runFunctionsSuite() {
     assert.equal(resumedWorkflow.data().lock.uid, credential.user.uid, 'resume-preserves-google-account-owner');
     assert.equal(resumedWorkflow.data().lock.recorderName, '재접속 기록관', 'resume-preserves-recorder-name');
     assert.equal(resumedWorkflow.data().lock.token, resumedDraft.token, 'resume-persists-new-token');
+
+    // Keep the recorder contract isolated from the topology scenarios above.
+    const contractCourt = 'recorder-contract-court';
+    const seedRecorderMatch = async (id, {
+      matchType = 'prelim', divisionId = null, dependencyReady = true, draftState = 'idle',
+      resumeDraftState = 'idle', lock = null, draft = { sets: [] },
+    } = {}) => f.seed(async (db) => {
+      await setDoc(doc(db, path('courts', contractCourt)), {
+        id: contractCourt, name: 'Recorder contract court', recorderName: 'Recorder One',
+      });
+      await setDoc(doc(db, path('courtQueues', contractCourt)), {
+        courtId: contractCourt, currentMatchKey: id, nextMatchKey: null, normalCursorMatchKey: id,
+        priorityEntries: [], nextPrioritySequence: 0, queueRevision: 0, lastTransitionId: `seed:${id}`,
+      });
+      await setDoc(doc(db, path('courtAssignments', id)), {
+        matchKey: id, matchType, matchId: id, divisionId, courtId: contractCourt, courtOrder: 1,
+        nextCourtMatchKey: null, publicStatus: draftState === 'editing' ? 'in_progress' : 'scheduled',
+        dependencyReady, attemptCount: 0, lastTransitionId: `seed:${id}`,
+      });
+      const official = { id, status: 'scheduled', teamA: 'A', teamB: 'B' };
+      if (matchType === 'final') {
+        await setDoc(doc(db, `tournaments/main/divisions/${divisionId}/finalMatches/${id}`), official);
+      } else {
+        await setDoc(doc(db, path('prelimMatches', id)), official);
+      }
+      await setDoc(doc(db, path('scoreWorkflows', id)), {
+        matchKey: id, draftState, resumeDraftState, lock, draft, submittedSnapshot: null,
+        draftRevision: 0, submissionVersion: 0, officialRevision: 0, lastTransitionId: `seed:${id}`,
+      });
+    });
+
+    const accessCode = await call(functions, 'createRecorderAccessCode', data);
+    const invalidCode = 'x'.repeat(24);
+    await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: 'too-short' }), /code_invalid/, 'code-shape-rejected-before-kdf');
+    assert.equal((await f.seed((db) => getDoc(doc(db, path('recorderFailures', credential.user.uid))))).exists(), false, 'malformed-code-does-not-record-kdf-failure');
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: invalidCode }), /code_invalid/, `valid-shape-failure-${attempt}`);
+    }
+    await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: invalidCode }), /code_rate_limited/, 'valid-shape-failures-rate-limited');
+    await f.seed((db) => deleteDoc(doc(db, path('recorderFailures', credential.user.uid))));
+    await call(functions, 'exchangeRecorderAccessCode', { ...data, code: accessCode.code });
+    const activeGrant = await f.seed((db) => getDoc(doc(db, path('recorderGrants', credential.user.uid))));
+    assert.equal(activeGrant.data().status, 'active', 'exchange-creates-active-grant');
+    assert.ok(activeGrant.data().issuedAt?.toMillis?.(), 'exchange-grant-has-issued-at');
+    assert.ok(activeGrant.data().expiresAt?.toMillis?.() > activeGrant.data().issuedAt?.toMillis?.(), 'exchange-grant-has-expiry');
+    assert.ok(Math.abs(activeGrant.data().expiresAt.toMillis() - activeGrant.data().issuedAt.toMillis() - 12 * 60 * 60 * 1000) < 5_000, 'exchange-grant-lasts-twelve-hours');
+    const grantList = await call(functions, 'listRecorderGrants', data);
+    const listedGrant = grantList.grants.find(({ uid }) => uid === credential.user.uid);
+    assert.deepEqual(Object.keys(listedGrant).sort(), ['effectiveStatus', 'expiresAt', 'issuedAt', 'lastUsedAt', 'status', 'uid', 'version'], 'grant-list-redacts-verifier-proof-and-email');
+    await f.seed((db) => setDoc(doc(db, path('recorderGrants', 'revoke-target')), {
+      uid: 'revoke-target', version: activeGrant.data().version, status: 'active',
+      proofHash: 'private-proof', issuedAt: Timestamp.now(), expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),
+    }));
+    await call(functions, 'revokeRecorderGrant', { ...data, uid: 'revoke-target' });
+    const [revokedTarget, untouchedGrant] = await f.seed((db) => Promise.all([
+      getDoc(doc(db, path('recorderGrants', 'revoke-target'))),
+      getDoc(doc(db, path('recorderGrants', credential.user.uid))),
+    ]));
+    assert.equal(revokedTarget.data().status, 'revoked', 'targeted-grant-revoke-marks-only-target');
+    assert.equal(untouchedGrant.data().status, 'active', 'targeted-grant-revoke-leaves-other-grants-active');
+    await call(functions, 'revokeRecorderGrant', { ...data, uid: credential.user.uid });
+    await assert.rejects(call(functions, 'exchangeRecorderAccessCode', {
+      ...data, code: accessCode.code,
+    }), /grant_revoked/, 'targeted-revoke-cannot-be-undone-with-same-code-version');
+    const rotatedAccessCode = await call(functions, 'createRecorderAccessCode', data);
+    await call(functions, 'exchangeRecorderAccessCode', { ...data, code: rotatedAccessCode.code });
+
+    await seedRecorderMatch('contract-unresolved', { dependencyReady: false });
+    const unresolvedBefore = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('courtAssignments', 'contract-unresolved'))),
+      getDoc(doc(db, path('scoreWorkflows', 'contract-unresolved'))),
+      getDoc(doc(db, path('courtQueues', contractCourt))),
+    ]));
+    await assert.rejects(call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-unresolved', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-unresolved-session',
+      queueRevision: 0,
+    }), /unresolved_teams/, 'unresolved-current-claim-rejected');
+    const unresolvedAfter = await f.seed(async (db) => Promise.all([
+      getDoc(doc(db, path('courtAssignments', 'contract-unresolved'))),
+      getDoc(doc(db, path('scoreWorkflows', 'contract-unresolved'))),
+      getDoc(doc(db, path('courtQueues', contractCourt))),
+    ]));
+    assert.deepEqual(unresolvedAfter.map((snap) => snap.data()), unresolvedBefore.map((snap) => snap.data()), 'unresolved-current-claim-zero-write');
+
+    await seedRecorderMatch('contract-lease');
+    const leaseClaim = await call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-lease', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-lease-session-aaa', queueRevision: 0,
+    });
+    assert.ok(leaseClaim.leaseExpiresAt - Date.now() <= 180_000 && leaseClaim.leaseExpiresAt - Date.now() > 170_000, 'claim-creates-three-minute-lease');
+    const claimedLease = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'contract-lease'))));
+    assert.equal(claimedLease.data().lock.sessionId, leaseClaim.sessionId, 'claim-persists-server-lease-session');
+    const saved = await call(functions, 'saveRecorderDraft', {
+      ...data, matchKey: 'contract-lease', token: leaseClaim.token, sessionId: leaseClaim.sessionId,
+      queueRevision: 0, expectedDraftRevision: 0, draft: { sets: [{ a: 4, b: 2 }] },
+    });
+    assert.equal(saved.draftRevision, 1, 'save-increments-draft-revision');
+    assert.ok(saved.leaseExpiresAt > leaseClaim.leaseExpiresAt, 'save-renews-lease');
+    const renewed = await call(functions, 'renewRecorderLease', {
+      ...data, matchKey: 'contract-lease', token: leaseClaim.token, sessionId: leaseClaim.sessionId, queueRevision: 0,
+    });
+    assert.ok(renewed.leaseExpiresAt >= saved.leaseExpiresAt, 'lease-heartbeat-extends-lease');
+    const savedAgain = await call(functions, 'saveRecorderDraft', {
+      ...data, matchKey: 'contract-lease', token: leaseClaim.token, sessionId: leaseClaim.sessionId,
+      queueRevision: 0, expectedDraftRevision: 1, draft: { sets: [{ a: 6, b: 4 }] },
+    });
+    assert.equal(savedAgain.draftRevision, 2, 'same-lease-second-save-has-distinct-audit-event');
+    const renewedAgain = await call(functions, 'renewRecorderLease', {
+      ...data, matchKey: 'contract-lease', token: leaseClaim.token, sessionId: leaseClaim.sessionId, queueRevision: 0,
+    });
+    assert.ok(renewedAgain.transitionId !== renewed.transitionId, 'same-lease-heartbeats-have-distinct-audit-events');
+    await assert.rejects(call(functions, 'saveRecorderDraft', {
+      ...data, matchKey: 'contract-lease', token: leaseClaim.token, sessionId: leaseClaim.sessionId,
+      queueRevision: 0, expectedDraftRevision: 1, draft: { sets: [{ a: 7, b: 5 }] },
+    }), /stale_revision/, 'stale-draft-revision-save-is-zero-write');
+    await assert.rejects(call(functions, 'saveRecorderDraft', {
+      ...data, matchKey: 'contract-lease', token: 'wrong-token', sessionId: leaseClaim.sessionId, queueRevision: 0, expectedDraftRevision: 2, draft: { sets: [] },
+    }), /ownership_lost/, 'stale-token-save-rejected');
+    await assert.rejects(call(functions, 'saveRecorderDraft', {
+      ...data, matchKey: 'contract-lease', token: leaseClaim.token, sessionId: 'contract-lease-other-session', queueRevision: 0, expectedDraftRevision: 2, draft: { sets: [] },
+    }), /ownership_lost/, 'other-session-save-rejected');
+    await assert.rejects(call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-lease', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-lease-session-bbb', queueRevision: 0,
+    }), /ownership_lost/, 'same-uid-other-session-claim-needs-takeover');
+    const takenClaim = await call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-lease', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-lease-session-bbb', queueRevision: 0, takeover: true,
+    });
+    await assert.rejects(call(functions, 'resumeRecorderDraft', {
+      ...data, matchKey: 'contract-lease', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-lease-session-ccc', queueRevision: 0,
+    }), /ownership_lost/, 'same-uid-other-session-resume-needs-takeover');
+    const takenResume = await call(functions, 'resumeRecorderDraft', {
+      ...data, matchKey: 'contract-lease', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-lease-session-ccc', queueRevision: 0, takeover: true,
+    });
+    await assert.notEqual(takenResume.token, takenClaim.token, 'explicit-resume-takeover-rotates-token');
+    await f.seed((db) => setDoc(doc(db, path('scoreWorkflows', 'contract-lease')), {
+      resumeDraftState: 'rejected',
+      lock: { uid: credential.user.uid, token: takenResume.token, recorderName: 'Recorder One', sessionId: takenResume.sessionId,
+        acquiredAt: Timestamp.now(), renewedAt: Timestamp.now(), expiresAt: Timestamp.fromMillis(Date.now() - 1) },
+    }, { merge: true }));
+    await assert.rejects(call(functions, 'saveRecorderDraft', {
+      ...data, matchKey: 'contract-lease', token: takenResume.token, sessionId: takenResume.sessionId, queueRevision: 0, expectedDraftRevision: 2, draft: { sets: [] },
+    }), /lease_expired/, 'expired-lease-save-rejected');
+    const reclaimed = await call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-lease', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-lease-session-ddd', queueRevision: 0,
+    });
+    const reclaimedWorkflow = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'contract-lease'))));
+    assert.equal(reclaimedWorkflow.data().resumeDraftState, 'rejected', 'expired-lock-reclaim-preserves-resume-state');
+    assert.ok(reclaimed.token, 'expired-lock-is-reclaimable');
+
+    await seedRecorderMatch('contract-final-straight', { matchType: 'final', divisionId: 'men' });
+    const straightClaim = await call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-final-straight', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-final-straight-session', queueRevision: 0,
+    });
+    for (const [index, invalidSets] of [
+      [{ a: '10', b: 8 }, { a: 10, b: 8 }],
+      [{ a: 10.5, b: 8 }, { a: 10, b: 8 }],
+      [{ a: 10, b: 8 }, { a: 10, b: 8 }, { a: 7, b: 5 }, { a: 7, b: 5 }],
+    ].entries()) {
+      await assert.rejects(call(functions, 'submitRecorderDraft', {
+        ...data, matchKey: 'contract-final-straight', courtId: contractCourt, token: straightClaim.token,
+        sessionId: straightClaim.sessionId, queueRevision: 0, score: { sets: invalidSets },
+        operationId: `contract-invalid-score-${index}`,
+      }), /Score/, 'invalid-final-score-rejected');
+    }
+    const straightResult = await call(functions, 'submitRecorderDraft', {
+      ...data, matchKey: 'contract-final-straight', courtId: contractCourt, token: straightClaim.token,
+      sessionId: straightClaim.sessionId, queueRevision: 0,
+      score: { sets: [...score, { a: 0, b: 0 }] },
+      operationId: 'contract-straight-submit',
+    });
+    const straightWorkflow = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'contract-final-straight'))));
+    assert.deepEqual(straightWorkflow.data().submittedSnapshot.sets, score, 'straight-final-drops-client-trailing-zero-set');
+    const straightReplay = await call(functions, 'submitRecorderDraft', {
+      ...data, matchKey: 'contract-final-straight', courtId: contractCourt, token: straightClaim.token,
+      sessionId: straightClaim.sessionId, queueRevision: 0, score: { sets: [...score, { a: 0, b: 0 }] }, operationId: 'contract-straight-submit',
+    });
+    assert.deepEqual(straightReplay, straightResult, 'submit-response-loss-replay-is-identical');
+    await assert.rejects(call(functions, 'submitRecorderDraft', {
+      ...data, matchKey: 'contract-final-straight', courtId: contractCourt, token: straightClaim.token,
+      sessionId: straightClaim.sessionId, queueRevision: 0, score: { sets: score }, operationId: 'contract-straight-submit',
+    }), /operation_mismatch/, 'submit-operation-id-is-bound-to-exact-payload');
+    assert.equal((await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'contract-final-straight'))))).data().submissionVersion, 1, 'submit-replay-does-not-double-submit');
+    assert.equal((await f.seed((db) => getDoc(
+      doc(db, path('courtQueues', contractCourt)),
+    ))).data().queueRevision, straightResult.queueRevision, 'submit-replay-does-not-double-advance-queue');
+
+    await seedRecorderMatch('contract-final-three', { matchType: 'final', divisionId: 'men' });
+    const threeClaim = await call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-final-three', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-final-three-session', queueRevision: 0,
+    });
+    await call(functions, 'submitRecorderDraft', {
+      ...data, matchKey: 'contract-final-three', courtId: contractCourt, token: threeClaim.token,
+      sessionId: threeClaim.sessionId, queueRevision: 0,
+      score: { sets: [{ a: 10, b: 8 }, { a: 8, b: 10 }, { a: 7, b: 5 }] },
+      operationId: 'contract-three-set-submit',
+    });
+    assert.equal((await f.seed((db) => getDoc(
+      doc(db, path('scoreWorkflows', 'contract-final-three')),
+    ))).data().submittedSnapshot.sets.length, 3, 'three-set-final-persists-three-sets');
+
+    const cancelCase = async (id, discardDraft) => {
+      await seedRecorderMatch(id);
+      const claimed = await call(functions, 'claimRecorderDraft', {
+        ...data, matchKey: id, courtId: contractCourt, recorderName: 'Recorder One',
+        sessionId: `${id}-session-0001`, queueRevision: 0,
+      });
+      await call(functions, 'saveRecorderDraft', {
+        ...data, matchKey: id, token: claimed.token, sessionId: claimed.sessionId, queueRevision: 0,
+        expectedDraftRevision: 0, draft: { sets: [{ a: 6, b: 4 }] },
+      });
+      const request = {
+        ...data, matchKey: id, courtId: contractCourt, token: claimed.token, sessionId: claimed.sessionId,
+        queueRevision: 0, discardDraft, operationId: `${id}-cancel-operation`,
+      };
+      const first = await call(functions, 'cancelRecorderDraft', request);
+      assert.deepEqual(await call(functions, 'cancelRecorderDraft', request), first, `${id}-cancel-replay-is-identical`);
+      return f.seed((db) => getDoc(doc(db, path('scoreWorkflows', id))));
+    };
+    const retained = await cancelCase('contract-cancel-retain', false);
+    assert.deepEqual(retained.data().draft, { sets: [{ a: 6, b: 4 }] }, 'cancel-retain-keeps-draft');
+    assert.equal(retained.data().draftRetention, 'retained_after_cancel', 'cancel-retain-marks-semantics');
+    const discarded = await cancelCase('contract-cancel-discard', true);
+    assert.equal(discarded.data().draft, undefined, 'cancel-discard-clears-draft');
+    assert.equal(discarded.data().draftRetention, undefined, 'cancel-discard-clears-retention-marker');
+
+    await call(functions, 'revokeRecorderGrant', { ...data, uid: credential.user.uid });
+    await seedRecorderMatch('contract-revoked');
+    await assert.rejects(call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-revoked', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-revoked-session', queueRevision: 0,
+    }), /Current recorder grant required/, 'revoked-grant-rejects-recorder-callables');
+    const restoredAccess = await call(functions, 'createRecorderAccessCode', data);
+    await call(functions, 'exchangeRecorderAccessCode', { ...data, code: restoredAccess.code });
+    await f.seed((db) => setDoc(doc(db, path('recorderGrants', credential.user.uid)), {
+      expiresAt: Timestamp.fromMillis(Date.now() - 1),
+    }, { merge: true }));
+    await assert.rejects(call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-revoked', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-expired-grant-session', queueRevision: 0,
+    }), /Current recorder grant required/, 'expired-grant-rejects-recorder-callables');
+    const renewedAccess = await call(functions, 'createRecorderAccessCode', data);
+    await call(functions, 'exchangeRecorderAccessCode', { ...data, code: renewedAccess.code });
+    const otherApp = initializeApp({ projectId: PROJECT_ID, apiKey: 'emulator-only', appId: `other-recorder-${Date.now()}` }, `other-recorder-${Date.now()}`);
+    try {
+      const otherAuth = getAuth(otherApp);
+      connectAuthEmulator(otherAuth, `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST || '127.0.0.1:9099'}`, { disableWarnings: true });
+      await signInAnonymously(otherAuth);
+      const otherFunctions = getFunctions(otherApp, 'asia-northeast3');
+      connectFunctionsEmulator(otherFunctions, functionsHost, Number(functionsPort));
+      await assert.rejects(call(otherFunctions, 'claimRecorderDraft', {
+        ...data, matchKey: 'contract-revoked', courtId: contractCourt, recorderName: 'Recorder One',
+        sessionId: 'contract-other-uid-session', queueRevision: 0,
+      }), /Current recorder grant required/, 'other-uid-is-denied-recorder-claim');
+    } finally {
+      await deleteApp(otherApp);
+    }
+    await f.seed((db) => setDoc(doc(db, 'tournaments/main'), { maintenance: { enabled: true } }, { merge: true }));
+    await assert.rejects(call(functions, 'exchangeRecorderAccessCode', { ...data, code: renewedAccess.code }), /maintenance/i, 'maintenance-blocks-recorder-readiness-exchange');
+    await assert.rejects(call(functions, 'claimRecorderDraft', {
+      ...data, matchKey: 'contract-revoked', courtId: contractCourt, recorderName: 'Recorder One',
+      sessionId: 'contract-maintenance-session', queueRevision: 0,
+    }), /Current recorder grant required/, 'maintenance-blocks-recorder-server-operation');
+    await f.seed((db) => setDoc(doc(db, 'tournaments/main'), { maintenance: { enabled: false } }, { merge: true }));
+
     await f.seed(async (db) => {
       await setDoc(doc(db, 'tournaments/main'), {
         tournamentId: 'main',
@@ -1719,11 +2010,13 @@ export async function runFunctionsSuite() {
       await setDoc(doc(db, 'tournaments/main/restoreManifests/reset-restore/chunks/0'), { index: 0 });
     });
     const preparedReset = await call(functions, 'prepareTournamentReset', { ...data, expectedName: '초기화 대상 대회' });
-    assert.deepEqual(
-      await call(functions, 'resetTournament', { ...data, token: preparedReset.token }),
-      { reset: true },
-      'reset-seeded-admin-succeeds',
-    );
+    const concurrentResetResults = await Promise.allSettled([
+      call(functions, 'resetTournament', { ...data, token: preparedReset.token }),
+      call(functions, 'resetTournament', { ...data, token: preparedReset.token }),
+    ]);
+    assert.equal(concurrentResetResults.filter(({ status }) => status === 'fulfilled').length, 1, 'reset-allows-one-execution-fence-owner');
+    assert.deepEqual(concurrentResetResults.find(({ status }) => status === 'fulfilled').value, { reset: true }, 'reset-seeded-admin-succeeds');
+    assert.equal(concurrentResetResults.filter(({ status }) => status === 'rejected').length, 1, 'reset-rejects-concurrent-worker');
     const resetRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
     assert.deepEqual(resetRoot.data(), {
       tournamentId: 'main',

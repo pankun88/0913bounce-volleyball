@@ -57,6 +57,7 @@ let reviewAssignments = [];
 let reviewWorkflows = new Map();
 let reviewQueues = new Map();
 let reviewCourts = new Map();
+const recorderLockInventoryReady = { assignments: false, workflows: false, courts: false };
 let reviewAudits = new Map();
 const reviewFinalMatchesByDivision = { men: [], women: [] };
 let correctionPreview = null;
@@ -71,6 +72,9 @@ let workflowQueueRevisionBaseline = {};
 let tournamentResetInProgress = false;
 let tournamentResetState = null;
 const TOURNAMENT_RESET_STATE_KEY = "bounce-volleyball:tournament-reset";
+let recorderGrants = [];
+let recorderGrantsLoading = false;
+let recorderGrantsError = "";
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
@@ -309,6 +313,7 @@ function initAuthGate() {
       loginScreen.style.display = "none";
       appShell.style.display = "";
       if (!unsubscribeWorkflowReviews.length) subscribeWorkflowReviews();
+      refreshRecorderGrants();
     } else {
       unsubscribeWorkflowReviews.forEach((unsubscribe) => unsubscribe());
       unsubscribeWorkflowReviews = [];
@@ -502,10 +507,12 @@ function initHelpTooltips() {
 }
 
 function subscribeWorkflowReviews() {
+  Object.keys(recorderLockInventoryReady).forEach((key) => { recorderLockInventoryReady[key] = false; });
   const root = ["tournaments", TOURNAMENT_ID];
   unsubscribeWorkflowReviews = [
     onSnapshot(collection(db, ...root, "courtAssignments"), (snap) => {
       reviewAssignments = snap.docs.map((item) => ({ id: item.id, ...item.data() }));
+      recorderLockInventoryReady.assignments = true;
       invalidateCorrectionPreview("코트 배정 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       if (!workflowDirty) resetWorkflowDraft();
       renderScoreReviews();
@@ -515,6 +522,7 @@ function subscribeWorkflowReviews() {
     }, (err) => reportError("검수 목록 구독", err)),
     onSnapshot(collection(db, ...root, "scoreWorkflows"), (snap) => {
       reviewWorkflows = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      recorderLockInventoryReady.workflows = true;
       invalidateCorrectionPreview("기록·잠금 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       renderScoreReviews();
       renderPrelimViews();
@@ -526,6 +534,7 @@ function subscribeWorkflowReviews() {
     }, (err) => reportError("코트 대기열 구독", err)),
     onSnapshot(collection(db, ...root, "courts"), (snap) => {
       reviewCourts = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      recorderLockInventoryReady.courts = true;
       invalidateCorrectionPreview("코트 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       if (!workflowDirty) resetWorkflowDraft();
       renderWorkflowCourtPlanner();
@@ -1184,6 +1193,147 @@ function renderScoreReviews() {
   });
 }
 
+function recorderGrantTime(value) {
+  const time = Number(value);
+  return Number.isFinite(time) && time > 0 ? new Date(time).toLocaleString() : "기록 없음";
+}
+
+function shortRecorderUid(uid) {
+  const value = String(uid || "");
+  if (value.length <= 14) return value;
+  return `${value.slice(0, 7)}…${value.slice(-5)}`;
+}
+
+function recorderGrantState(grant) {
+  if (grant.effectiveStatus === "revoked") return { label: "폐기됨", className: "revoked" };
+  if (grant.effectiveStatus === "expired") return { label: "만료됨", className: "expired" };
+  if (grant.effectiveStatus === "superseded") return { label: "이전 코드 권한", className: "expired" };
+  if (grant.effectiveStatus === "disabled") return { label: "전체 비활성", className: "expired" };
+  return { label: "활성", className: "active" };
+}
+
+function renderRecorderGrants() {
+  const root = document.getElementById("recorderGrantList");
+  const status = document.getElementById("recorderGrantStatus");
+  if (!root || !status) return;
+  root.replaceChildren();
+  if (recorderGrantsLoading) {
+    status.textContent = "권한 목록을 불러오는 중입니다.";
+    return;
+  }
+  if (recorderGrantsError) {
+    status.textContent = recorderGrantsError;
+    return;
+  }
+  if (!recorderGrants.length) {
+    status.textContent = "발급 또는 폐기된 기록관 권한이 없습니다.";
+    return;
+  }
+  status.textContent = `${recorderGrants.length}개 계정 권한`;
+  recorderGrants.forEach((grant) => {
+    const state = recorderGrantState(grant);
+    const row = document.createElement("article");
+    row.className = "recorder-grant-card";
+    const uid = document.createElement("button");
+    uid.type = "button";
+    uid.className = "recorder-uid";
+    uid.textContent = shortRecorderUid(grant.uid);
+    uid.title = `${grant.uid} 복사`;
+    uid.setAttribute("aria-label", `기록관 UID ${grant.uid} 복사`);
+    uid.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(grant.uid);
+        showToast("기록관 UID를 복사했습니다.");
+      } catch {
+        showToast("UID 복사에 실패했습니다. 브라우저 권한을 확인하세요.");
+      }
+    });
+    const details = document.createElement("div");
+    details.className = "recorder-grant-details";
+    details.innerHTML = `<span><small>발급</small>${escapeHtml(recorderGrantTime(grant.issuedAt))}</span>`
+      + `<span><small>마지막 사용</small>${escapeHtml(recorderGrantTime(grant.lastUsedAt))}</span>`
+      + `<span><small>만료</small>${escapeHtml(recorderGrantTime(grant.expiresAt))}</span>`;
+    const badge = document.createElement("span");
+    badge.className = `recorder-grant-state ${state.className}`;
+    badge.textContent = state.label;
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "btn danger small";
+    revoke.textContent = "이 계정 폐기";
+    revoke.disabled = grant.status === "revoked";
+    revoke.addEventListener("click", async () => {
+      if (!confirm(`UID ${grant.uid} 계정의 기록관 권한만 폐기할까요?\n다른 기록관의 권한, 입력 중인 초안 및 잠금은 변경되지 않습니다.`)) return;
+      const result = await runWorkflowButton(revoke, "계정별 접근 권한 폐기", () => adminWorkflowCallable("revokeRecorderGrant", { uid: grant.uid }));
+      if (result?.revoked) {
+        showToast("해당 계정의 기록관 권한을 폐기했습니다.");
+        refreshRecorderGrants();
+      }
+    });
+    row.append(uid, badge, details, revoke);
+    root.appendChild(row);
+  });
+}
+
+async function refreshRecorderGrants() {
+  if (recorderGrantsLoading) return;
+  recorderGrantsLoading = true;
+  const refreshButton = document.getElementById("refreshRecorderGrantsBtn");
+  if (refreshButton) {
+    refreshButton.disabled = true;
+    refreshButton.textContent = "불러오는 중…";
+  }
+  renderRecorderGrants();
+  try {
+    const result = await adminWorkflowCallable("listRecorderGrants");
+    if (!Array.isArray(result?.data?.grants)) throw new Error("권한 목록 응답 형식이 올바르지 않습니다.");
+    if (result.data.grants.some((grant) => typeof grant?.uid !== "string"
+      || !["active", "expired", "revoked", "superseded", "disabled"].includes(grant.effectiveStatus))) {
+      throw new Error("권한 목록 항목 형식이 올바르지 않습니다.");
+    }
+    recorderGrants = result.data.grants
+      .filter((grant) => typeof grant?.uid === "string" && grant.uid)
+      .sort((a, b) => Number(b.issuedAt) - Number(a.issuedAt));
+    recorderGrantsError = "";
+  } catch (err) {
+    recorderGrantsError = "권한 목록을 불러오지 못했습니다. 새로고침해 다시 확인하세요.";
+    reportError("기록관 권한 목록", err);
+  } finally {
+    recorderGrantsLoading = false;
+    if (refreshButton) {
+      refreshButton.disabled = false;
+      refreshButton.textContent = "권한 목록 새로고침";
+    }
+    renderRecorderGrants();
+  }
+}
+
+function activeRecorderLockList() {
+  return reviewAssignments
+    .map((assignment) => ({ assignment, workflow: reviewWorkflows.get(assignment.id) }))
+    .filter(({ workflow }) => workflow?.lock && workflow.draftState === "editing")
+    .map(({ assignment, workflow }) => {
+      const court = reviewCourts.get(assignment.courtId);
+      const display = scoreReviewDisplay(assignment);
+      return {
+        recorder: `${workflow.lock.recorderName || "이름 없음"} (${shortRecorderUid(workflow.lock.uid)})`,
+        court: court?.name ? formatCourtName(court.name) : "미배정 코트",
+        match: `${[display.divisionName, ...display.matchParts].filter(Boolean).join(" · ") || "경기"} [${assignment.id}]`,
+      };
+    });
+}
+
+function confirmGlobalRecorderCodeAction(actionLabel) {
+  if (!Object.values(recorderLockInventoryReady).every(Boolean)) {
+    showToast("현재 편집 잠금 목록을 아직 불러오는 중입니다. 잠시 후 다시 시도하세요.", 5000);
+    return false;
+  }
+  const locks = activeRecorderLockList();
+  const affected = locks.length
+    ? `\n\n현재 편집 잠금 ${locks.length}건(유지됨):\n${locks.map((item) => `- 기록관 ${item.recorder} / ${item.court} / ${item.match}`).join("\n")}`
+    : "\n\n현재 편집 잠금은 없습니다.";
+  return confirm(`${actionLabel}하면 모든 기록관의 기존 접근 권한이 무효화됩니다. 초안과 잠금은 자동 해제하거나 삭제하지 않습니다.${affected}\n\n초안·잠금을 유지한 채 진행하려면 확인을, 취소하려면 취소를 누르세요. 잠금 해제는 검수 목록의 ‘잠금 강제 해제’로 별도 처리합니다.`);
+}
+
 function renderCorrectionMatchOptions() {
   const select = document.getElementById("correctionMatchKeys");
   if (!select) return;
@@ -1445,17 +1595,27 @@ function bindStaticHandlers() {
   document.getElementById("restoreFileInput").addEventListener("change", handleRestoreFile);
 
   document.getElementById("createRecorderCodeBtn").addEventListener("click", async (e) => {
+    if (!confirmGlobalRecorderCodeAction("접근 코드를 재발급")) return;
     const result = await runWorkflowButton(e.currentTarget, "접근 코드 생성/재발급", () => adminWorkflowCallable("createRecorderAccessCode"));
     if (result?.code) {
       const output = document.getElementById("recorderCodeOutput");
       output.textContent = `새 접근 코드: ${result.code}`;
       output.style.display = "";
+      refreshRecorderGrants();
     }
   });
   document.getElementById("revokeRecorderCodeBtn").addEventListener("click", async (e) => {
+    if (!confirmGlobalRecorderCodeAction("접근 코드를 전체 폐기")) return;
     const result = await runWorkflowButton(e.currentTarget, "접근 코드 폐기", () => adminWorkflowCallable("revokeRecorderAccessCode"));
-    if (result?.revoked) showToast("기록관 접근 코드를 폐기했습니다.");
+    if (result?.revoked) {
+      const output = document.getElementById("recorderCodeOutput");
+      output.textContent = "";
+      output.style.display = "none";
+      showToast("기록관 접근 코드를 폐기했습니다.");
+      refreshRecorderGrants();
+    }
   });
+  document.getElementById("refreshRecorderGrantsBtn").addEventListener("click", refreshRecorderGrants);
   document.getElementById("addCourtBtn").addEventListener("click", createWorkflowCourt);
   ["setupCourtsBtn", "setupWorkflowBtn"].forEach((id) => {
     document.getElementById(id).addEventListener("click", (e) => saveCourtWorkflow(e.currentTarget));

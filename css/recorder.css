@@ -53,6 +53,10 @@ h2 { margin-bottom: 14px; color: var(--text); font-size: 1.03rem; letter-spacing
   font-size: .78rem; font-weight: 750;
 }
 .connection-status:empty { display: none; }
+.action-status { margin: 0 4px 10px; color: #1d514c; font-size: .84rem; font-weight: 800; }
+#codeHelp { margin: 7px 0 0; color: var(--muted); font-size: .78rem; line-height: 1.45; }
+h3 { margin: 0 0 8px; font-size: .95rem; }
+input[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 3px rgba(184, 74, 74, .18); }
 label { display: block; margin: 12px 0 6px; color: var(--muted); font-size: .75rem; font-weight: 750; }
 input, select {
   width: 100%; padding: 10px 13px;
@@ -76,6 +80,7 @@ button:active:not(:disabled) { transform: translateY(0); }
 .quiet-button { flex: none; min-height: 40px; padding: 8px 10px; font-size: .78rem; }
 #accessCodeForm .primary-button, #googleLoginButton { width: 100%; margin-top: 12px; }
 .identity { margin-bottom: 0; color: var(--text); font-weight: 750; }
+.onboarding-steps { margin: 10px 0 14px; padding-left: 1.35rem; color: var(--muted); font-size: .88rem; line-height: 1.65; }
 #courtPanel { position: relative; }
 #courtPanel h2 { margin-bottom: 6px; }
 #courtMessage { margin: 9px 2px 0; color: var(--accent); font-size: .79rem; font-weight: 700; }
@@ -148,4 +153,13 @@ legend { width: 100%; margin-bottom: 8px; color: var(--text); font-size: .84rem;
   .matchup strong { min-height: 52px; padding: 7px 5px; }
   .score-row { padding: 10px; }
   .score-entry input { min-height: 56px; font-size: 1.45rem; }
+}
+@media (max-height: 520px) and (orientation: landscape) {
+  .recorder-shell { width: min(100%, 900px); padding-top: max(10px, env(safe-area-inset-top)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  .app-header, .panel { margin: 8px 0; padding: 12px; }
+  .score-row { padding: 8px; }
+  .score-entry input { min-height: 48px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
 }

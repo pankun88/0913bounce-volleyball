@@ -9,11 +9,16 @@ const callable = (handler) => onCall({ region: 'asia-northeast3' }, handler);
 
 export const createRecorderAccessCode = callable(adminWorkflow.createRecorderAccessCode);
 export const revokeRecorderAccessCode = callable(adminWorkflow.revokeRecorderAccessCode);
+export const listRecorderGrants = callable(adminWorkflow.listRecorderGrants);
+export const revokeRecorderGrant = callable(adminWorkflow.revokeRecorderGrant);
 export const prepareTournamentReset = callable(adminWorkflow.prepareTournamentReset);
 export const recoverTournamentReset = callable(adminWorkflow.recoverTournamentReset);
 export const cancelTournamentReset = callable(adminWorkflow.cancelTournamentReset);
 export const resetTournament = callable(adminWorkflow.resetTournament);
 export const exchangeRecorderAccessCode = callable(adminWorkflow.exchangeRecorderAccessCode);
+export const claimRecorderDraft = callable(adminWorkflow.claimRecorderDraft);
+export const saveRecorderDraft = callable(adminWorkflow.saveRecorderDraft);
+export const renewRecorderLease = callable(adminWorkflow.renewRecorderLease);
 export const replaceCourtWorkflows = callable(adminWorkflow.replaceCourtWorkflows);
 export const publishFinalStructure = callable(adminWorkflow.publishFinalStructure);
 export const clearFinalStructure = callable(adminWorkflow.clearFinalStructure);

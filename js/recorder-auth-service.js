@@ -1,187 +1,113 @@
-// 기록관은 Google 로그인과 현재 접근 코드 grant를 모두 충족할 때만 준비 상태가 된다.
 import {
-  GoogleAuthProvider,
-  browserSessionPersistence,
-  onAuthStateChanged,
-  setPersistence,
-  signInWithPopup,
-  signOut,
+  GoogleAuthProvider, browserSessionPersistence, getRedirectResult, onAuthStateChanged,
+  setPersistence, signInWithPopup, signInWithRedirect, signOut,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import {
-  doc,
-  onSnapshot,
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
 import { auth, db, functions } from "./firebase-init.js";
+import { TOURNAMENT_ID } from "./firebase-config.js";
 
-export const TOURNAMENT_ID = "main";
+const google = "google.com";
+const timestampMs = (value) => value?.toMillis?.() ?? 0;
+const provider = () => new GoogleAuthProvider().setCustomParameters({ prompt: "select_account" });
 
-const GOOGLE_PROVIDER_ID = "google.com";
-
-function isGoogleUser(user) {
-  return Boolean(user?.providerData?.some((provider) => provider.providerId === GOOGLE_PROVIDER_ID));
+function state(user, root, challenge, grant, admin, activeProvider, offline = false) {
+  if (offline) return { kind: "offline", user, ready: false };
+  if (!user) return { kind: "signedOut", user: null, ready: false };
+  if (activeProvider !== google && !admin) return { kind: "wrongProvider", user, ready: false };
+  if (root?.maintenance?.enabled === true) return { kind: "maintenance", user, ready: false };
+  if (root?.recorderFeatureEnabled !== true || challenge?.enabled !== true) return { kind: "disabled", user, ready: false };
+  if (!grant) return { kind: "codeRequired", user, ready: false, codeSource: "대회 공용 코드" };
+  if (grant.uid !== user.uid || grant.status !== "active" || grant.version !== challenge?.version || timestampMs(grant.expiresAt) <= Date.now()) {
+    return { kind: "staleGrant", user, ready: false, codeSource: "대회 공용 코드" };
+  }
+  return { kind: "ready", user, ready: true, grantVersion: grant.version, codeSource: "대회 공용 코드" };
 }
 
-function recorderState(user, challenge, grant, tournamentEnabled) {
-  const grantVersion = Number.isInteger(grant?.version) ? grant.version : null;
-  const challengeVersion = Number.isInteger(challenge?.version) ? challenge.version : null;
-  const ready = Boolean(
-    user
-    && isGoogleUser(user)
-    && tournamentEnabled === true
-    && challenge?.enabled === true
-    && grant?.uid === user.uid
-    && grantVersion !== null
-    && grantVersion === challengeVersion,
-  );
-
-  return {
-    user: user || null,
-    ready,
-    grantVersion,
-  };
-}
-
-/**
- * Google 사용자, 공개된 현재 access version, 그리고 자기 grant를 함께 관찰한다.
- * 버전 변경·폐기·권한 오류는 모두 ready=false로 fail closed 처리한다.
- */
 export function watchRecorderAuthState(cb) {
-  let stopGrant = () => {};
-  let stopChallenge = () => {};
-  let stopTournament = () => {};
-  let active = true;
-
-  const stopAuth = onAuthStateChanged(auth, (user) => {
-    stopGrant();
-    stopChallenge();
-    stopTournament();
-    stopGrant = () => {};
-    stopChallenge = () => {};
-    stopTournament = () => {};
-
-    if (!user || !isGoogleUser(user)) {
-      cb(recorderState(user, null, null, false));
-      return;
-    }
-
-    const uid = user.uid;
-    let challenge = null;
-    let grant = null;
-    let tournamentEnabled = false;
-    const emit = () => {
-      if (!active || auth.currentUser?.uid !== uid) return;
-      cb(recorderState(auth.currentUser, challenge, grant, tournamentEnabled));
+  let stops = []; let active = true; let latestUser = null; let authGeneration = 0; let expiryTimer = null; let recompute = () => {};
+  const clear = () => { stops.forEach((stop) => stop()); stops = []; if (expiryTimer) window.clearTimeout(expiryTimer); expiryTimer = null; };
+  const emit = (value) => { if (active) cb(value); };
+  const stopAuth = onAuthStateChanged(auth, async (user) => {
+    const generation = ++authGeneration;
+    clear(); latestUser = user;
+    if (!user) { emit(state(null)); return; }
+    let root; let challenge; let grant; let admin; let failed = false;
+    let activeProvider = "";
+    const loaded = { root: false, challenge: false, grant: false, admin: false, provider: false };
+    const update = () => {
+      if (!active || auth.currentUser?.uid !== user.uid) return;
+      if (!Object.values(loaded).every(Boolean)) {
+        emit({ kind: "loading", user, ready: false });
+        return;
+      }
+      const next = failed ? { kind: navigator.onLine ? "error" : "offline", user, ready: false } : state(user, root, challenge, grant, admin, activeProvider);
+      emit(next);
+      if (expiryTimer) window.clearTimeout(expiryTimer);
+      expiryTimer = null;
+      if (next.kind === "ready") {
+        expiryTimer = window.setTimeout(update, Math.max(1, timestampMs(grant.expiresAt) - Date.now() + 50));
+      }
     };
-
-    stopTournament = onSnapshot(
-      doc(db, "tournaments", TOURNAMENT_ID),
-      (snapshot) => {
-        tournamentEnabled = snapshot.exists() && snapshot.data().recorderFeatureEnabled === true;
-        emit();
-      },
-      () => {
-        tournamentEnabled = false;
-        emit();
-      },
-    );
-    stopChallenge = onSnapshot(
-      doc(db, "tournaments", TOURNAMENT_ID, "recorderAccessChallenge", "current"),
-      (snapshot) => {
-        challenge = snapshot.exists() ? snapshot.data() : null;
-        emit();
-      },
-      () => {
-        challenge = null;
-        emit();
-      },
-    );
-    stopGrant = onSnapshot(
-      doc(db, "tournaments", TOURNAMENT_ID, "recorderGrants", uid),
-      (snapshot) => {
-        grant = snapshot.exists() ? snapshot.data() : null;
-        emit();
-      },
-      () => {
-        grant = null;
-        emit();
-      },
-    );
+    recompute = update;
+    const watch = (key, path, assign) => onSnapshot(doc(db, ...path), (snap) => {
+      assign(snap.exists() ? snap.data() : null);
+      loaded[key] = true;
+      update();
+    }, () => {
+      loaded[key] = true;
+      failed = true;
+      update();
+    });
+    try {
+      activeProvider = (await user.getIdTokenResult()).signInProvider || "";
+    } catch {
+      failed = true;
+    }
+    if (!active || generation !== authGeneration || auth.currentUser?.uid !== user.uid) return;
+    loaded.provider = true;
+    stops = [
+      watch("root", ["tournaments", TOURNAMENT_ID], (value) => { root = value; }),
+      watch("challenge", ["tournaments", TOURNAMENT_ID, "recorderAccessChallenge", "current"], (value) => { challenge = value; }),
+      watch("grant", ["tournaments", TOURNAMENT_ID, "recorderGrants", user.uid], (value) => { grant = value; }),
+      watch("admin", ["tournaments", TOURNAMENT_ID, "admins", user.uid], (value) => { admin = Boolean(value); }),
+    ];
+    update();
   });
-
-  return () => {
-    active = false;
-    stopGrant();
-    stopChallenge();
-    stopTournament();
-    stopAuth();
+  const online = () => {
+    if (!latestUser) return;
+    recompute();
   };
+  const offline = () => emit({ kind: "offline", user: auth.currentUser, ready: false });
+  window.addEventListener("online", online); window.addEventListener("offline", offline);
+  getRedirectResult(auth).catch((error) => emit({ kind: "error", user: auth.currentUser, ready: false, error }));
+  return () => { active = false; clear(); stopAuth(); window.removeEventListener("online", online); window.removeEventListener("offline", offline); };
 }
 
 export async function loginWithGoogle() {
   await setPersistence(auth, browserSessionPersistence);
-  return signInWithPopup(auth, new GoogleAuthProvider());
+  try { return await signInWithPopup(auth, provider()); }
+  catch (error) {
+    if (["auth/popup-blocked", "auth/operation-not-supported-in-this-environment"].includes(error.code)) {
+      await signInWithRedirect(auth, provider());
+      return null;
+    }
+    throw error;
+  }
 }
-
-/**
- * 코드 원문은 Callable 요청에만 사용하며 브라우저 저장소나 반환값에 남기지 않는다.
- */
 export async function exchangeRecorderAccessCode(code) {
-  const user = auth.currentUser;
-  if (!isGoogleUser(user)) {
-    const err = new Error("Google 로그인이 필요합니다.");
-    err.code = "auth/google-login-required";
-    throw err;
-  }
-  if (typeof code !== "string" || !code.trim()) {
-    const err = new Error("접근 코드를 입력하세요.");
-    err.code = "functions/invalid-argument";
-    throw err;
-  }
-
-  const result = await httpsCallable(functions, "exchangeRecorderAccessCode")({
-    tournamentId: TOURNAMENT_ID,
-    code: code.trim(),
-  });
-  const data = result?.data;
-  if (
-    !data
-    || data.tournamentId !== TOURNAMENT_ID
-    || !Number.isInteger(data.grantVersion)
-    || data.grantVersion < 1
-  ) {
-    const err = new Error("접근 권한 확인 응답이 올바르지 않습니다.");
-    err.code = "functions/internal";
-    throw err;
-  }
-
-  const response = {
-    tournamentId: TOURNAMENT_ID,
-    grantVersion: data.grantVersion,
-  };
-  if (data.expiresAt !== undefined) response.expiresAt = data.expiresAt;
-  return response;
+  if (!auth.currentUser) throw Object.assign(new Error("Google 로그인이 필요합니다."), { code: "auth/google-login-required" });
+  if (!/^[A-Za-z0-9_-]{24}$/.test(code.trim())) throw Object.assign(new Error("접근 코드는 24자 영문·숫자·-_ 형식입니다."), { code: "functions/invalid-argument" });
+  return (await httpsCallable(functions, "exchangeRecorderAccessCode")({ tournamentId: TOURNAMENT_ID, code: code.trim() })).data;
 }
-
-export async function logoutRecorder() {
-  await signOut(auth);
-}
-
-export function describeRecorderAuthError(err) {
-  const code = err?.code || "";
-  if (code.includes("popup-closed-by-user")) return "Google 로그인을 취소했습니다.";
-  if (code.includes("popup-blocked")) return "팝업이 차단되었습니다. 브라우저에서 팝업을 허용해주세요.";
-  if (code.includes("account-exists-with-different-credential")) {
-    return "다른 로그인 방법으로 등록된 이메일입니다.";
-  }
-  if (code.includes("google-login-required")) return "Google 로그인이 필요합니다.";
-  if (code.includes("permission-denied") || code.includes("unauthenticated")) {
-    return "기록관 접근 권한이 없습니다.";
-  }
-  if (code.includes("invalid-argument")) return "접근 코드를 확인해주세요.";
-  if (code.includes("failed-precondition")) return "현재 기록관 접근이 허용되지 않았습니다.";
-  if (code.includes("unavailable") || code.includes("network-request-failed")) {
-    return "네트워크 오류로 요청에 실패했어요. 인터넷 연결을 확인해주세요.";
-  }
-  return "처리 중 오류가 발생했습니다." + (code ? ` (${code})` : "");
+export const logoutRecorder = () => signOut(auth);
+export function describeRecorderAuthError(error) {
+  const code = error?.code || "";
+  if (code.includes("popup-closed")) return "Google 로그인을 취소했습니다.";
+  if (code.includes("popup-blocked")) return "팝업이 차단되었습니다. 리디렉션 로그인을 사용하세요.";
+  if (code.includes("code_invalid")) return "접근 코드를 확인하세요.";
+  if (code.includes("code_rate_limited")) return "코드 입력이 잠시 제한되었습니다.";
+  if (code.includes("grant_revoked") || error?.details?.reason === "grant_revoked" || /grant_revoked/.test(error?.message || "")) return "이 계정의 기록관 권한이 폐기되었습니다. 운영진에게 문의하세요.";
+  if (code.includes("network") || code.includes("unavailable")) return "네트워크 연결을 확인하세요.";
+  return error?.message || "인증 처리 중 오류가 발생했습니다.";
 }

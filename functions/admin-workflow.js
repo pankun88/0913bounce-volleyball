@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { HttpsError } from 'firebase-functions/v2/https';
 import {
   activateDependencyEntries, consumeCurrentAndAdvance, planCorrectionReplay,
@@ -16,6 +16,27 @@ const requireMain = (data) => { if (data?.tournamentId !== TOURNAMENT_ID) throw 
 const bounded = (value) => JSON.parse(JSON.stringify(value ?? null, (_key, item) => typeof item === 'string' ? item.slice(0, 1024) : item));
 const boundedReason = (value) => value.trim().slice(0, 1024);
 const transitionId = (matchKey, event, revision = 0) => `server:${matchKey}:${event}:${revision}`;
+const LEASE_MS = 3 * 60 * 1000;
+const OPERATION_ID = /^[A-Za-z0-9_-]{16,128}$/;
+const callableError = (reason, code = 'failed-precondition') => { throw new HttpsError(code, reason, { reason }); };
+const recorderAuditId = (event, uid, matchKey, token) => `rec:${crypto.createHash('sha256').update(`${event}:${uid}:${matchKey}:${token}`).digest('base64url')}`;
+function requireOperationId(value) {
+  if (typeof value !== 'string' || !OPERATION_ID.test(value)) throw new HttpsError('invalid-argument', 'operationId required.', { reason: 'stale_revision' });
+  return value;
+}
+function isExpired(lock, now = Date.now()) { return !lock?.expiresAt?.toMillis || lock.expiresAt.toMillis() <= now; }
+function newLease(uid, token, recorderName, sessionId, now = Date.now()) {
+  const stamp = Timestamp.fromMillis(now);
+  return { uid, token, recorderName, sessionId, acquiredAt: stamp, renewedAt: stamp, expiresAt: Timestamp.fromMillis(now + LEASE_MS) };
+}
+function renewLease(lock, now = Date.now()) { return { ...lock, renewedAt: Timestamp.fromMillis(now), expiresAt: Timestamp.fromMillis(now + LEASE_MS) }; }
+function validateLease(workflow, { uid, token, sessionId }) {
+  const lock = workflow.lock;
+  if (!lock || lock.uid !== uid || lock.token !== token || lock.sessionId !== sessionId) callableError('ownership_lost', 'aborted');
+  if (isExpired(lock)) callableError('lease_expired', 'aborted');
+  return lock;
+}
+function assertResolved(assignment) { if (assignment.dependencyReady === false) callableError('unresolved_teams'); }
 function hash(code, salt) { return crypto.scryptSync(code, salt, 32).toString('base64url'); }
 function randomCode() { return crypto.randomBytes(18).toString('base64url'); }
 function resetTokenHash(token) { return crypto.createHash('sha256').update(token).digest('base64url'); }
@@ -60,7 +81,10 @@ async function recorder(tx, request) {
       || configSnap.data().enabled !== true
       || !grantSnap.exists
       || grantSnap.data().uid !== uid
-      || grantSnap.data().version !== configSnap.data().version) {
+      || grantSnap.data().version !== configSnap.data().version
+      || grantSnap.data().status !== 'active'
+      || !grantSnap.data().expiresAt?.toMillis
+      || grantSnap.data().expiresAt.toMillis() <= Date.now()) {
     throw new HttpsError('permission-denied', 'Current recorder grant required.');
   }
 }
@@ -154,18 +178,127 @@ function finalAssignmentKey(divisionId, matchId) {
 }
 function setWinner(a, b, target) { if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < 0 || a > 15 || b > 15) return null; const hi = Math.max(a,b); const margin=Math.abs(a-b); if (hi < target || a === b || (hi === 15 && margin > 2) || (hi > target && hi < 15 && margin !== 2) || (hi === target && margin < 2)) return null; return a > b ? 'A' : 'B'; }
 function evaluate(assignment, sets) {
-  const final = assignment.matchType === 'final'; const max = final ? 3 : 2; const targets = final ? [10, 10, 7] : [10, 10]; const source = Array.isArray(sets) ? sets : [];
+  const final = assignment.matchType === 'final'; const max = final ? 3 : 2; const targets = final ? [10, 10, 7] : [10, 10]; let source = Array.isArray(sets) ? sets : [];
+  while (source.length && source[source.length - 1]?.a === 0 && source[source.length - 1]?.b === 0) source = source.slice(0, -1);
   if (!source.length) bad('Score is required.');
   if (source.length > max) bad('Score contains too many sets.');
   let a = 0; let b = 0; let pointsForA = 0; let pointsForB = 0;
   for (let i=0; i<source.length; i++) { const s=source[i]; if (!s || !Number.isInteger(s.a) || !Number.isInteger(s.b)) bad('Score values must be integers.'); const w=setWinner(s.a, s.b, targets[i]); if (!w) bad('Score contains an incomplete or invalid set.'); pointsForA += s.a; pointsForB += s.b; if (w === 'A') a++; else b++; if (final && (a === 2 || b === 2) && i !== source.length - 1) bad('Sets after a final winner are not allowed.'); }
-  if ((!final && source.length !== 2) || (final && a !== 2 && b !== 2)) bad('Complete score required.');
+  if ((!final && source.length !== 2) || (final && (a !== 2 && b !== 2 || source.length !== (a === 2 || b === 2 ? (a + b === 2 ? 2 : 3) : 0)))) bad('Complete score required.');
   return { sets: source.map((s) => ({ a:s.a, b:s.b })), setsWonA:a, setsWonB:b, pointsForA, pointsForB, status:'done', result: final ? (a === 2 ? 'A' : 'B') : (a === b ? 'draw' : (a > b ? 'A' : 'B')), winner: final ? (a === 2 ? 'A' : 'B') : null };
 }
 async function courtState(tx, courtId) {
   const queueSnap = await tx.get(ref('courtQueues', courtId)); if (!queueSnap.exists) bad('Court queue not found.');
   const assignmentsSnap = await tx.get(root().collection('courtAssignments').where('courtId', '==', courtId)); const workflows = await Promise.all(assignmentsSnap.docs.map((doc) => tx.get(ref('scoreWorkflows', doc.id))));
   const assignments = Object.fromEntries(assignmentsSnap.docs.map((doc) => [doc.id, doc.data()])); const workflowMap = Object.fromEntries(workflows.map((doc) => [doc.id, doc.exists ? doc.data() : {}])); return { queue: queueSnap.data(), assignments, workflows: workflowMap };
+}
+function draftSets(value) {
+  const sets = value?.sets;
+  if (!Array.isArray(sets) || sets.length > 3 || sets.some((set) => !set || !Number.isInteger(set.a) || !Number.isInteger(set.b) || set.a < 0 || set.b < 0 || set.a > 15 || set.b > 15)) {
+    throw new HttpsError('invalid-argument', 'Draft sets must be bounded integers.');
+  }
+  return { sets: sets.map(({ a, b }) => ({ a, b })) };
+}
+function operationRef(uid, operationId) { return ref('recorderOperations', `${uid}:${operationId}`); }
+function touchRecorderGrant(tx, uid) {
+  tx.update(ref('recorderGrants', uid), { lastUsedAt: FieldValue.serverTimestamp() });
+}
+function operationFingerprint(value) {
+  return crypto.createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+}
+function unresolvedOfficial(assignment, official) {
+  return assignment.dependencyReady === false || !official?.teamA || !official?.teamB;
+}
+export async function claimRecorderDraft(request) {
+  requireMain(request.data);
+  const uid = request.auth?.uid;
+  const { matchKey, courtId, recorderName, sessionId, queueRevision, takeover = false } = request.data || {};
+  if (!uid || typeof matchKey !== 'string' || typeof courtId !== 'string' || typeof recorderName !== 'string' || !recorderName.trim() || typeof sessionId !== 'string' || sessionId.length < 16 || sessionId.length > 128) throw new HttpsError('invalid-argument', 'Match, court, recorder and session required.');
+  const token = randomCode();
+  return db().runTransaction(async (tx) => {
+    await recorder(tx, request);
+    const [assignmentSnap, workflowSnap, courtSnap, queueSnap] = await Promise.all([tx.get(ref('courtAssignments', matchKey)), tx.get(ref('scoreWorkflows', matchKey)), tx.get(ref('courts', courtId)), tx.get(ref('courtQueues', courtId))]);
+    if (!assignmentSnap.exists || !workflowSnap.exists || !courtSnap.exists || !queueSnap.exists) throw new HttpsError('not-found', 'Recorder workflow not found.');
+    const assignment = assignmentSnap.data(); const workflow = workflowSnap.data(); const queue = queueSnap.data();
+    if (assignment.courtId !== courtId || queue.currentMatchKey !== matchKey || queue.queueRevision !== queueRevision) callableError('stale_queue', 'aborted');
+    if (courtSnap.data().recorderName?.trim() !== recorderName.trim()) callableError('recorder_name_changed', 'aborted');
+    assertResolved(assignment);
+    const official = await tx.get(matchRef(assignment));
+    if (!official.exists || unresolvedOfficial(assignment, official.data())) callableError('unresolved_teams');
+    const lock = workflow.lock;
+    if (lock && !isExpired(lock)) {
+      if (lock.uid !== uid) callableError('ownership_lost', 'permission-denied');
+      if (lock.sessionId !== sessionId && takeover !== true) callableError('ownership_lost', 'aborted');
+    }
+    if (!['idle', 'rejected', 'editing'].includes(workflow.draftState)) callableError('submitted', 'aborted');
+    const nextLock = newLease(uid, token, recorderName.trim(), sessionId);
+    const id = recorderAuditId('claim', uid, matchKey, token);
+    const resumeDraftState = workflow.draftState === 'rejected'
+      ? 'rejected'
+      : workflow.draftState === 'editing' && ['idle', 'rejected'].includes(workflow.resumeDraftState)
+        ? workflow.resumeDraftState
+        : 'idle';
+    touchRecorderGrant(tx, uid);
+    tx.update(workflowSnap.ref, { draftState: 'editing', resumeDraftState, lock: nextLock, lastTransitionId: id });
+    tx.update(assignmentSnap.ref, { publicStatus: 'in_progress', attemptCount: Math.max(1, assignment.attemptCount || 0), lastTransitionId: id });
+    audit(tx, id, 'recorder_claim', matchKey, { uid, name: nextLock.recorderName, email: request.auth?.token?.email || null }, { lock: lock || null }, { lock: nextLock });
+    return {
+      token,
+      sessionId,
+      leaseExpiresAt: nextLock.expiresAt.toMillis(),
+      transitionId: id,
+      draftRevision: workflow.draftRevision || 0,
+      draft: workflow.draft || { sets: [] },
+    };
+  });
+}
+export async function saveRecorderDraft(request) {
+  requireMain(request.data);
+  const uid = request.auth?.uid; const {
+    matchKey, token, sessionId, draft, queueRevision, expectedDraftRevision,
+  } = request.data || {};
+  if (!uid || typeof matchKey !== 'string' || typeof token !== 'string' || typeof sessionId !== 'string') throw new HttpsError('invalid-argument', 'Match ownership required.');
+  if (!Number.isInteger(expectedDraftRevision) || expectedDraftRevision < 0) callableError('stale_revision', 'invalid-argument');
+  const normalized = draftSets(draft);
+  const eventNonce = crypto.randomUUID();
+  return db().runTransaction(async (tx) => {
+    await recorder(tx, request);
+    const [assignmentSnap, workflowSnap] = await Promise.all([tx.get(ref('courtAssignments', matchKey)), tx.get(ref('scoreWorkflows', matchKey))]);
+    if (!assignmentSnap.exists || !workflowSnap.exists) throw new HttpsError('not-found', 'Match workflow not found.');
+    const assignment = assignmentSnap.data(); const workflow = workflowSnap.data(); const state = assignment.courtId ? await courtState(tx, assignment.courtId) : null;
+    if (state && (state.queue.currentMatchKey !== matchKey || state.queue.queueRevision !== queueRevision)) callableError('stale_queue', 'aborted');
+    if ((workflow.draftRevision || 0) !== expectedDraftRevision) callableError('stale_revision', 'aborted');
+    assertResolved(assignment); validateLease(workflow, { uid, token, sessionId });
+    const lock = renewLease(workflow.lock); const id = recorderAuditId('save', uid, matchKey, `${token}:${eventNonce}`);
+    touchRecorderGrant(tx, uid);
+    tx.update(workflowSnap.ref, {
+      draft: normalized,
+      draftRevision: (workflow.draftRevision || 0) + 1,
+      lock,
+      draftRetention: FieldValue.delete(),
+      draftRetainedBy: FieldValue.delete(),
+      draftRetainedAt: FieldValue.delete(),
+      lastTransitionId: id,
+    });
+    audit(tx, id, 'draft_save', matchKey, { uid, name: lock.recorderName, email: request.auth?.token?.email || null }, { draft: workflow.draft || null, lock: workflow.lock }, { draft: normalized, lock });
+    return { draftRevision: (workflow.draftRevision || 0) + 1, leaseExpiresAt: lock.expiresAt.toMillis(), transitionId: id };
+  });
+}
+export async function renewRecorderLease(request) {
+  requireMain(request.data);
+  const uid = request.auth?.uid; const { matchKey, token, sessionId, queueRevision } = request.data || {};
+  const eventNonce = crypto.randomUUID();
+  return db().runTransaction(async (tx) => {
+    await recorder(tx, request);
+    const [assignmentSnap, workflowSnap] = await Promise.all([tx.get(ref('courtAssignments', matchKey)), tx.get(ref('scoreWorkflows', matchKey))]);
+    if (!assignmentSnap.exists || !workflowSnap.exists) throw new HttpsError('not-found', 'Match workflow not found.');
+    const assignment = assignmentSnap.data(); const workflow = workflowSnap.data(); const state = assignment.courtId ? await courtState(tx, assignment.courtId) : null;
+    if (state && (state.queue.currentMatchKey !== matchKey || state.queue.queueRevision !== queueRevision)) callableError('stale_queue', 'aborted');
+    const lock = renewLease(validateLease(workflow, { uid, token, sessionId })); const id = recorderAuditId('renew', uid, matchKey, `${token}:${eventNonce}`);
+    touchRecorderGrant(tx, uid);
+    tx.update(workflowSnap.ref, { lock, lastTransitionId: id }); audit(tx, id, 'lease_renewed', matchKey, { uid, name: lock.recorderName }, { lock: workflow.lock }, { lock });
+    return { leaseExpiresAt: lock.expiresAt.toMillis(), transitionId: id };
+  });
 }
 export async function createRecorderAccessCode(request) {
   const uid = await admin(request, request.data); const code = randomCode(); const salt = crypto.randomBytes(24).toString('base64url');
@@ -195,6 +328,56 @@ export async function revokeRecorderAccessCode(request) {
   });
   return { revoked:true };
 }
+export async function listRecorderGrants(request) {
+  await admin(request, request.data);
+  const [grants, config, tournament] = await Promise.all([
+    root().collection('recorderGrants').get(),
+    ref('recorderAccess', 'config').get(),
+    root().get(),
+  ]);
+  const access = config.data();
+  const globallyEnabled = tournament.data()?.maintenance?.enabled !== true
+    && tournament.data()?.recorderFeatureEnabled === true
+    && config.exists
+    && access.enabled === true;
+  return { grants: grants.docs.slice(0, 500).map((snap) => {
+    const value = snap.data();
+    const expiresAt = value.expiresAt?.toMillis?.() || null;
+    const effectiveStatus = value.status === 'revoked'
+      ? 'revoked'
+      : expiresAt == null || expiresAt <= Date.now()
+        ? 'expired'
+        : !globallyEnabled
+          ? 'disabled'
+          : value.version !== access.version
+            ? 'superseded'
+            : 'active';
+    return {
+      uid: value.uid,
+      version: value.version,
+      status: value.status,
+      effectiveStatus,
+      issuedAt: value.issuedAt?.toMillis?.() || null,
+      lastUsedAt: value.lastUsedAt?.toMillis?.() || null,
+      expiresAt,
+    };
+  }) };
+}
+export async function revokeRecorderGrant(request) {
+  const actor = await admin(request, request.data);
+  const targetUid = request.data?.uid;
+  const eventNonce = crypto.randomUUID();
+  if (typeof targetUid !== 'string' || !targetUid || targetUid.length > 128) throw new HttpsError('invalid-argument', 'Grant uid required.');
+  return db().runTransaction(async (tx) => {
+    await assertTournamentWritable(tx);
+    const grant = await tx.get(ref('recorderGrants', targetUid));
+    if (!grant.exists) throw new HttpsError('not-found', 'Recorder grant not found.');
+    tx.update(grant.ref, { status: 'revoked', revokedAt: FieldValue.serverTimestamp() });
+    const id = recorderAuditId('grant_revoke', actor, targetUid, `${grant.data().version}:${eventNonce}`);
+    audit(tx, id, 'recorder_grant_revoked', null, { uid: actor }, { grant: { uid: targetUid, status: grant.data().status } }, { grant: { uid: targetUid, status: 'revoked' } });
+    return { revoked: true, uid: targetUid };
+  });
+}
 export async function prepareTournamentReset(request) {
   const uid = await admin(request, request.data);
   const expectedName = request.data?.expectedName;
@@ -215,14 +398,12 @@ export async function prepareTournamentReset(request) {
     tx.set(root(), {
       maintenance: {
         enabled: true,
-        reset: {
-          ownerUid: uid,
-          tokenHash: resetTokenHash(token),
-          phase: 'prepared',
-          preparedAt: FieldValue.serverTimestamp(),
-        },
+        reset: FieldValue.delete(),
       },
     }, { merge: true });
+    tx.set(ref('resetState', 'current'), {
+      ownerUid: uid, tokenHash: resetTokenHash(token), phase: 'prepared', preparedAt: FieldValue.serverTimestamp(),
+    });
   });
   return { prepared: true, token, tournamentName };
 }
@@ -232,26 +413,28 @@ export async function recoverTournamentReset(request) {
   let phase;
   await db().runTransaction(async (tx) => {
     const tournament = await tx.get(root());
-    const reset = tournament.data()?.maintenance?.reset;
+    const resetSnap = await tx.get(ref('resetState', 'current'));
+    const reset = resetSnap.data();
     const preparedAt = reset?.preparedAt?.toMillis?.() || 0;
-    const stale = Date.now() - preparedAt >= 15 * 60 * 1000;
+    const recoveryReference = reset?.phase === 'deleting'
+      ? reset?.deletionStartedAt?.toMillis?.() || 0
+      : preparedAt;
+    const stale = Date.now() - recoveryReference >= 15 * 60 * 1000;
     if (tournament.data()?.maintenance?.enabled !== true
         || !reset
-        || (reset.ownerUid !== uid && !stale)) {
+        || (reset.phase === 'deleting' && !stale)
+        || (reset.phase !== 'deleting' && reset.ownerUid !== uid && !stale)) {
       throw new HttpsError('failed-precondition', 'Active reset can only be recovered by its owner or after 15 minutes.');
     }
     phase = reset.phase;
-    tx.set(root(), {
-      maintenance: {
-        ...tournament.data().maintenance,
-        reset: {
-          ...reset,
-          ownerUid: uid,
-          tokenHash: resetTokenHash(token),
-          recoveredAt: FieldValue.serverTimestamp(),
-        },
-      },
-    }, { merge: true });
+    tx.update(resetSnap.ref, {
+      ownerUid: uid,
+      tokenHash: resetTokenHash(token),
+      phase: 'prepared',
+      executionFence: FieldValue.delete(),
+      deletionStartedAt: FieldValue.delete(),
+      recoveredAt: FieldValue.serverTimestamp(),
+    });
   });
   return { recovered: true, phase, token };
 }
@@ -259,10 +442,10 @@ async function resetOwner(request) {
   const uid = await admin(request, request.data, { allowResetMaintenance: true });
   const token = request.data?.token;
   if (typeof token !== 'string' || !token) throw new HttpsError('invalid-argument', 'Reset token required.');
-  const maintenance = (await root().get()).data()?.maintenance;
-  if (maintenance?.enabled !== true
-      || maintenance?.reset?.ownerUid !== uid
-      || maintenance?.reset?.tokenHash !== resetTokenHash(token)) {
+  const [tournament, reset] = await Promise.all([root().get(), ref('resetState', 'current').get()]);
+  if (tournament.data()?.maintenance?.enabled !== true
+      || reset.data()?.ownerUid !== uid
+      || reset.data()?.tokenHash !== resetTokenHash(token)) {
     throw new HttpsError('permission-denied', 'Current reset owner and token required.');
   }
   return { uid, token };
@@ -271,53 +454,69 @@ export async function cancelTournamentReset(request) {
   const { uid, token } = await resetOwner(request);
   await db().runTransaction(async (tx) => {
     const tournament = await tx.get(root());
-    const reset = tournament.data()?.maintenance?.reset;
+    const resetSnap = await tx.get(ref('resetState', 'current'));
+    const reset = resetSnap.data();
     if (tournament.data()?.maintenance?.enabled !== true
         || reset?.ownerUid !== uid
         || reset?.tokenHash !== resetTokenHash(token)
         || reset?.phase !== 'prepared') {
       throw new HttpsError('permission-denied', 'Current reset owner and token required.');
     }
-    // merge:true 는 중첩 맵을 병합하므로 enabled만 내리면 reset 리스가 문서에 남아
-    // 이후 복구(restore) 단계 callable이 영원히 maintenance로 차단된다. 명시적으로 지운다.
-    tx.set(root(), { maintenance: { enabled: false, reset: FieldValue.delete() } }, { merge: true });
+    tx.set(root(), { maintenance: { enabled: false } }, { merge: true });
+    tx.delete(resetSnap.ref);
   });
   return { cancelled: true };
 }
 export async function resetTournament(request) {
   const { uid, token } = await resetOwner(request);
+  const executionFence = crypto.randomUUID();
   await db().runTransaction(async (tx) => {
     const tournament = await tx.get(root());
-    const reset = tournament.data()?.maintenance?.reset;
+    const resetSnap = await tx.get(ref('resetState', 'current'));
+    const reset = resetSnap.data();
     if (tournament.data()?.maintenance?.enabled !== true
         || reset?.ownerUid !== uid
         || reset?.tokenHash !== resetTokenHash(token)
-        || !['prepared', 'deleting'].includes(reset?.phase)) {
+        || reset?.phase !== 'prepared') {
       throw new HttpsError('permission-denied', 'Current reset owner and token required.');
     }
-    tx.set(root(), {
-      maintenance: {
-        ...tournament.data().maintenance,
-        reset: { ...reset, phase: 'deleting', deletionStartedAt: FieldValue.serverTimestamp() },
-      },
-    }, { merge: true });
+    tx.update(resetSnap.ref, {
+      phase: 'deleting',
+      executionFence,
+      deletionStartedAt: FieldValue.serverTimestamp(),
+    });
   });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const collections = await root().listCollections();
-    const operational = collections.filter((subcollection) => subcollection.id !== 'admins');
+    const operational = collections.filter((subcollection) => !['admins', 'resetState'].includes(subcollection.id));
     await Promise.all(operational.map((subcollection) => db().recursiveDelete(subcollection)));
-    const remaining = (await root().listCollections()).filter((subcollection) => subcollection.id !== 'admins');
+    const remaining = (await root().listCollections()).filter((subcollection) => !['admins', 'resetState'].includes(subcollection.id));
     if (!remaining.length) break;
     if (attempt === 2) throw new HttpsError('internal', 'Tournament data deletion did not complete.');
   }
-  await root().set({
-    tournamentId: TOURNAMENT_ID,
-    name: '',
-    qualifyPerGroup: { men: 2, women: 2 },
-    recorderFeatureEnabled: false,
-    maintenance: { enabled: false },
-    courtTopologyRevision: 0,
-    venueDisplay: { mode: 'auto', intervalSeconds: 15 },
+  await db().runTransaction(async (tx) => {
+    const [tournament, resetSnap] = await Promise.all([
+      tx.get(root()),
+      tx.get(ref('resetState', 'current')),
+    ]);
+    const reset = resetSnap.data();
+    if (tournament.data()?.maintenance?.enabled !== true
+        || reset?.ownerUid !== uid
+        || reset?.tokenHash !== resetTokenHash(token)
+        || reset?.phase !== 'deleting'
+        || reset?.executionFence !== executionFence) {
+      throw new HttpsError('aborted', 'Reset execution was superseded.');
+    }
+    tx.set(root(), {
+      tournamentId: TOURNAMENT_ID,
+      name: '',
+      qualifyPerGroup: { men: 2, women: 2 },
+      recorderFeatureEnabled: false,
+      maintenance: { enabled: false },
+      courtTopologyRevision: 0,
+      venueDisplay: { mode: 'auto', intervalSeconds: 15 },
+    });
+    tx.delete(resetSnap.ref);
   });
   return { reset: true };
 }
@@ -326,14 +525,16 @@ export async function exchangeRecorderAccessCode(request) {
   const uid = request.auth?.uid;
   if (!uid) throw new HttpsError('unauthenticated', 'Authentication required.');
   const code = request.data?.code;
-  if (typeof code !== 'string' || !code.trim()) {
-    throw new HttpsError('invalid-argument', 'Code required.');
-  }
-  return db().runTransaction(async (tx) => {
-    const [tournament, adminSnap] = await Promise.all([
+  if (typeof code !== 'string' || !/^[A-Za-z0-9_-]{24}$/.test(code)) callableError('code_invalid', 'permission-denied');
+  const outcome = await db().runTransaction(async (tx) => {
+    const [tournament, adminSnap, failures, existingGrant] = await Promise.all([
       tx.get(root()),
       tx.get(ref('admins', uid)),
+      tx.get(ref('recorderFailures', uid)),
+      tx.get(ref('recorderGrants', uid)),
     ]);
+    const failure = failures.data();
+    if (failure?.cooldownUntil?.toMillis?.() > Date.now()) return { error: 'code_rate_limited' };
     if (!hasGoogleProvider(request) && !adminSnap.exists) {
       throw new HttpsError('permission-denied', 'Google recorder sign-in required.');
     }
@@ -342,26 +543,47 @@ export async function exchangeRecorderAccessCode(request) {
     }
     const config = await tx.get(ref('recorderAccess', 'config'));
     const data = config.data();
-    const suppliedHash = data ? hash(code.trim(), data.salt) : '';
+    const suppliedHash = data ? hash(code, data.salt) : '';
     const validHash = Boolean(
       config.exists
       && data.enabled
       && suppliedHash.length === data.codeHash?.length
       && crypto.timingSafeEqual(Buffer.from(suppliedHash), Buffer.from(data.codeHash)),
     );
-    if (!validHash) throw new HttpsError('permission-denied', 'Invalid access code.');
+    if (!validHash) {
+      const startedAt = failure?.windowStartedAt?.toMillis?.() || 0;
+      const withinWindow = Date.now() - startedAt < 15 * 60 * 1000;
+      const attempts = withinWindow ? (failure?.attempts || 0) + 1 : 1;
+      tx.set(ref('recorderFailures', uid), {
+        uid, attempts, windowStartedAt: withinWindow ? failure.windowStartedAt : Timestamp.now(),
+        cooldownUntil: attempts >= 5 ? Timestamp.fromMillis(Date.now() + 15 * 60 * 1000) : null,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { error: 'code_invalid' };
+    }
     const version = data.version;
+    if (existingGrant.exists
+        && existingGrant.data().status === 'revoked'
+        && existingGrant.data().version === version) {
+      return { error: 'grant_revoked' };
+    }
     tx.set(ref('recorderGrants', uid), {
       uid,
       version,
-      proofHash: data.codeHash,
       issuedAt: FieldValue.serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(Date.now() + 12 * 60 * 60 * 1000),
+      status: 'active',
     });
+    tx.delete(ref('recorderFailures', uid));
     // 과거 버전은 코드 생성 시 이 플래그를 켜지 않았다. 유효한 현재 코드를
     // 증명한 경우 함께 복구해 기존 발급 코드도 다시 만들지 않고 사용할 수 있게 한다.
     tx.set(root(), { recorderFeatureEnabled: true }, { merge: true });
     return { tournamentId: TOURNAMENT_ID, grantVersion: version };
   });
+  if (outcome.error === 'code_rate_limited') callableError('code_rate_limited', 'resource-exhausted');
+  if (outcome.error === 'grant_revoked') callableError('grant_revoked', 'permission-denied');
+  if (outcome.error) callableError('code_invalid', 'permission-denied');
+  return outcome;
 }
 export async function replaceCourtWorkflows(request) {
   const uid = await admin(request, request.data);
@@ -1814,11 +2036,21 @@ export async function rejectScoreReview(request) {
 export async function cancelRecorderDraft(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;
-  const { matchKey, courtId, token, queueRevision } = request.data || {};
+  const { matchKey, courtId, token, sessionId, queueRevision, operationId, discardDraft } = request.data || {};
+  if (!uid) throw new HttpsError('unauthenticated', 'Authentication required.');
   if (!matchKey || !token) {
     throw new HttpsError('invalid-argument', 'matchKey and token are required.');
   }
+  const opId = requireOperationId(operationId);
+  if (typeof sessionId !== 'string' || typeof discardDraft !== 'boolean') throw new HttpsError('invalid-argument', 'sessionId and discardDraft required.');
+  const fingerprint = operationFingerprint({ type: 'cancel', matchKey, courtId: courtId || null, discardDraft });
   return db().runTransaction(async (tx) => {
+    const operation = operationRef(uid, opId);
+    const prior = await tx.get(operation);
+    if (prior.exists) {
+      if (prior.data().fingerprint !== fingerprint) callableError('operation_mismatch', 'already-exists');
+      return prior.data().result;
+    }
     await recorder(tx, request);
     const [assignmentSnap, workflowSnap] = await Promise.all([
       tx.get(ref('courtAssignments', matchKey)),
@@ -1835,13 +2067,13 @@ export async function cancelRecorderDraft(request) {
       || state.queue.currentMatchKey !== matchKey
     ))
         || workflow.draftState !== 'editing'
-        || workflow.lock?.uid !== uid
-        || workflow.lock?.token !== token) {
+        || workflow.lock?.uid !== uid) {
       throw new HttpsError('aborted', 'Stale recorder ownership or queue revision.');
     }
+    validateLease(workflow, { uid, token, sessionId });
     const draftState = workflow.resumeDraftState === 'rejected' ? 'rejected' : 'idle';
     const publicStatus = draftState === 'rejected' ? 'replay_required' : 'scheduled';
-    const id = transitionId(matchKey, 'recorder_cancel', `${queueRevision ?? 'unassigned'}:${token}`);
+    const id = recorderAuditId('cancel', uid, matchKey, token);
     let queue = null;
     if (state) {
       const assignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus } };
@@ -1853,20 +2085,37 @@ export async function cancelRecorderDraft(request) {
         { draftState },
       );
     }
-    tx.update(ref('scoreWorkflows', matchKey), { draftState, lock: null, lastTransitionId: id });
+    const retainedDraft = discardDraft ? FieldValue.delete() : (workflow.draft || { sets: [] });
+    touchRecorderGrant(tx, uid);
+    tx.update(ref('scoreWorkflows', matchKey), {
+      draftState,
+      lock: null,
+      draft: retainedDraft,
+      draftRetention: discardDraft ? FieldValue.delete() : 'retained_after_cancel',
+      draftRetainedBy: discardDraft ? FieldValue.delete() : { uid, name: workflow.lock?.recorderName || null },
+      draftRetainedAt: discardDraft ? FieldValue.delete() : FieldValue.serverTimestamp(),
+      lastTransitionId: id,
+    });
     tx.update(ref('courtAssignments', matchKey), { publicStatus, lastTransitionId: id });
     if (state) tx.update(ref('courtQueues', assignment.courtId), { ...queue, lastTransitionId: id });
-    audit(tx, id, 'recorder_cancel', matchKey, uid, { workflow, queue: state?.queue || null }, { workflow: { ...workflow, draftState, lock: null }, queue });
-    return { transitionId: id, queueRevision: queue?.queueRevision ?? null };
+    audit(tx, id, 'recorder_cancel', matchKey, {
+      uid,
+      name: workflow.lock?.recorderName || null,
+      email: request.auth?.token?.email || null,
+    }, { workflow, queue: state?.queue || null }, { workflow: { ...workflow, draftState, lock: null }, queue });
+    const result = { transitionId: id, queueRevision: queue?.queueRevision ?? null, discardedDraft: discardDraft };
+    tx.create(operation, { uid, operationId: opId, type: 'cancel', fingerprint, result, createdAt: FieldValue.serverTimestamp() });
+    return result;
   });
 }
 
 export async function resumeRecorderDraft(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;
-  const { matchKey, courtId, recorderName, queueRevision } = request.data || {};
+  const { matchKey, courtId, recorderName, sessionId, queueRevision, takeover = false } = request.data || {};
   if (typeof matchKey !== 'string' || !matchKey || typeof courtId !== 'string' || !courtId
-      || typeof recorderName !== 'string' || !recorderName.trim()) {
+      || typeof recorderName !== 'string' || !recorderName.trim()
+      || typeof sessionId !== 'string' || sessionId.length < 16 || sessionId.length > 128) {
     throw new HttpsError('invalid-argument', 'Match, court and recorder name required.');
 }
   const normalizedRecorderName = recorderName.trim();
@@ -1897,8 +2146,11 @@ export async function resumeRecorderDraft(request) {
         || court.recorderName?.trim() !== normalizedRecorderName) {
       throw new HttpsError('permission-denied', 'Only the same recorder can resume this draft.');
 }
-    const nextLock = { uid, token, recorderName: normalizedRecorderName };
-    const id = `${transitionId(matchKey, 'recorder_resume', workflow.draftRevision || 0)}:${resetTokenHash(token).slice(0, 12)}`;
+    assertResolved(assignment);
+    if (!isExpired(workflow.lock) && workflow.lock.sessionId !== sessionId && takeover !== true) callableError('ownership_lost', 'aborted');
+    const nextLock = newLease(uid, token, normalizedRecorderName, sessionId);
+    const id = recorderAuditId('resume', uid, matchKey, token);
+    touchRecorderGrant(tx, uid);
     tx.update(workflowSnap.ref, { lock: nextLock, lastTransitionId: id });
     tx.update(assignmentSnap.ref, { lastTransitionId: id });
     audit(tx, id, 'recorder_resume', matchKey, {
@@ -1914,7 +2166,15 @@ export async function resumeRecorderDraft(request) {
       draftState: workflow.draftState,
       draftRevision: workflow.draftRevision || 0,
     });
-    result = { token, transitionId: id, resumed: true, draftRevision: workflow.draftRevision || 0 };
+    result = {
+      token,
+      sessionId,
+      leaseExpiresAt: nextLock.expiresAt.toMillis(),
+      transitionId: id,
+      resumed: true,
+      draftRevision: workflow.draftRevision || 0,
+      draft: workflow.draft || { sets: [] },
+    };
   });
   return result;
 }
@@ -1922,11 +2182,21 @@ export async function resumeRecorderDraft(request) {
 export async function submitRecorderDraft(request) {
   requireMain(request.data);
   const uid = request.auth?.uid;
-  const { matchKey, courtId, token, queueRevision, score } = request.data || {};
+  const { matchKey, courtId, token, sessionId, queueRevision, score, operationId } = request.data || {};
+  if (!uid) throw new HttpsError('unauthenticated', 'Authentication required.');
   if (!matchKey || !token) {
     throw new HttpsError('invalid-argument', 'matchKey and token are required.');
   }
+  const opId = requireOperationId(operationId);
+  if (typeof sessionId !== 'string') throw new HttpsError('invalid-argument', 'sessionId required.');
+  const fingerprint = operationFingerprint({ type: 'submit', matchKey, courtId: courtId || null, score });
   return db().runTransaction(async (tx) => {
+    const operation = operationRef(uid, opId);
+    const prior = await tx.get(operation);
+    if (prior.exists) {
+      if (prior.data().fingerprint !== fingerprint) callableError('operation_mismatch', 'already-exists');
+      return prior.data().result;
+    }
     await recorder(tx, request);
     const [assignmentSnap, workflowSnap] = await Promise.all([
       tx.get(ref('courtAssignments', matchKey)),
@@ -1943,10 +2213,13 @@ export async function submitRecorderDraft(request) {
       || state.queue.currentMatchKey !== matchKey
     ))
         || workflow.draftState !== 'editing'
-        || workflow.lock?.uid !== uid
-        || workflow.lock?.token !== token) {
+        || workflow.lock?.uid !== uid) {
       throw new HttpsError('aborted', 'Stale recorder ownership or queue revision.');
     }
+    validateLease(workflow, { uid, token, sessionId });
+    assertResolved(assignment);
+    const official = await tx.get(matchRef(assignment));
+    if (!official.exists || unresolvedOfficial(assignment, official.data())) callableError('unresolved_teams');
     const evaluated = evaluate(assignment, score?.sets);
     const submittedSnapshot = { sets: evaluated.sets };
     const submissionVersion = (workflow.submissionVersion || 0) + 1;
@@ -1955,10 +2228,9 @@ export async function submitRecorderDraft(request) {
       recorder: {
         uid,
         name: workflow.lock?.recorderName || request.auth?.token?.name || null,
-        email: request.auth?.token?.email || null,
       },
     };
-    const id = transitionId(matchKey, 'submission_complete', submissionVersion);
+    const id = recorderAuditId('submit', uid, matchKey, `${token}:${submissionVersion}`);
     let queue = null;
     if (state) {
       const assignments = { ...state.assignments, [matchKey]: { ...assignment, publicStatus: 'under_review' } };
@@ -1979,6 +2251,9 @@ export async function submitRecorderDraft(request) {
       submission,
       submittedAt: FieldValue.serverTimestamp(),
       rejectionReason: FieldValue.delete(),
+      draftRetention: FieldValue.delete(),
+      draftRetainedBy: FieldValue.delete(),
+      draftRetainedAt: FieldValue.delete(),
       lastTransitionId: id,
     });
     tx.update(ref('courtAssignments', matchKey), { publicStatus: 'under_review', lastTransitionId: id });
@@ -1994,6 +2269,7 @@ export async function submitRecorderDraft(request) {
       officialRevision: workflow.officialRevision || 0,
       lastTransitionId: id,
     };
+    touchRecorderGrant(tx, uid);
     audit(tx, id, 'submission_complete', matchKey, {
       uid,
       name: workflow.lock?.recorderName || request.auth?.token?.name || null,
@@ -2002,11 +2278,13 @@ export async function submitRecorderDraft(request) {
       workflow: submittedWorkflowAudit,
       queue,
     });
-    return {
+    const result = {
       transitionId: id,
       queueRevision: queue?.queueRevision ?? null,
       nextMatchKey: queue?.currentMatchKey ?? null,
     };
+    tx.create(operation, { uid, operationId: opId, type: 'submit', fingerprint, result, createdAt: FieldValue.serverTimestamp() });
+    return result;
   });
 }
 export async function forceReleaseWorkflow(request) {

@@ -64,7 +64,9 @@ service cloud.firestore {
         && root.data.recorderFeatureEnabled == true
         && config.data.enabled == true
         && grant.data.uid == request.auth.uid
-        && grant.data.version == config.data.version;
+        && grant.data.version == config.data.version
+        && grant.data.status == 'active'
+        && grant.data.expiresAt > request.time;
     }
 
     function validRecorderAuditPayload(tournamentId, transitionId) {
@@ -314,13 +316,7 @@ service cloud.firestore {
         allow get: if isMain(tournamentId)
           && (isAdmin() || hasCurrentRecorderGrant(tournamentId));
         allow list: if isMain(tournamentId) && isAdmin();
-        allow update: if isMain(tournamentId)
-          && hasCurrentRecorderGrant(tournamentId)
-          && isCurrentMatch(tournamentId, matchKey)
-          && request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['publicStatus', 'attemptCount', 'lastTransitionId'])
-          && request.resource.data.lastTransitionId is string
-          && validAssignmentClaim(tournamentId, matchKey);
+        allow update: if false;
         allow create, delete: if false;
       }
       match /courtQueues/{courtId} {
@@ -352,38 +348,20 @@ service cloud.firestore {
           && isCurrentMatch(tournamentId, matchKey)
           && resource.data.lock == null
           && resource.data.draftState in ['idle', 'rejected'];
+        // Keep an already-open listener readable while an admin approval/direct
+        // score atomically advances the court queue. Queries remain closed.
+        allow get: if isMain(tournamentId)
+          && hasCurrentRecorderGrant(tournamentId)
+          && resource.data.lock == null
+          && resource.data.draftState in ['submitted', 'approved'];
         allow list: if isMain(tournamentId) && isAdmin();
-        allow update: if isMain(tournamentId)
-          && hasCurrentRecorderGrant(tournamentId)
-          && isCurrentMatch(tournamentId, matchKey)
-          && validClaim(tournamentId, matchKey)
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            'draftState', 'resumeDraftState', 'lock', 'lastTransitionId'
-          ]);
-        allow update: if isMain(tournamentId)
-          && hasCurrentRecorderGrant(tournamentId)
-          && validDraftSave(tournamentId, matchKey)
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            'draft', 'draftRevision', 'lastTransitionId'
-          ]);
+        allow update: if false;
         allow create, delete: if false;
       }
       match /auditEvents/{transitionId} {
         allow read: if isMain(tournamentId) && isAdmin();
         allow update, delete: if false;
-        allow create: if isMain(tournamentId)
-          && request.auth != null
-          && hasCurrentRecorderGrant(tournamentId)
-          && isNotMaintained(tournamentId)
-          && transitionId.size() <= 512
-          && transitionId.matches('^recorder:.*')
-          && request.resource.data.transitionId == transitionId
-          && request.resource.data.actor.uid == request.auth.uid
-          && request.resource.data.createdAt == request.time
-          && request.resource.data.matchKey is string
-          && validRecorderAuditPayload(tournamentId, transitionId)
-          && getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(request.resource.data.matchKey)).data.lastTransitionId
-              == transitionId;
+        allow create: if false;
       }
 
       // These collections are function-private, including for seeded admins.
@@ -392,6 +370,9 @@ service cloud.firestore {
         allow list, write: if false;
       }
       match /recorderAccess/{document=**} { allow read, write: if false; }
+      match /recorderOperations/{document=**} { allow read, write: if false; }
+      match /recorderFailures/{document=**} { allow read, write: if false; }
+      match /resetState/{document=**} { allow read, write: if false; }
       match /migrationManifests/{manifestId} { allow read, write: if false; }
       match /officialRevisions/{revisionId} {
         allow read: if isMain(tournamentId) && isAdmin();

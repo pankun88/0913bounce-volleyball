@@ -654,6 +654,44 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 
 .footer-note { text-align:center; color: var(--muted); font-size: 12px; margin-top: 30px; }
 
+.recorder-code-guidance { margin: 0 0 12px; }
+.recorder-runbook {
+  margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line);
+  border-radius: 10px; background: #fffaf1; font-size: 13px;
+}
+.recorder-runbook ul { margin: 6px 0 0; padding-left: 20px; }
+.recorder-runbook li + li { margin-top: 5px; }
+.recorder-grant-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin-top: 18px;
+}
+.recorder-grant-header h3 { margin: 0; font-size: 15px; }
+.recorder-grant-list { display: grid; gap: 8px; margin-top: 8px; }
+.recorder-grant-card {
+  display: grid; grid-template-columns: minmax(120px, 1fr) auto minmax(220px, 2fr) auto;
+  align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px;
+}
+.recorder-uid {
+  border: 0; background: transparent; padding: 0; text-align: left; font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--red-dark); cursor: pointer;
+}
+.recorder-uid:hover, .recorder-uid:focus-visible { text-decoration: underline; }
+.recorder-grant-details { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; }
+.recorder-grant-details span { display: grid; gap: 2px; }
+.recorder-grant-details small { color: var(--muted); }
+.recorder-grant-state {
+  white-space: nowrap; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700;
+}
+.recorder-grant-state.active { color: #176b3a; background: #e4f6e9; }
+.recorder-grant-state.expired { color: #795b00; background: #fff2c2; }
+.recorder-grant-state.revoked { color: #9b2626; background: #fde6e6; }
+
+@media (max-width: 640px) {
+  .recorder-grant-card { grid-template-columns: 1fr auto; }
+  .recorder-grant-details { grid-column: 1 / -1; }
+  .recorder-grant-card .btn { grid-column: 1 / -1; width: 100%; }
+}
+
 /* ---- 관리자 페이지 로그인 화면 ---- */
 .login-screen {
   position: fixed;
