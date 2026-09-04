@@ -1735,18 +1735,6 @@ function bindStaticHandlers() {
       invalidateCorrectionPreview("정정을 적용했습니다. 대기열이 서버 계획으로 갱신되었습니다.");
     }
   });
-  document.getElementById("createMigrationBtn").addEventListener("click", async (e) => {
-    const manifestId = document.getElementById("migrationManifestId").value.trim();
-    if (!manifestId) return showToast("manifest ID를 입력하세요.");
-    const result = await runWorkflowButton(e.currentTarget, "migration manifest 생성", () => adminWorkflowCallable("createMigrationManifest", { manifestId }));
-    if (result) document.getElementById("workflowStatus").textContent = `manifest ${manifestId}: ${result.status}, unresolved ${result.unresolvedCount ?? 0}`;
-  });
-  document.getElementById("applyMigrationBtn").addEventListener("click", async (e) => {
-    const manifestId = document.getElementById("migrationManifestId").value.trim();
-    if (!manifestId) return showToast("manifest ID를 입력하세요.");
-    const result = await runWorkflowButton(e.currentTarget, "migration manifest 적용", () => adminWorkflowCallable("applyMigrationManifest", { manifestId }));
-    if (result?.applied) document.getElementById("workflowStatus").textContent = `manifest ${manifestId}를 적용했습니다.`;
-  });
 }
 
 /** 현재 전체 데이터를 JSON 파일 하나로 저장(되돌릴 수 있는 백업) */

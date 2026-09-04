@@ -55,7 +55,6 @@ service cloud.firestore {
       match /recorderAccess/{document=**} { allow read, write: if false; }
       match /scoreWorkflows/{matchKey} { allow read, write: if false; }
       match /auditEvents/{transitionId} { allow read, write: if false; }
-      match /migrationManifests/{manifestId} { allow read, write: if false; }
       match /restoreManifests/{manifestId} { allow read, write: if false; }
       match /{document=**} { allow read, write: if false; }
     }

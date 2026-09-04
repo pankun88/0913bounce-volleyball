@@ -1,7 +1,6 @@
 import { getApps, initializeApp } from 'firebase-admin/app';
 import { onCall } from 'firebase-functions/v2/https';
 import * as adminWorkflow from './admin-workflow.js';
-import * as migration from './migration.js';
 import * as restore from './restore.js';
 
 if (!getApps().length) initializeApp();
@@ -33,8 +32,6 @@ export const directEditOfficialScore = callable(adminWorkflow.directEditOfficial
 export const forceReleaseWorkflow = callable(adminWorkflow.forceReleaseWorkflow);
 export const previewApprovedCorrection = callable(adminWorkflow.previewApprovedCorrection);
 export const applyApprovedCorrection = callable(adminWorkflow.applyApprovedCorrection);
-export const createMigrationManifest = callable(migration.createMigrationManifest);
-export const applyMigrationManifest = callable(migration.applyMigrationManifest);
 export const beginRestore = callable(restore.beginRestore);
 export const supersedeRestore = callable(restore.supersedeRestore);
 export const resumeRestore = callable(restore.resumeRestore);

@@ -802,7 +802,6 @@ export async function runFunctionsSuite() {
     const preparedCancellation = await call(functions, 'prepareTournamentReset', resetData);
     assert.equal(preparedCancellation.prepared, true, 'reset-prepare-seeded-admin-succeeds');
     await assert.rejects(call(functions, 'createRecorderAccessCode', data), /maintenance/i, 'reset-maintenance-rejects-admin-callables');
-    await assert.rejects(call(functions, 'createMigrationManifest', { ...data, manifestId: 'blocked-reset-migration' }), /maintenance/i, 'reset-maintenance-rejects-migration');
     await assert.rejects(call(functions, 'beginRestore', {
       ...data, manifestId: 'blocked-reset-restore', rootData: {}, chunks: [],
     }), /maintenance/i, 'reset-maintenance-rejects-restore');
@@ -1371,9 +1370,6 @@ export async function runFunctionsSuite() {
       'correction-token-reuse-zero-write',
     );
 
-    const manifest = await call(functions, 'createMigrationManifest', { ...data, manifestId: 'migration-idempotent' });
-    const repeated = await call(functions, 'createMigrationManifest', { ...data, manifestId: 'migration-idempotent' });
-    assert.equal(repeated.manifestId, manifest.manifestId, 'migration-idempotency');
     await f.seed(async (db) => {
       await setDoc(doc(db, path('prelimMatches', 'approval-prelim')), {
         teamA: 'approval-a',

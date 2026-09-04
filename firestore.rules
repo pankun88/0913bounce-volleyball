@@ -373,7 +373,6 @@ service cloud.firestore {
       match /recorderOperations/{document=**} { allow read, write: if false; }
       match /recorderFailures/{document=**} { allow read, write: if false; }
       match /resetState/{document=**} { allow read, write: if false; }
-      match /migrationManifests/{manifestId} { allow read, write: if false; }
       match /officialRevisions/{revisionId} {
         allow read: if isMain(tournamentId) && isAdmin();
         allow write: if false;
