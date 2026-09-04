@@ -123,6 +123,110 @@ export function backupFromServerExport(response) {
   return normalizeV3(backup);
 }
 
+function legacyTransition(matchKey) {
+  return `legacy-import:${matchKey}`;
+}
+
+function legacyOperationalPair(match, matchType, division) {
+  const matchKey = matchType === "final" ? `final:${division}:${match.id}` : match.id;
+  const source = { ...match.data };
+  const completed = source.status === "done";
+  const officialRevision = completed ? 1 : 0;
+  const transitionId = legacyTransition(matchKey);
+  if (!source.nextMatchId) source.nextSlot = null;
+  if (completed) {
+    source.officialRevision = officialRevision;
+    source.officialCurrent = true;
+    source.lastTransitionId = transitionId;
+  }
+  return {
+    match: { id: match.id, data: source },
+    assignment: {
+      id: matchKey,
+      data: {
+        matchKey,
+        matchType,
+        matchId: match.id,
+        division,
+        divisionId: division,
+        courtId: null,
+        courtOrder: null,
+        nextCourtMatchKey: null,
+        nextMatchId: source.nextMatchId || null,
+        nextSlot: source.nextSlot || null,
+        dependencyReady: Boolean(source.teamA && source.teamB),
+        publicStatus: completed ? "completed" : "scheduled",
+        attemptCount: 0,
+        officialRevision,
+        lastTransitionId: transitionId,
+      },
+    },
+    workflow: {
+      id: matchKey,
+      data: {
+        matchKey,
+        draftState: completed ? "approved" : "idle",
+        lock: null,
+        draft: { sets: Array.isArray(source.sets) ? source.sets : [] },
+        draftRevision: 0,
+        submissionVersion: 0,
+        officialRevision,
+        officialSnapshot: completed ? source : null,
+        lastTransitionId: transitionId,
+      },
+    },
+  };
+}
+
+/**
+ * Initial single-division backups predate division, court and workflow data.
+ * The caller must choose the destination division explicitly.
+ */
+export function upgradeLegacyBackup(rawData, division) {
+  const data = safeBackupValue(rawData);
+  if (!data || data.app !== "bounce-volleyball" || data.type !== "backup" || data.version !== 1
+      || data.tournamentId !== "main" || !["men", "women"].includes(division)
+      || !Array.isArray(data.groups) || !Array.isArray(data.teams)
+      || !Array.isArray(data.prelimMatches) || !Array.isArray(data.finalMatches)) {
+    invalidBackup();
+  }
+  [data.groups, data.teams, data.prelimMatches, data.finalMatches].forEach(documentArray);
+  const prelimPairs = data.prelimMatches.map((match) => legacyOperationalPair(match, "prelim", division));
+  const finalPairs = data.finalMatches.map((match) => legacyOperationalPair(match, "final", division));
+  const pairs = [...prelimPairs, ...finalPairs];
+  const qualify = Number.isInteger(data.info?.qualifyPerGroup) && data.info.qualifyPerGroup > 0
+    ? data.info.qualifyPerGroup
+    : 2;
+  return normalizeV3({
+    app: "bounce-volleyball",
+    type: "backup",
+    version: 3,
+    tournamentId: "main",
+    info: {
+      name: typeof data.info?.name === "string" ? data.info.name : "",
+      qualifyPerGroup: { men: 2, women: 2, [division]: qualify },
+      courtTopologyRevision: 0,
+      venueDisplay: { mode: "auto", intervalSeconds: 15 },
+    },
+    groups: data.groups.map((item) => ({ id: item.id, data: { ...item.data, division } })),
+    teams: data.teams.map((item) => ({ id: item.id, data: { ...item.data, division } })),
+    prelimMatches: prelimPairs.map((item) => ({
+      ...item.match,
+      data: { ...item.match.data, division },
+    })),
+    finalMatches: {
+      men: division === "men" ? finalPairs.map((item) => item.match) : [],
+      women: division === "women" ? finalPairs.map((item) => item.match) : [],
+    },
+    officialRevisions: [],
+    courts: [],
+    courtAssignments: pairs.map((item) => item.assignment),
+    courtQueues: [],
+    scoreWorkflows: pairs.map((item) => item.workflow),
+    auditEvents: [],
+  });
+}
+
 function documentArray(value) {
   if (!Array.isArray(value)) invalidBackup();
   const ids = new Set();

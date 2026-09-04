@@ -151,6 +151,15 @@
             <button class="btn" id="restoreBtn">백업 파일에서 복원</button>
             <input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none;" />
           </div>
+          <label class="legacy-restore-option" for="legacyRestoreDivision">
+            초기 버전(v1) 백업의 경기 부문
+            <select id="legacyRestoreDivision">
+              <option value="">파일명·대회명으로 자동 판별</option>
+              <option value="men">남자부</option>
+              <option value="women">여자부</option>
+            </select>
+          </label>
+          <p class="empty-hint" style="margin:8px 0 0;">초기 백업에는 남녀 부문 정보가 없으므로 자동 판별이 어려울 때만 직접 선택하세요.</p>
           <p class="empty-hint" style="margin:10px 0 0; color:#c0392b;">복원하면 현재 입력된 데이터가 백업 파일 내용으로 <b>전부 대체</b>됩니다.</p>
         </div>
 

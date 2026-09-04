@@ -20,6 +20,7 @@ import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
 import { orderExistingRoundRobinMatchIds } from "./schedule.js";
 import { adminWorkflowCallable } from "./workflow-service.js";
 import { reconcilePlannerAssignments } from "./score-workflow.js";
+import { upgradeLegacyBackup } from "./backup-format.js";
 import {
   courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
 } from "./court-display.js";
@@ -1748,11 +1749,30 @@ async function handleBackup() {
 /** 선택한 백업 파일로 전체 데이터를 복원(현재 데이터는 전부 대체됨) */
 async function handleRestoreFile(e) {
   const file = e.target.files && e.target.files[0];
-  e.target.value = ""; // 같은 파일 다시 선택해도 change 이벤트가 또 뜨도록 비워둔다
+  e.target.value = ""; // 같은 파일 다시 선택해도 change 이벤트이 또 뜨도록 비워둔다
   if (!file) return;
-  if (!confirm("백업 파일로 복원하면 현재 입력된 모든 데이터(팀·조·예선·본선)가 백업 내용으로 전부 대체됩니다.\n계속할까요?")) return;
   try {
-    const data = JSON.parse(await file.text());
+    const raw = JSON.parse(await file.text());
+    let data = raw;
+    let legacyDivision = "";
+    if (raw?.version === 1) {
+      const explicitDivision = document.getElementById("legacyRestoreDivision")?.value || "";
+      const legacyHint = `${file.name} ${raw.info?.name || ""}`;
+      const inferredDivision = /(?:girl|여자|여성|여초|소녀)/i.test(legacyHint)
+        ? "women"
+        : /(?:boy|남자|남성|남초)/i.test(legacyHint)
+          ? "men"
+          : "";
+      legacyDivision = explicitDivision || inferredDivision;
+      if (!legacyDivision) {
+        throw new Error("초기 버전 백업의 경기 부문을 남자부 또는 여자부로 먼저 선택하세요.");
+      }
+      data = upgradeLegacyBackup(raw, legacyDivision);
+    }
+    const legacyNotice = legacyDivision
+      ? `\n\n초기 버전 데이터를 ${legacyDivision === "women" ? "여자부" : "남자부"}로 변환해 복원합니다.`
+      : "";
+    if (!confirm(`백업 파일로 복원하면 현재 입력된 모든 데이터(팀·조·예선·본선)가 백업 내용으로 전부 대체됩니다.${legacyNotice}\n계속할까요?`)) return;
     await importAllData(data);
     showToast("백업에서 복원했습니다");
   } catch (err) {

@@ -12,7 +12,7 @@ import { generateBracket, recordMatchResult, invalidateDescendantResults, groupB
 import { generateRoundRobin, orderExistingRoundRobinMatchIds } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
 import {
-  backupFromServerExport, normalizeBackupData, restorableRootData, selectRestoreRecovery,
+  backupFromServerExport, normalizeBackupData, restorableRootData, selectRestoreRecovery, upgradeLegacyBackup,
 } from './backup-format.js';
 import {
   courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
@@ -145,6 +145,44 @@ for (const [label, backup] of [['women', legacyBackup], ['men', legacyMenBackup]
   }
   check(`legacy ${label} backup is rejected instead of pseudo-migrated`, rejected);
 }
+const upgradedLegacy = upgradeLegacyBackup({
+  ...legacyBackup,
+  app: 'bounce-volleyball',
+  tournamentId: 'main',
+  prelimMatches: [{
+    id: 'p1',
+    data: {
+      id: 'p1', groupId: 'g1', teamA: { id: 't1', name: '팀1' },
+      teamB: { id: 't2', name: '팀2' }, sets: [{ a: 10, b: 8 }, { a: 10, b: 7 }],
+      status: 'done', result: 'A',
+    },
+  }],
+  teams: [
+    { id: 't1', data: { name: '팀1', groupId: 'g1' } },
+    { id: 't2', data: { name: '팀2', groupId: 'g1' } },
+  ],
+  finalMatches: [{
+    id: 'f1',
+    data: {
+      id: 'f1', round: 1, index: 0, teamA: { id: 't1', name: '팀1' },
+      teamB: { id: 't2', name: '팀2' }, sets: [], status: 'pending',
+      nextMatchId: null, nextSlot: 'A',
+    },
+  }],
+}, 'women');
+check('legacy v1 upgrade assigns every business document to selected division',
+  upgradedLegacy.groups[0].data.division === 'women'
+  && upgradedLegacy.teams.every((item) => item.data.division === 'women')
+  && upgradedLegacy.prelimMatches[0].data.division === 'women'
+  && upgradedLegacy.finalMatches.women.length === 1
+  && upgradedLegacy.finalMatches.men.length === 0);
+check('legacy v1 upgrade creates complete assignment-workflow pairs',
+  upgradedLegacy.courtAssignments.length === 2
+  && upgradedLegacy.scoreWorkflows.length === 2
+  && upgradedLegacy.courtAssignments.every((item) => item.data.attemptCount === 0)
+  && upgradedLegacy.scoreWorkflows.some((item) => item.id === 'p1' && item.data.draftState === 'approved'));
+check('legacy v1 upgrade removes invalid championship downstream slot',
+  upgradedLegacy.finalMatches.women[0].data.nextSlot === null);
 
 const protectedRoot = {
   name: '복원 대회',

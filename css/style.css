@@ -618,6 +618,12 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   .review-score-table tbody th { font-size: 12px; }
   .review-score-table tbody td { font-size: 28px; }
   .review-info-chip { width: 100%; justify-content: space-between; }
+  .legacy-restore-option {
+    align-items: stretch;
+    flex-direction: column;
+    width: 100%;
+  }
+  .legacy-restore-option select { width: 100%; min-width: 0; }
   .review-actions { display: grid; grid-template-columns: repeat(2, 1fr); }
   .review-actions .btn { width: 100%; }
 }
@@ -758,6 +764,19 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 .recorder-grant-header {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   margin-top: 18px;
+}
+.legacy-restore-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+.legacy-restore-option select {
+  min-width: 220px;
 }
 .recorder-grant-header h3 { margin: 0; font-size: 15px; }
 .recorder-grant-list { display: grid; gap: 8px; margin-top: 8px; }
