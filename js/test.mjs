@@ -191,6 +191,25 @@ check('v3 backup accepts empty business document lists',
   emptyV3Backup.groups.length === 0 && emptyV3Backup.teams.length === 0 &&
   emptyV3Backup.prelimMatches.length === 0 && emptyV3Backup.finalMatches.men.length === 0 &&
   emptyV3Backup.finalMatches.women.length === 0 && emptyV3Backup.auditEvents.length === 0);
+const legacyFinalAssignmentBackup = normalizeBackupData({
+  ...emptyV3Backup,
+  courtAssignments: [{
+    id: 'final:men:m_r1_0',
+    data: { matchKey: 'final:men:m_r1_0', matchType: 'final', publicStatus: 'scheduled' },
+  }],
+});
+check('v3 backup normalizes missing legacy assignment attempt count',
+  legacyFinalAssignmentBackup.courtAssignments[0].data.attemptCount === 0);
+let malformedAttemptCountRejected = false;
+try {
+  normalizeBackupData({
+    ...emptyV3Backup,
+    courtAssignments: [{ id: 'bad', data: { matchKey: 'bad', attemptCount: '0' } }],
+  });
+} catch {
+  malformedAttemptCountRejected = true;
+}
+check('v3 backup still rejects non-integer assignment attempt count', malformedAttemptCountRejected);
 let unexpectedEnvelopeRejected = false;
 try {
   normalizeBackupData({ ...emptyV3Backup, maintenance: { enabled: true } });

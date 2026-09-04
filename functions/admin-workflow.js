@@ -1226,6 +1226,7 @@ export async function publishFinalStructure(request) {
         nextCourtMatchKey: oldAssignment?.nextCourtMatchKey || null,
         nextMatchId: match.nextMatchId || null, nextSlot: match.nextSlot || null,
         dependencyReady: Boolean(match.teamA && match.teamB), publicStatus: revision ? 'completed' : 'scheduled',
+        attemptCount: oldAssignment?.attemptCount || 0,
         officialRevision: revision, lastTransitionId: transition,
       };
       const nextWorkflow = {

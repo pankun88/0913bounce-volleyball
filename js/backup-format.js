@@ -212,6 +212,7 @@ function normalizeV3(data) {
   documentArray(data.finalMatches.men);
   documentArray(data.finalMatches.women);
   data.courtAssignments.forEach(({ data: assignment }) => {
+    if (assignment.attemptCount == null) assignment.attemptCount = 0;
     if (!Number.isInteger(assignment.attemptCount) || assignment.attemptCount < 0) invalidBackup();
   });
   validateQueueBackup(data.courtQueues, data.courtAssignments, data.scoreWorkflows);
