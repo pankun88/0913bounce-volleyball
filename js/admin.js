@@ -3090,6 +3090,7 @@ function finalStructureMatch(match) {
     structure.teamASource = null;
     structure.teamBSource = null;
   }
+  if (!structure.nextMatchId) structure.nextSlot = null;
   return structure;
 }
 

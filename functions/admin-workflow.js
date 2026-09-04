@@ -931,7 +931,9 @@ export async function publishFinalStructure(request) {
       throw new HttpsError('invalid-argument', 'Final matches must contain unique structure-only records.');
     }
     ids.add(input.id);
-    byId.set(input.id, bounded(input));
+    const normalizedInput = bounded(input);
+    if (!normalizedInput.nextMatchId) normalizedInput.nextSlot = null;
+    byId.set(input.id, normalizedInput);
   }
   for (const matchId of staged.keys()) if (!byId.has(matchId)) bad('Score draft references an unknown final match.');
 

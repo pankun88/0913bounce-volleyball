@@ -434,6 +434,13 @@ check('8 teams -> bracketSize 8', bs8 === 8);
 check('8 teams -> totalRounds 3', tr8 === 3);
 check('8 teams -> 7 matches (no 3rd place match)', m8.length === 7);
 check('no byes among 8 teams', m8.filter((m) => m.status === 'bye').length === 0);
+check('championship has no downstream match or slot', (() => {
+  const championship = m8.find((m) => m.round === tr8);
+  return championship.nextMatchId === null && championship.nextSlot === null;
+})());
+check('non-championship matches keep paired downstream ids and slots', m8
+  .filter((m) => m.round < tr8)
+  .every((m) => m.nextMatchId && ['A', 'B'].includes(m.nextSlot)));
 
 // simulate full run: round1 (4 matches), winners always teamA
 let round1 = m8.filter((m) => m.round === 1);

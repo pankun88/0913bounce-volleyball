@@ -331,7 +331,7 @@ export async function runFunctionsSuite() {
             teamB: null,
             teamBSource: null,
             nextMatchId: null,
-            nextSlot: null,
+            nextSlot: 'A',
           },
         ],
       });
@@ -346,7 +346,8 @@ export async function runFunctionsSuite() {
       assert.deepEqual(publishedDownstream.data().teamA, { id: 'bye-team', name: 'bye-team' }, 'final-publication-canonicalizes-bye-downstream-entrant');
       assert.deepEqual(publishedDownstream.data().teamASource, {
         type: 'upstream', matchKey: 'final:men:published-confirmed-bye',
-      }, 'final-publication-retains-bye-downstream-source');
+      }, 'final-publication-persists-upstream-source');
+      assert.equal(publishedDownstream.data().nextSlot, null, 'final-publication-normalizes-legacy-championship-next-slot');
       for (const field of [
         'score', 'sets', 'result', 'winner',
         'setsWonA', 'setsWonB', 'pointsForA', 'pointsForB',

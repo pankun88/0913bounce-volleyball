@@ -255,7 +255,7 @@ export function generateBracket(teamsInSeedOrder) {
       winnerTeam: null,
       byeCandidate,
       nextMatchId: totalRounds > 1 ? `m_r2_${Math.floor(i / 2)}` : null,
-      nextSlot: i % 2 === 0 ? 'A' : 'B',
+      nextSlot: totalRounds > 1 ? (i % 2 === 0 ? 'A' : 'B') : null,
     });
   }
 
@@ -278,7 +278,7 @@ export function generateBracket(teamsInSeedOrder) {
         winnerTeam: null,
         byeCandidate: null,
         nextMatchId: r < totalRounds ? `m_r${r + 1}_${Math.floor(i / 2)}` : null,
-        nextSlot: i % 2 === 0 ? 'A' : 'B',
+        nextSlot: r < totalRounds ? (i % 2 === 0 ? 'A' : 'B') : null,
       });
     }
   }
