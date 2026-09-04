@@ -664,6 +664,26 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   font-weight: 800;
   font-size: 13px;
 }
+.team-pill .group-pill-name {
+  min-width: 1.5em;
+}
+.team-pill .group-pill-action {
+  min-height: 32px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(47, 128, 113, .1);
+  color: var(--theme-primary-dark);
+  cursor: pointer;
+}
+.team-pill .group-pill-action:hover,
+.team-pill .group-pill-action:focus-visible {
+  background: rgba(47, 128, 113, .2);
+}
+.team-pill .group-pill-action.delete {
+  padding-inline: 7px;
+  background: rgba(192, 57, 43, .08);
+  color: var(--red);
+}
 .team-pill[draggable="true"] {
   cursor: grab;
 }

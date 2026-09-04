@@ -62,6 +62,13 @@ export async function addGroup(name, division) {
   await addDoc(groupsCol(), { name, division, order: Date.now() });
 }
 
+export async function renameGroup(groupId, name) {
+  if (typeof groupId !== "string" || !groupId || typeof name !== "string" || !name.trim()) {
+    throw new Error("조 ID와 새 이름이 필요합니다.");
+  }
+  await updateDoc(doc(db, "tournaments", TID, "groups", groupId), { name: name.trim() });
+}
+
 /** 조 카드의 드래그 순서를 저장한다. */
 export async function reorderGroups(orderedGroupIds) {
   const batch = writeBatch(db);

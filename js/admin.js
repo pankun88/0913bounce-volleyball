@@ -5,7 +5,7 @@ import {
 import { watchAuthState, login, logout, requestPasswordReset, changePassword, describeAuthError } from "./auth-service.js";
 import {
   saveTournamentInfo, subscribeTournamentInfo,
-  addGroup, reorderGroups, subscribeGroups,
+  addGroup, renameGroup, reorderGroups, subscribeGroups,
   addTeam, moveAndReorderTeam, subscribeTeams,
   mutatePrelimStructure, subscribePrelimMatches, reorderPrelimMatches,
   setGroupMatchMode, setGroupRingOrder,
@@ -1884,8 +1884,43 @@ function renderGroupList() {
     const pill = document.createElement("span");
     pill.className = "team-pill reorder-pill";
     pill.draggable = true;
-    pill.innerHTML = `${escapeHtml(g.name)} <button title="삭제">✕</button>`;
-    pill.querySelector("button").addEventListener("click", async () => {
+    const label = document.createElement("span");
+    label.className = "group-pill-name";
+    label.textContent = g.name;
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.className = "group-pill-action";
+    renameButton.title = "조 이름 변경";
+    renameButton.setAttribute("aria-label", `${g.name} 조 이름 변경`);
+    renameButton.textContent = "수정";
+    renameButton.addEventListener("click", async () => {
+      const entered = prompt(`'${g.name}'의 새 조 이름을 입력하세요.`, g.name);
+      if (entered == null) return;
+      const nextName = entered.trim().replace(/\s+/g, " ");
+      if (!nextName) return showToast("조 이름을 입력하세요.");
+      if (nextName.length > 40) return showToast("조 이름은 40자 이내로 입력하세요.");
+      if (normalizeEntryName(nextName) === normalizeEntryName(g.name)) return;
+      if (groups.some((group) => group.id !== g.id
+        && normalizeEntryName(group.name) === normalizeEntryName(nextName))) {
+        return showToast("이미 등록된 조 이름입니다.");
+      }
+      renameButton.disabled = true;
+      try {
+        await renameGroup(g.id, nextName);
+        showToast(`'${g.name}'을(를) '${nextName}'으로 변경했습니다.`);
+      } catch (err) {
+        reportError("조 이름 변경", err);
+      } finally {
+        renameButton.disabled = false;
+      }
+    });
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "group-pill-action delete";
+    deleteButton.title = "삭제";
+    deleteButton.setAttribute("aria-label", `${g.name} 조 삭제`);
+    deleteButton.textContent = "✕";
+    deleteButton.addEventListener("click", async () => {
       if (!confirm(`${divisionLabel()} '${g.name}' 조를 삭제할까요? (소속 팀은 무소속이 됩니다)`)) return;
       try {
         await mutatePrelimStructureAndRefresh("delete_group", { groupId: g.id });
@@ -1893,6 +1928,7 @@ function renderGroupList() {
         reportError("조 삭제", err);
       }
     });
+    pill.append(label, renameButton, deleteButton);
     pill.addEventListener("dragstart", (e) => {
       e.dataTransfer.setData("application/x-bounce-group", g.id);
       e.dataTransfer.effectAllowed = "move";
