@@ -1079,6 +1079,58 @@ function scoreReviewDisplay(assignment) {
   };
 }
 
+function buildReviewScoreboard(display, scoreSource, isSubmitted) {
+  const sets = Array.isArray(scoreSource?.sets)
+    ? scoreSource.sets.filter((set) => Number.isInteger(set?.a) && Number.isInteger(set?.b))
+    : [];
+  if (!sets.length) return null;
+  const winsA = sets.filter((set) => set.a > set.b).length;
+  const winsB = sets.filter((set) => set.b > set.a).length;
+  const board = document.createElement("section");
+  board.className = "review-scoreboard";
+  board.setAttribute("aria-label", `${display.teamA} 대 ${display.teamB} 세트별 ${isSubmitted ? "제출" : "임시"} 점수`);
+
+  const heading = document.createElement("div");
+  heading.className = "review-score-heading";
+  const title = document.createElement("strong");
+  title.textContent = isSubmitted ? "기록관 제출 점수" : "현재 임시 점수";
+  const total = document.createElement("span");
+  total.textContent = `세트 스코어 ${winsA} : ${winsB}`;
+  heading.append(title, total);
+
+  const table = document.createElement("table");
+  table.className = "review-score-table";
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  ["세트", display.teamA, display.teamB].forEach((label, index) => {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = label;
+    if (index > 0) cell.className = "review-score-team";
+    headRow.appendChild(cell);
+  });
+  head.appendChild(headRow);
+
+  const body = document.createElement("tbody");
+  sets.forEach((set, index) => {
+    const row = document.createElement("tr");
+    const setLabel = document.createElement("th");
+    setLabel.scope = "row";
+    setLabel.textContent = `${index + 1}세트`;
+    const scoreA = document.createElement("td");
+    const scoreB = document.createElement("td");
+    scoreA.textContent = String(set.a);
+    scoreB.textContent = String(set.b);
+    if (set.a > set.b) scoreA.className = "set-winner";
+    if (set.b > set.a) scoreB.className = "set-winner";
+    row.append(setLabel, scoreA, scoreB);
+    body.appendChild(row);
+  });
+  table.append(head, body);
+  board.append(heading, table);
+  return board;
+}
+
 function renderScoreReviews() {
   const root = document.getElementById("scoreReviewList");
   if (!root) return;
@@ -1116,7 +1168,8 @@ function renderScoreReviews() {
     const author = isSubmitted
       ? (workflow.submission?.recorder?.name || "기록관")
       : (workflow.lock?.recorderName || "기록관");
-    const scoreText = formatSets(workflow.submittedSnapshot || workflow.draft);
+    const scoreSource = workflow.submittedSnapshot || workflow.draft;
+    const scoreboard = buildReviewScoreboard(display, scoreSource, isSubmitted);
     const header = document.createElement("div");
     header.className = "review-card-header";
     const tags = document.createElement("div");
@@ -1136,11 +1189,12 @@ function renderScoreReviews() {
     const meta = document.createElement("div");
     meta.className = "review-meta";
     meta.innerHTML = `<span class="review-info-chip"><small>기록관</small><strong>${escapeHtml(author)}</strong></span>`
-      + (submittedAt ? `<span class="review-info-chip"><small>제출 시간</small><strong>${escapeHtml(submittedAt)}</strong></span>` : "")
-      + (scoreText !== "점수 없음" ? `<span class="review-info-chip score"><small>입력 점수</small><strong>${escapeHtml(scoreText)}</strong></span>` : "");
+      + (submittedAt ? `<span class="review-info-chip"><small>제출 시간</small><strong>${escapeHtml(submittedAt)}</strong></span>` : "");
     const actions = document.createElement("div");
     actions.className = "review-actions";
-    row.append(header, matchup, meta, actions);
+    row.append(header, matchup);
+    if (scoreboard) row.append(scoreboard);
+    row.append(meta, actions);
     const approve = document.createElement("button");
     approve.className = "btn primary small";
     approve.textContent = assignment.matchType === "final" ? "공개 초안에 반영" : "승인";
