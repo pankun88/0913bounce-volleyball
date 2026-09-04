@@ -1597,7 +1597,15 @@ function bindStaticHandlers() {
     tournamentResetInProgress = true;
     const result = await runWorkflowButton(button, "대회 전체 초기화", async () => {
       let resetState = loadTournamentResetState();
+      if (resetState?.token && !resetState.backupCompleted) {
+        await adminWorkflowCallable("cancelTournamentReset", { token: resetState.token });
+        saveTournamentResetState(null);
+        resetState = null;
+      }
       if (!resetState?.token) {
+        // 백업 export는 일관된 snapshot을 위해 maintenance 중에는 거부된다.
+        // 따라서 reset maintenance를 시작하기 전에 먼저 안전 백업을 내려받는다.
+        await handleBackup();
         let prepared;
         try {
           prepared = await adminWorkflowCallable("prepareTournamentReset", { expectedName });
@@ -1608,27 +1616,13 @@ function bindStaticHandlers() {
         }
         const token = prepared.data?.token;
         if (typeof token !== "string" || !token) throw new Error("초기화 준비 토큰을 받지 못했습니다.");
-        resetState = { token, backupCompleted: prepared.data?.phase === "deleting" };
+        resetState = { token, backupCompleted: true };
         saveTournamentResetState(resetState);
-      }
-      if (!resetState.backupCompleted) {
-        try {
-          await handleBackup();
-          resetState.backupCompleted = true;
-          saveTournamentResetState(resetState);
-        } catch (backupError) {
-          try {
-            await adminWorkflowCallable("cancelTournamentReset", { token: resetState.token });
-            saveTournamentResetState(null);
-          } catch (cancelError) {
-            console.error("[대회 전체 초기화 취소 실패]", cancelError);
-          }
-          throw backupError;
-        }
       }
       return adminWorkflowCallable("resetTournament", { token: resetState.token });
     });
     tournamentResetInProgress = false;
+    if (!result) return;
     if (!result?.reset) {
       showToast("초기화가 완료되지 않았습니다. 같은 브라우저에서 다시 실행하면 안전하게 이어서 처리합니다.", 6000);
       return;

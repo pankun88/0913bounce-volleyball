@@ -2033,6 +2033,8 @@ export async function runFunctionsSuite() {
       await setDoc(doc(db, path('restoreManifests', 'reset-restore')), { status: 'staged' });
       await setDoc(doc(db, 'tournaments/main/restoreManifests/reset-restore/chunks/0'), { index: 0 });
     });
+    const preResetBackup = await call(functions, 'exportTournamentBackup', data);
+    assert.equal(preResetBackup.version, 3, 'reset-safety-backup-completes-before-maintenance');
     const preparedReset = await call(functions, 'prepareTournamentReset', { ...data, expectedName: '초기화 대상 대회' });
     const concurrentResetResults = await Promise.allSettled([
       call(functions, 'resetTournament', { ...data, token: preparedReset.token }),
