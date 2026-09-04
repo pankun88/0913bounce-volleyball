@@ -38,6 +38,12 @@ const queue = (changes = {}) => ({
     division: 'men',
     courtId: 'court-a',
     label: '이전 한라 표기',
+  }, {
+    matchKey: 'deleted-live-match',
+    matchType: 'prelim',
+    division: 'men',
+    courtId: 'court-a',
+    label: '이미 삭제된 경기',
   }];
   const options = [
     { matchKey: 'men-halla-1', matchType: 'prelim', division: 'men', label: '남자부 · 한라 · 1경기', hasOfficialHistory: false },
@@ -62,6 +68,7 @@ const queue = (changes = {}) => ({
   assert.equal(merged[1].courtId, null, '새 백두 경기 활성 초안 생성');
   assert.equal(merged[2].division, 'women', '새 여자부 경기 활성 초안 생성');
   assert.equal(merged[3].courtId, 'court-b', '공식 경기의 서버 배정 복원');
+  assert.equal(merged.some((assignment) => assignment.matchKey === 'deleted-live-match'), false, '서버에서 사라진 경기 초안 제거');
 }
 
 // pass-4: review history is excluded and submit advances without approval.

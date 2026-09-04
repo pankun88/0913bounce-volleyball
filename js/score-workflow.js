@@ -1,5 +1,3 @@
-export const TOURNAMENT_ID = 'main';
-
 const READY = 'ready';
 const ACTIVE_STATUS = 'in_progress';
 const NORMAL_STATUS = 'scheduled';
@@ -13,9 +11,9 @@ export function reconcilePlannerAssignments(currentAssignments, matchOptions, pe
     assignment.matchKey || assignment.id,
     { ...assignment, matchKey: assignment.matchKey || assignment.id },
   ]));
-  const merged = currentAssignments.map((assignment) => {
+  const merged = currentAssignments.flatMap((assignment) => {
     const option = matchOptions.find((item) => item.matchKey === assignment.matchKey);
-    return option ? { ...assignment, ...option, matchKey: option.matchKey } : assignment;
+    return option ? [{ ...assignment, ...option, matchKey: option.matchKey }] : [];
   });
   const mergedKeys = new Set(merged.map((assignment) => assignment.matchKey));
 
@@ -262,7 +260,7 @@ export function planCorrectionReplay(queue, assignments, workflows, targets, tra
     const workflow = workflowFor(nextWorkflows, matchKey);
     if (classifyCorrectionTarget(assignment, workflow) === 'in_place') continue;
     nextAssignments[matchKey] = { ...assignment, publicStatus: 'replay_required' };
-    nextWorkflows[matchKey] = { ...workflow, draftState: 'idle', lock: null };
+    nextWorkflows[matchKey] = { ...workflow, draftState: 'rejected', lock: null };
     nextQueue = insertPriorityEntry(nextQueue, nextAssignments, nextWorkflows, {
       matchKey,
       kind: 'correction_replay',

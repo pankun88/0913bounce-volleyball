@@ -1,4 +1,4 @@
-import { groupByRound, officialResultFields } from "./bracket.js";
+import { groupByRound, publicMatchView } from "./bracket.js";
 import { evaluateFinalMatch } from "./match-logic.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -21,12 +21,7 @@ export function displayTeamName(name) {
  * @param {{editable?:boolean, onEdit?:(match)=>void}} options
  */
 export function renderBracket(container, matches, options = {}) {
-  // 같은 컨테이너에 다시 그릴 때(점수 갱신 등), 이전 렌더링에서 등록해 둔
-  // ResizeObserver가 누적되지 않도록 먼저 정리한다.
-  if (container.__bracketResizeObserver) {
-    container.__bracketResizeObserver.disconnect();
-    container.__bracketResizeObserver = null;
-  }
+  disposeBracketRender(container);
   container.innerHTML = "";
   if (!matches || matches.length === 0) {
     container.innerHTML = '<div class="empty-hint">아직 본선 대진표가 생성되지 않았습니다.</div>';
@@ -36,7 +31,7 @@ export function renderBracket(container, matches, options = {}) {
   // A public match can carry progress metadata, but score/result fields are
   // renderable only after an approval revision exists. Do not read workflow or
   // submission data here; those documents are intentionally private.
-  const publicMatches = matches.map((match) => ({ ...match, ...officialResultFields(match) }));
+  const publicMatches = options.editable ? matches : matches.map(publicMatchView);
   const { rounds } = groupByRound(publicMatches);
 
   // 아무 경기도 시작되지 않았을 때만(=점수가 하나도 입력되지 않았을 때만) 1라운드 카드에서
@@ -210,10 +205,36 @@ export function renderBracket(container, matches, options = {}) {
   if (typeof ResizeObserver !== "undefined") {
     const ro = new ResizeObserver(() => redraw());
     ro.observe(container);
-    container.__bracketResizeObserver = ro;
+    container.__bracketRenderState = { observer: ro, timers: new Set() };
   } else {
     window.addEventListener("resize", redraw);
+    container.__bracketRenderState = { resizeListener: redraw, timers: new Set() };
   }
+}
+
+/** Remove all per-container rendering resources before replacing its contents. */
+export function disposeBracketRender(container) {
+  const state = container?.__bracketRenderState;
+  if (state?.observer) state.observer.disconnect();
+  if (state?.resizeListener) window.removeEventListener("resize", state.resizeListener);
+  state?.timers?.forEach((timer) => clearTimeout(timer));
+  if (container) {
+    container.__bracketResizeObserver?.disconnect();
+    container.__bracketResizeObserver = null;
+    container.querySelectorAll(".champion-celebrate-layer, .bracket-fire-line").forEach((el) => el.remove());
+    container.querySelectorAll(".champion-aflame").forEach((el) => el.classList.remove("champion-aflame"));
+    container.__bracketRenderState = null;
+  }
+}
+
+function schedule(container, callback, delay) {
+  const state = container.__bracketRenderState;
+  const timer = setTimeout(() => {
+    state?.timers?.delete(timer);
+    callback();
+  }, delay);
+  state?.timers?.add(timer);
+  return timer;
 }
 
 function renderMatchCard(match, options) {
@@ -590,7 +611,7 @@ function playChampionCeremony(track, container, path, champ, finalMatch) {
     fire.style.strokeDasharray = `${len}`;
     fire.style.strokeDashoffset = `${len}`;
     svg.appendChild(fire);
-    setTimeout(() => {
+    schedule(container, () => {
       fire.getBoundingClientRect(); // 레이아웃 강제 후 트랜지션 시작
       fire.style.transition = `stroke-dashoffset ${perSeg}ms linear`;
       fire.style.strokeDashoffset = "0";
@@ -600,7 +621,7 @@ function playChampionCeremony(track, container, path, champ, finalMatch) {
   const total = Math.max(1, segs.length) * perSeg;
 
   // 불꽃이 결승까지 도달할 즈음 우승팀 학교명에 불을 붙인다.
-  setTimeout(() => {
+  schedule(container, () => {
     const nameEl = track.querySelector(
       `.match-card[data-match-id="${finalMatch.id}"] .match-vs-name[data-team-id="${champ.id}"]`
     );
@@ -608,7 +629,7 @@ function playChampionCeremony(track, container, path, champ, finalMatch) {
   }, Math.max(0, total - 120));
 
   // 마지막에 우승 이펙트(섬광 + 불티 + 우승 배너)를 터뜨린다.
-  setTimeout(() => burstChampionCelebration(container, champ), total);
+  schedule(container, () => burstChampionCelebration(container, champ), total);
 }
 
 /** 화면을 덮는 우승 이펙트: 금빛 섬광 + 위로 솟는 불티들 + 가운데 "우승!" 배너. */
@@ -642,5 +663,5 @@ function burstChampionCelebration(container, champ) {
   }
 
   container.appendChild(layer);
-  setTimeout(() => layer.remove(), 4600);
+  schedule(container, () => layer.remove(), 4600);
 }

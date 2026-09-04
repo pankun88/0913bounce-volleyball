@@ -101,15 +101,24 @@ export function renderRingDiagram(container, opts) {
   } = opts;
 
   const n = ringOrder.length;
-  const size = 260;
-  const positions = getRingPositions(n, size);
+  const minimumCenterGap = 110;
+  const radius = n > 1 ? minimumCenterGap / (2 * Math.sin(Math.PI / n)) : 0;
+  const margin = 64;
+  const size = Math.max(260, Math.ceil((radius + margin) * 2));
+  const positions = getRingPositions(n, size, margin);
   const edges = getRingEdges(n);
   const filled = n > 0 && ringOrder.every((id) => id);
 
   container.innerHTML = "";
-  container.className = "ring-diagram";
-  container.style.width = size + "px";
-  container.style.height = size + "px";
+  container.className = "ring-diagram-scroll";
+  container.style.width = "100%";
+  container.style.maxWidth = "100%";
+  container.style.overflowX = "auto";
+  const stage = document.createElement("div");
+  stage.className = "ring-diagram";
+  stage.style.width = `${size}px`;
+  stage.style.height = `${size}px`;
+  container.appendChild(stage);
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
@@ -123,10 +132,10 @@ export function renderRingDiagram(container, opts) {
     line.setAttribute("class", "ring-edge" + (filled ? " done" : ""));
     svg.appendChild(line);
   });
-  container.appendChild(svg);
+  stage.appendChild(svg);
 
   // 경기 순서 라벨: 변(=인접한 두 팀의 대진) 중앙에 1경기, 2경기... 순서를 작게 표시
-  const labelPositions = getRingEdgeLabelPositions(n, size);
+  const labelPositions = getRingEdgeLabelPositions(n, size, margin);
   edges.forEach((_, idx) => {
     const pos = labelPositions[idx];
     const label = document.createElement("div");
@@ -135,7 +144,7 @@ export function renderRingDiagram(container, opts) {
     label.style.top = pos.y + "px";
     label.textContent = String(idx + 1);
     label.title = `${idx + 1}경기`;
-    container.appendChild(label);
+    stage.appendChild(label);
   });
 
   ringOrder.forEach((teamId, i) => {
@@ -166,6 +175,6 @@ export function renderRingDiagram(container, opts) {
         if (onVertexClick) onVertexClick(i);
       });
     }
-    container.appendChild(slot);
+    stage.appendChild(slot);
   });
 }

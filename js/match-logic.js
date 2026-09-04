@@ -19,8 +19,8 @@
  * @returns {'A'|'B'|null} null이면 아직 진행중(미종료)
  */
 export function getSetWinner(a, b, target) {
-  if (a == null || b == null) return null;
-  if (a < 0 || b < 0) return null;
+  if (!Number.isInteger(a) || !Number.isInteger(b)) return null;
+  if (a < 0 || b < 0 || a > 15 || b > 15) return null;
   const hi = Math.max(a, b);
   if (hi < target) return null; // 목표 점수 미달 -> 진행중
 
@@ -39,7 +39,7 @@ export function getSetWinner(a, b, target) {
 
 /** 세트가 아직 진행 중(미완료)인지 여부 - 둘 다 0이면 미입력으로 간주 */
 export function isSetEmpty(set) {
-  return !set || (Number(set.a) === 0 && Number(set.b) === 0);
+  return !set || (set.a === 0 && set.b === 0);
 }
 
 /**
@@ -54,11 +54,11 @@ export function isSetEmpty(set) {
  * @returns {{ok:true}|{ok:false,message:string}}
  */
 export function validateSetScore(a, b, target) {
-  const na = Number(a);
-  const nb = Number(b);
-  if (!Number.isInteger(na) || !Number.isInteger(nb)) {
+  if (!Number.isInteger(a) || !Number.isInteger(b)) {
     return { ok: false, message: '점수는 정수로 입력해주세요.' };
   }
+  const na = a;
+  const nb = b;
   if (na < 0 || nb < 0) {
     return { ok: false, message: '점수는 0 이상이어야 합니다.' };
   }
@@ -97,6 +97,15 @@ export function validateSetScore(a, b, target) {
 
 const PRELIM_TARGET = 10;
 
+function hasSetInput(set) {
+  return !isSetEmpty(set);
+}
+
+function validSetWinner(set, target) {
+  if (isSetEmpty(set) || !validateSetScore(set.a, set.b, target).ok) return null;
+  return getSetWinner(set.a, set.b, target);
+}
+
 /**
  * 예선 경기 결과를 평가한다.
  * @param {{a:number,b:number}[]} sets 최대 2세트
@@ -109,23 +118,26 @@ const PRELIM_TARGET = 10;
  * }}
  */
 export function evaluatePrelimMatch(sets) {
-  const trimmed = (sets || []).slice(0, 2);
-  const setResults = trimmed.map((s) => getSetWinner(s.a, s.b, PRELIM_TARGET));
+  const supplied = Array.isArray(sets) ? sets : [];
+  const trimmed = supplied.slice(0, 2);
+  const setResults = trimmed.map((s) => validSetWinner(s, PRELIM_TARGET));
   let setsWonA = 0, setsWonB = 0;
   let pointsForA = 0, pointsForB = 0;
   trimmed.forEach((s, i) => {
-    pointsForA += Number(s.a) || 0;
-    pointsForB += Number(s.b) || 0;
+    if (setResults[i]) {
+      pointsForA += s.a;
+      pointsForB += s.b;
+    }
     if (setResults[i] === 'A') setsWonA++;
     else if (setResults[i] === 'B') setsWonB++;
   });
 
   let status = 'pending';
   let result = null;
-  const anyInput = trimmed.some((s) => !isSetEmpty(s));
+  const anyInput = supplied.some(hasSetInput);
   if (anyInput) status = 'in_progress';
 
-  if (setsWonA + setsWonB === 2) {
+  if (!supplied.slice(2).some(hasSetInput) && setsWonA + setsWonB === 2) {
     status = 'done';
     if (setsWonA === 2) result = 'A';
     else if (setsWonB === 2) result = 'B';
@@ -144,28 +156,34 @@ const FINAL_TARGETS = [10, 10, 7];
  * @param {{a:number,b:number}[]} sets 최대 3세트
  */
 export function evaluateFinalMatch(sets) {
-  const trimmed = (sets || []).slice(0, 3);
+  const supplied = Array.isArray(sets) ? sets : [];
+  const trimmed = supplied.slice(0, 3);
   const setResults = [];
   let setsWonA = 0, setsWonB = 0;
   let pointsForA = 0, pointsForB = 0;
+  let hasUnreachableSet = supplied.slice(3).some(hasSetInput);
+  let seenEmptySet = false;
 
   for (let i = 0; i < trimmed.length; i++) {
     const s = trimmed[i];
-    pointsForA += Number(s.a) || 0;
-    pointsForB += Number(s.b) || 0;
-    const w = getSetWinner(s.a, s.b, FINAL_TARGETS[i]);
+    if (isSetEmpty(s)) seenEmptySet = true;
+    else if (seenEmptySet || setsWonA === 2 || setsWonB === 2) hasUnreachableSet = true;
+    const w = validSetWinner(s, FINAL_TARGETS[i]);
     setResults.push(w);
+    if (w) {
+      pointsForA += s.a;
+      pointsForB += s.b;
+    }
     if (w === 'A') setsWonA++;
     else if (w === 'B') setsWonB++;
-    if (setsWonA === 2 || setsWonB === 2) break; // 2세트 선취 시 종료
   }
 
   let status = 'pending';
-  const anyInput = trimmed.some((s) => !isSetEmpty(s));
+  const anyInput = supplied.some(hasSetInput);
   if (anyInput) status = 'in_progress';
 
   let winner = null;
-  if (setsWonA === 2 || setsWonB === 2) {
+  if (!hasUnreachableSet && (setsWonA === 2 || setsWonB === 2)) {
     status = 'done';
     winner = setsWonA === 2 ? 'A' : 'B';
   }
@@ -184,7 +202,7 @@ export function finalNeedsThirdSet(sets) {
 /**
  * 조 순위를 계산한다.
  * @param {{id:string,name:string}[]} teams 해당 조 소속 팀들
- * @param {Array} matches 해당 조의 경기 목록. 각 항목: {teamA, teamB, sets, status, result} (evaluatePrelimMatch 결과 포함 또는 sets로부터 계산)
+ * @param {Array} matches 해당 조의 경기 목록. 각 항목: {teamA, teamB, sets}
  * @returns {Array} 순위 정렬된 통계 배열. 동률 미해소 시 needsLottery 표시.
  */
 export function computeGroupStandings(teams, matches) {
@@ -207,11 +225,12 @@ export function computeGroupStandings(teams, matches) {
 
   const headToHead = {}; // headToHead[a][b] = 'win'|'loss'|'draw' (a팀 기준 결과)
 
-  (matches || []).forEach((m) => {
-    if (!stats[m.teamA] || !stats[m.teamB]) return;
-    const evald = m.result !== undefined && m.setsWonA !== undefined
-      ? m
-      : evaluatePrelimMatch(m.sets || []);
+  const scheduledMatches = (matches || []).filter((m) => stats[m.teamA] && stats[m.teamB]);
+  const provisional = scheduledMatches.length === 0
+    || scheduledMatches.some((m) => evaluatePrelimMatch(m.sets).status !== 'done');
+
+  scheduledMatches.forEach((m) => {
+    const evald = evaluatePrelimMatch(m.sets);
     if (evald.status !== 'done') return;
 
     const sa = stats[m.teamA];
@@ -274,19 +293,25 @@ export function computeGroupStandings(teams, matches) {
     const tiedGroup = list.slice(i, j);
     if (tiedGroup.length > 1) {
       resolveHeadToHead(tiedGroup, headToHead);
-      const allDistinct = tiedGroup.every(
-        (t, idx) => idx === 0 || t._h2hOrder !== tiedGroup[idx - 1]._h2hOrder
-      );
-      if (!allDistinct) {
-        tiedGroup.forEach((t) => { t.needsLottery = true; });
-      }
     }
-    tiedGroup.forEach((t, idx) => { t.rank = rank + idx; });
+    let k = 0;
+    while (k < tiedGroup.length) {
+      let l = k + 1;
+      while (l < tiedGroup.length && tiedGroup[l]._h2hOrder === tiedGroup[k]._h2hOrder) l++;
+      const sameHeadToHeadGroup = tiedGroup.slice(k, l);
+      if (sameHeadToHeadGroup.length > 1) {
+        if (!provisional) sameHeadToHeadGroup.forEach((t) => { t.needsLottery = true; });
+      }
+      sameHeadToHeadGroup.forEach((t) => { t.rank = rank + k; });
+      k = l;
+    }
     rank += tiedGroup.length;
     i = j;
   }
 
-  return list.sort((x, y) => x.rank - y.rank);
+  return list
+    .sort((x, y) => x.rank - y.rank)
+    .map((standing) => ({ ...standing, provisional }));
 }
 
 /** 동률 팀들 내에서 승자승(상호 전적) 기준으로 재정렬을 시도한다 */
@@ -302,6 +327,23 @@ function resolveHeadToHead(tiedGroup, headToHead) {
     t._h2hOrder = wins;
   });
   tiedGroup.sort((x, y) => y._h2hOrder - x._h2hOrder);
+}
+
+/**
+ * 진출 인원 안에 완전히 들어오는 순위 그룹만 자동 진출팀으로 반환한다.
+ * 컷오프를 걸치는 공동 순위는 오프라인 추첨 뒤 관리자가 직접 선택해야 한다.
+ */
+export function computeAutomaticQualifiers(standings, qualificationCount) {
+  if ((standings || []).some((standing) => standing.provisional)) return [];
+  const cutoff = Math.max(0, Math.floor(Number(qualificationCount) || 0));
+  const groupSizes = new Map();
+  (standings || []).forEach((standing) => {
+    groupSizes.set(standing.rank, (groupSizes.get(standing.rank) || 0) + 1);
+  });
+  return (standings || []).filter((standing) => (
+    standing.rank <= cutoff
+    && standing.rank + groupSizes.get(standing.rank) - 1 <= cutoff
+  ));
 }
 
 // ---------- CSV 유틸 ----------

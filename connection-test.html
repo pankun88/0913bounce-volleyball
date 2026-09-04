@@ -28,8 +28,8 @@
     <div class="test-card">
       <h2 style="margin-top:0;">🔌 Firebase 연결 테스트</h2>
       <p style="color: var(--muted); font-size: 14px;">
-        <code>js/firebase-config.js</code>에 입력한 설정값으로 실제 Firestore에
-        쓰기·읽기·삭제가 정상 동작하는지 확인합니다. (배포 전 로컬에서 열어도 되고, 배포 후 접속해도 됩니다)
+        현재 고정 설정으로 공개 Firestore 읽기와 공개 Cloud Functions 응답이 가능한지 확인합니다.
+        관리자 로그인·권한 쓰기 동작은 관리자 화면과 에뮬레이터 릴리스 테스트에서 별도로 검증합니다.
       </p>
       <button id="runBtn" class="btn btn-primary test-btn">테스트 시작</button>
       <div id="steps" style="margin-top: 18px;"></div>
@@ -38,8 +38,9 @@
   </div>
 
   <script type="module">
-    import { doc, setDoc, getDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-    import { db, isFirebaseConfigured } from "./js/firebase-init.js";
+    import { doc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
+    import { db, functions, isFirebaseConfigured } from "./js/firebase-init.js";
 
     const stepsEl = document.getElementById("steps");
     const summaryEl = document.getElementById("summary");
@@ -47,9 +48,8 @@
 
     const STEP_DEFS = [
       { key: "config", title: "1. firebase-config.js 값 확인" },
-      { key: "write", title: "2. Firestore 쓰기 테스트 (_diagnostic 문서 생성)" },
-      { key: "read", title: "3. Firestore 읽기 테스트 (방금 쓴 문서 다시 읽기)" },
-      { key: "cleanup", title: "4. 테스트 문서 정리 (삭제)" },
+      { key: "firestore", title: "2. 공개 대회정보 읽기 테스트" },
+      { key: "functions", title: "3. Cloud Functions 연결 테스트" },
     ];
 
     function renderSteps(state) {
@@ -92,48 +92,35 @@
       state.config = { status: "ok", detail: "config 값이 입력되어 있습니다." };
       renderSteps(state);
 
-      const testDocRef = doc(db, "tournaments", "main", "_diagnostic", "ping");
-      const payload = { checkedAt: new Date().toISOString(), from: "connection-test.html" };
-
-      // 2. 쓰기
+      // 2. 현재 보안 규칙이 허용하는 공개 대회정보 읽기
       try {
-        await setDoc(testDocRef, payload);
-        state.write = { status: "ok", detail: "tournaments/main/_diagnostic/ping 문서를 생성했습니다." };
+        const snap = await getDoc(doc(db, "tournaments", "main"));
+        if (!snap.exists()) throw new Error("tournaments/main 대회 문서가 없습니다.");
+        state.firestore = { status: "ok", detail: `대회정보를 읽었습니다: ${snap.data().name || "이름 미설정"}` };
       } catch (err) {
-        state.write = { status: "fail", detail: `${err.code || ""} ${err.message}` };
+        state.firestore = { status: "fail", detail: `${err.code || ""} ${err.message}` };
         renderSteps(state);
-        summaryEl.innerHTML = `<div class="summary fail">❌ 실패 — Firestore가 생성되지 않았거나, 보안 규칙이 배포되지 않았거나, 설정값(특히 projectId)이 잘못되었을 수 있습니다.</div>`;
+        summaryEl.innerHTML = `<div class="summary fail">실패 — Firestore 대회 문서, 공개 읽기 규칙, projectId를 확인하세요.</div>`;
         runBtn.disabled = false;
         return;
       }
       renderSteps(state);
 
-      // 3. 읽기
+      // 3. 인증 없이 호출 가능한 서버 시계로 Functions 배포 상태 확인
       try {
-        const snap = await getDoc(testDocRef);
-        if (snap.exists()) {
-          state.read = { status: "ok", detail: `읽어온 값: ${JSON.stringify(snap.data())}` };
-        } else {
-          state.read = { status: "fail", detail: "문서를 썼지만 다시 읽어오지 못했습니다." };
-        }
+        const response = await httpsCallable(functions, "getServerClock")({ tournamentId: "main" });
+        const serverTimeMs = Number(response.data?.serverTimeMs);
+        if (!Number.isFinite(serverTimeMs)) throw new Error("서버 시각 응답이 올바르지 않습니다.");
+        state.functions = { status: "ok", detail: `서버 응답 정상: ${new Date(serverTimeMs).toLocaleString()}` };
       } catch (err) {
-        state.read = { status: "fail", detail: `${err.code || ""} ${err.message}` };
-      }
-      renderSteps(state);
-
-      // 4. 정리
-      try {
-        await deleteDoc(testDocRef);
-        state.cleanup = { status: "ok", detail: "테스트 문서를 삭제했습니다." };
-      } catch (err) {
-        state.cleanup = { status: "fail", detail: `${err.code || ""} ${err.message}` };
+        state.functions = { status: "fail", detail: `${err.code || ""} ${err.message}` };
       }
       renderSteps(state);
 
       const allOk = STEP_DEFS.every((s) => state[s.key].status === "ok");
       summaryEl.innerHTML = allOk
-        ? `<div class="summary ok">✅ 모두 통과 — Firebase 연동이 정상 동작합니다. 관리자 페이지에서 안심하고 사용하세요.</div>`
-        : `<div class="summary fail">❌ 일부 단계 실패 — 위 상세 메시지를 확인해 주세요. (흔한 원인: Firestore Database 미생성, 보안 규칙 미배포, projectId 오타)</div>`;
+        ? `<div class="summary ok">모두 통과 — Firestore와 Cloud Functions 연결이 정상입니다.</div>`
+        : `<div class="summary fail">일부 단계 실패 — Functions·Rules·Hosting을 같은 프로젝트에 함께 배포했는지 확인하세요.</div>`;
       runBtn.disabled = false;
     });
   </script>

@@ -1,14 +1,16 @@
 import {
-  collection, doc, setDoc, addDoc, updateDoc, deleteDoc, getDoc, getDocs,
+  collection, doc, setDoc, addDoc, updateDoc, getDoc, getDocs,
   onSnapshot, query, orderBy, writeBatch, serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
 import { db, functions } from "./firebase-init.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
-import { generateRoundRobin } from "./schedule.js";
-import { normalizeBackupData } from "./backup-format.js";
+import {
+  backupFromServerExport, normalizeBackupData, restorableRootData, selectRestoreRecovery,
+} from "./backup-format.js";
 
 const TID = TOURNAMENT_ID;
+const RESTORE_SESSION_KEY = `bounce-volleyball.restore.${TID}`;
 
 const tDoc = () => doc(db, "tournaments", TID);
 const groupsCol = () => collection(db, "tournaments", TID, "groups");
@@ -39,11 +41,15 @@ export async function saveTournamentInfo(data) {
   await setDoc(tDoc(), { ...data, updatedAt: serverTimestamp() }, { merge: true });
 }
 
+function serverConfirmed(snapshot) {
+  return !snapshot.metadata.fromCache && !snapshot.metadata.hasPendingWrites;
+}
+
 export function subscribeTournamentInfo(cb) {
   const clearWatch = watchForTimeout("대회정보");
-  return onSnapshot(tDoc(), (snap) => {
-    clearWatch();
-    cb(snap.exists() ? snap.data() : null);
+  return onSnapshot(tDoc(), { includeMetadataChanges: true }, (snap) => {
+    if (serverConfirmed(snap)) clearWatch();
+    cb(snap.exists() ? snap.data() : null, snap.metadata);
   }, (err) => {
     clearWatch();
     reportSnapshotError("대회정보 구독", err);
@@ -65,44 +71,12 @@ export async function reorderGroups(orderedGroupIds) {
   await batch.commit();
 }
 
-/** 조를 삭제하면서, 그 조에 속해 있던 팀들은 '미배정' 상태(groupId: null)로 되돌린다.
- *  (이렇게 하지 않으면 팀이 삭제된 조의 id를 계속 들고 있어 화면에서 보이지도, 지워지지도 않는
- *  '고아 팀'이 되어버린다.) */
-export async function deleteGroup(id) {
-  const [teamsSnap, prelimSnap] = await Promise.all([
-    getDocs(teamsCol()),
-    getDocs(prelimCol()),
-  ]);
-  const batch = writeBatch(db);
-  teamsSnap.docs.forEach((d) => {
-    if (d.data().groupId === id) {
-      batch.update(d.ref, { groupId: null });
-    }
+/** 예선 구조를 서버 트랜잭션으로 변경한다. */
+export async function mutatePrelimStructure(operation, division, data = {}) {
+  const result = await httpsCallable(functions, "mutatePrelimStructure")({
+    tournamentId: TID, operation, division, ...data,
   });
-  prelimSnap.docs.forEach((d) => {
-    if (d.data().groupId === id) batch.delete(d.ref);
-  });
-  batch.delete(doc(groupsCol(), id));
-  await batch.commit();
-}
-
-/** 등록된 모든 조를 삭제한다 ('조 편성' 초기화 버튼용).
- *  팀은 지우지 않고 모두 '미배정' 상태(groupId: null)로 되돌리며, 조에 딸린 예선 경기도 함께 삭제한다. */
-export async function deleteAllGroups(division) {
-  const [groupsSnap, teamsSnap, prelimSnap] = await Promise.all([
-    getDocs(groupsCol()), getDocs(teamsCol()), getDocs(prelimCol()),
-  ]);
-  const batch = writeBatch(db);
-  teamsSnap.docs.forEach((d) => {
-    if (d.data().division === division && d.data().groupId) batch.update(d.ref, { groupId: null });
-  });
-  prelimSnap.docs.forEach((d) => {
-    if (d.data().division === division) batch.delete(d.ref);
-  });
-  groupsSnap.docs.forEach((d) => {
-    if (d.data().division === division) batch.delete(d.ref);
-  });
-  await batch.commit();
+  return result.data;
 }
 
 /** 조의 예선 진행 방식을 라운드로빈/링크제로 전환한다 */
@@ -115,22 +89,11 @@ export async function setGroupRingOrder(groupId, ringOrder) {
   await updateDoc(doc(groupsCol(), groupId), { ringOrder });
 }
 
-/** 모든 조의 링크제 꼭짓점 배치(ringOrder)를 비운다 (대회설정 탭 '예선 대진 방식·생성'의 전체 초기화 버튼용).
- *  예선 경기 자체는 clearAllPrelimMatches가 지우므로, 이 함수는 도형에 남아있는 팀 배치만 정리한다. */
-export async function resetAllRingOrders(division) {
-  const existing = await getDocs(groupsCol());
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => {
-    if (d.data().division === division && d.data().ringOrder && d.data().ringOrder.length) batch.update(d.ref, { ringOrder: [] });
-  });
-  await batch.commit();
-}
-
 export function subscribeGroups(cb) {
   const clearWatch = watchForTimeout("조 목록");
-  return onSnapshot(query(groupsCol(), orderBy("order")), (snap) => {
-    clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  return onSnapshot(query(groupsCol(), orderBy("order")), { includeMetadataChanges: true }, (snap) => {
+    if (serverConfirmed(snap)) clearWatch();
+    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
   }, (err) => {
     clearWatch();
     reportSnapshotError("조 목록 구독", err);
@@ -158,32 +121,11 @@ export async function moveAndReorderTeam(teamId, targetGroupId, orderedTeamIds) 
   await batch.commit();
 }
 
-export async function deleteTeam(id) {
-  await deleteDoc(doc(teamsCol(), id));
-}
-
-/** 등록된 모든 팀을 삭제한다 ('참가팀 등록' 초기화 버튼용).
- *  팀에 의존하는 예선/본선 경기 기록도 함께 삭제해 고아 데이터가 남지 않게 한다. */
-export async function deleteAllTeams(division) {
-  const [teamsSnap, prelimSnap, finalSnap] = await Promise.all([
-    getDocs(teamsCol()), getDocs(prelimCol()), getDocs(finalCol(division)),
-  ]);
-  const batch = writeBatch(db);
-  teamsSnap.docs.forEach((d) => {
-    if (d.data().division === division) batch.delete(d.ref);
-  });
-  prelimSnap.docs.forEach((d) => {
-    if (d.data().division === division) batch.delete(d.ref);
-  });
-  finalSnap.docs.forEach((d) => batch.delete(d.ref));
-  await batch.commit();
-}
-
 export function subscribeTeams(cb) {
   const clearWatch = watchForTimeout("팀 목록");
-  return onSnapshot(query(teamsCol(), orderBy("order")), (snap) => {
-    clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  return onSnapshot(query(teamsCol(), orderBy("order")), { includeMetadataChanges: true }, (snap) => {
+    if (serverConfirmed(snap)) clearWatch();
+    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
   }, (err) => {
     clearWatch();
     reportSnapshotError("팀 목록 구독", err);
@@ -191,83 +133,6 @@ export function subscribeTeams(cb) {
 }
 
 // ---------- 예선 ----------
-
-/** 해당 조의 기존 예선 경기를 모두 지우고 라운드로빈 일정을 새로 만든다 */
-export async function generatePrelimMatchesForGroup(groupId, teamIds) {
-  const [existing, groupSnap] = await Promise.all([
-    getDocs(prelimCol()), getDoc(doc(groupsCol(), groupId)),
-  ]);
-  if (!groupSnap.exists()) throw new Error("조를 찾을 수 없습니다.");
-  const division = groupSnap.data().division;
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => {
-    if (d.data().groupId === groupId) batch.delete(d.ref);
-  });
-  const pairs = generateRoundRobin(teamIds);
-  pairs.forEach((p) => {
-    const ref = doc(prelimCol());
-    batch.set(ref, {
-      groupId,
-      division,
-      teamA: p.teamA,
-      teamB: p.teamB,
-      round: p.round,
-      sets: [],
-      status: "pending",
-      result: null,
-      createdAt: Date.now(),
-    });
-  });
-  await batch.commit();
-}
-
-/** 해당 조의 기존 예선 경기를 모두 지운다 (방식 전환 시 사용) */
-export async function clearPrelimMatchesForGroup(groupId) {
-  const existing = await getDocs(prelimCol());
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => {
-    if (d.data().groupId === groupId) batch.delete(d.ref);
-  });
-  await batch.commit();
-}
-
-/** 모든 조의 예선 경기(대진+결과)를 전부 삭제한다 (대회설정 탭 '예선 대진 방식·생성'의 전체 초기화 버튼용). */
-export async function clearAllPrelimMatches(division) {
-  const existing = await getDocs(prelimCol());
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => {
-    if (d.data().division === division) batch.delete(d.ref);
-  });
-  await batch.commit();
-}
-
-/** 해당 조의 기존 예선 경기를 모두 지우고, 링크제(인접 꼭짓점) 대진쌍으로 새로 만든다 */
-export async function generateRingMatchesForGroup(groupId, pairs) {
-  const [existing, groupSnap] = await Promise.all([
-    getDocs(prelimCol()), getDoc(doc(groupsCol(), groupId)),
-  ]);
-  if (!groupSnap.exists()) throw new Error("조를 찾을 수 없습니다.");
-  const division = groupSnap.data().division;
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => {
-    if (d.data().groupId === groupId) batch.delete(d.ref);
-  });
-  pairs.forEach((p, idx) => {
-    const ref = doc(prelimCol());
-    batch.set(ref, {
-      groupId,
-      division,
-      teamA: p.teamA,
-      teamB: p.teamB,
-      round: idx + 1,
-      sets: [],
-      status: "pending",
-      result: null,
-      createdAt: Date.now(),
-    });
-  });
-  await batch.commit();
-}
 
 /** 경기 순서(드래그로 재배열한 결과)를 저장한다 - matchIds를 새 순서대로 넘기면 round(1부터)를 다시 매긴다 */
 export async function reorderPrelimMatches(groupId, orderedMatchIds) {
@@ -280,9 +145,9 @@ export async function reorderPrelimMatches(groupId, orderedMatchIds) {
 
 export function subscribePrelimMatches(cb) {
   const clearWatch = watchForTimeout("예선경기");
-  return onSnapshot(prelimCol(), (snap) => {
-    clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  return onSnapshot(prelimCol(), { includeMetadataChanges: true }, (snap) => {
+    if (serverConfirmed(snap)) clearWatch();
+    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
   }, (err) => {
     clearWatch();
     reportSnapshotError("예선경기 구독", err);
@@ -291,35 +156,38 @@ export function subscribePrelimMatches(cb) {
 
 // ---------- 본선 ----------
 
-/**
- * 관리자가 (대진표 생성 → 부전승 배치 → 자리 조정 → 점수 입력까지) 화면에서만 다듬어 둔
- * 본선 대진표를 한 번에 그대로 Firestore에 반영해서 관객 화면(대시보드)에 공개한다.
- * 대진표를 새로 생성하면 경기 수/아이디 구성 자체가 달라질 수 있으므로, 단순히 덮어쓰기(merge)만
- * 하면 이전에 공개됐던 경기 문서가 고스란히 남아 유령 경기로 보일 수 있다. 그래서 새 배열에 없는
- * 기존 문서는 지우고, 새 배열은 전부 덮어쓰는 "완전 교체" 방식으로 공개한다.
- */
-export async function publishFinalBracket(division, matches) {
+/** Publish a local final draft with its exact authoritative CAS baseline. */
+export async function publishFinalBracket(division, expectedMatches, matches, scoreDrafts) {
   const callable = httpsCallable(functions, "publishFinalStructure");
-  const result = await callable({ tournamentId: TID, division, matches });
+  const result = await callable({
+    tournamentId: TID,
+    division,
+    expectedMatches,
+    matches,
+    scoreDrafts,
+  });
   return result.data;
 }
 
 export function subscribeFinalMatches(division, cb) {
-  const clearWatch = watchForTimeout("본선경기");
-  return onSnapshot(finalCol(division), (snap) => {
-    clearWatch();
-    cb(snap.docs.map((d) => d.data()));
+  const label = `${division} 본선경기`;
+  const clearWatch = watchForTimeout(label);
+  return onSnapshot(finalCol(division), { includeMetadataChanges: true }, (snap) => {
+    if (serverConfirmed(snap)) clearWatch();
+    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
   }, (err) => {
     clearWatch();
-    reportSnapshotError("본선경기 구독", err);
+    reportSnapshotError(`${label} 구독`, err);
   });
 }
 
-export async function clearFinalBracket(division) {
-  const existing = await getDocs(finalCol(division));
-  const batch = writeBatch(db);
-  existing.docs.forEach((d) => batch.delete(d.ref));
-  await batch.commit();
+export async function getServerClockOffset() {
+  const startedAt = Date.now();
+  const result = await httpsCallable(functions, "getServerClock")({ tournamentId: TID });
+  const finishedAt = Date.now();
+  const serverTimeMs = Number(result.data?.serverTimeMs);
+  if (!Number.isFinite(serverTimeMs)) throw new Error("서버 기준 시간을 확인할 수 없습니다.");
+  return serverTimeMs - ((startedAt + finishedAt) / 2);
 }
 
 // ---------- 백업 / 복원 ----------
@@ -331,64 +199,20 @@ export async function clearFinalBracket(division) {
  * 있는" 백업 파일을 만드는 용도다.
  */
 export async function exportAllData() {
-  const root = `tournaments/${TID}`;
-  const [infoSnap, groups, teams, prelim, menFinal, womenFinal, revisions, courts, assignments, queues, workflows, audits, restores] = await Promise.all([
-    getDoc(tDoc()),
-    getDocs(groupsCol()),
-    getDocs(teamsCol()),
-    getDocs(prelimCol()),
-    getDocs(finalCol("men")),
-    getDocs(finalCol("women")),
-    getDocs(collection(db, root, "officialRevisions")),
-    getDocs(collection(db, root, "courts")),
-    getDocs(collection(db, root, "courtAssignments")),
-    getDocs(collection(db, root, "courtQueues")),
-    getDocs(collection(db, root, "scoreWorkflows")),
-    getDocs(collection(db, root, "auditEvents")),
-    getDocs(collection(db, root, "restoreManifests")),
-  ]);
-  const toArr = (snap) => snap.docs.map((d) => ({ id: d.id, data: d.data() }));
-
-  const info = infoSnap.exists() ? { ...infoSnap.data() } : null;
-  // updatedAt(서버 타임스탬프)은 복원 시 의미가 없고 JSON으로 깔끔히 안 떨어지므로 뺀다.
-  if (info) delete info.updatedAt;
-
-  return {
-    app: "bounce-volleyball",
-    type: "backup",
-    version: 3,
-    exportedAt: new Date().toISOString(),
-    tournamentId: TID,
-    info,
-    groups: toArr(groups),
-    teams: toArr(teams),
-    prelimMatches: toArr(prelim),
-    finalMatches: {
-      men: toArr(menFinal),
-      women: toArr(womenFinal),
-    },
-    officialRevisions: toArr(revisions),
-    courts: toArr(courts),
-    courtAssignments: toArr(assignments),
-    courtQueues: toArr(queues),
-    scoreWorkflows: toArr(workflows),
-    auditEvents: toArr(audits),
-    restoreManifests: toArr(restores),
-    maintenance: { enabled: Boolean(info?.maintenance?.enabled) },
-  };
+  const result = await httpsCallable(functions, "exportTournamentBackup")({ tournamentId: TID });
+  return backupFromServerExport(result.data);
 }
 
 /**
- * 백업 객체로 현재 대회 데이터를 통째로 덮어쓴다(복원). 기존 데이터는 모두 지우고 백업 내용으로
- * 교체하므로, 호출 전 사용자에게 반드시 확인을 받아야 한다. 쓰기 작업은 배치(최대 500개) 한도를
- * 넘지 않도록 청크로 나눠 커밋한다.
+ * 백업 객체로 허용된 대회 데이터를 정확히 교체한다. 서버는 청크 적용 뒤 이전 사업 문서를
+ * 제거하고 검증·승격하므로, 호출 전 사용자에게 반드시 확인을 받아야 한다.
  */
 export async function importAllData(data) {
   data = normalizeBackupData(data);
-  if (data.version !== 3) throw new Error("v3 백업만 복원할 수 있습니다. 먼저 migration manifest를 생성하세요.");
+  if (data.version !== 3) throw new Error("v3 백업만 복원할 수 있습니다.");
   const root = `tournaments/${TID}`;
+  const rootData = restorableRootData(data.info);
   const documents = [
-    { path: root, data: { ...(data.info || {}), maintenance: data.maintenance } },
     ...data.groups.map((item) => ({ path: `${root}/groups/${item.id}`, data: item.data })),
     ...data.teams.map((item) => ({ path: `${root}/teams/${item.id}`, data: item.data })),
     ...data.prelimMatches.map((item) => ({ path: `${root}/prelimMatches/${item.id}`, data: item.data })),
@@ -400,17 +224,60 @@ export async function importAllData(data) {
     ...data.courtQueues.map((item) => ({ path: `${root}/courtQueues/${item.id}`, data: item.data })),
     ...data.scoreWorkflows.map((item) => ({ path: `${root}/scoreWorkflows/${item.id}`, data: item.data })),
     ...data.auditEvents.map((item) => ({ path: `${root}/auditEvents/${item.id}`, data: item.data })),
-    ...data.restoreManifests.map((item) => ({ path: `${root}/restoreManifests/${item.id}`, data: item.data })),
   ];
   const chunks = [];
-  for (let i = 0; i < documents.length; i += 200) chunks.push({ documents: documents.slice(i, i + 200) });
-  const manifestId = `restore-${Date.now()}-${crypto.randomUUID()}`;
-  const call = (name, payload) => httpsCallable(functions, name)({ tournamentId: TID, ...payload });
-  await call("beginRestore", { manifestId, chunks });
-  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
-    await call("resumeRestore", { manifestId, chunkIndex });
+  const encoder = new TextEncoder();
+  let current = [];
+  let currentBytes = 2;
+  for (const document of documents) {
+    const bytes = encoder.encode(JSON.stringify(document)).byteLength + (current.length ? 1 : 0);
+    if (bytes > 2_000_000) throw new Error(`백업 문서가 복원 전송 한도를 초과합니다: ${document.path}`);
+    if (current.length >= 100 || currentBytes + bytes > 2_000_000) {
+      chunks.push({ documents: current });
+      current = [];
+      currentBytes = 2;
+    }
+    current.push(document);
+    currentBytes += bytes;
   }
+  if (current.length) chunks.push({ documents: current });
+  if (chunks.length > 100 || encoder.encode(JSON.stringify(chunks)).byteLength > 24_000_000) {
+    throw new Error("백업 전체 크기가 안전한 복원 한도를 초과합니다.");
+  }
+  const payload = { rootData, chunks };
+  let savedState = null;
+  try {
+    savedState = JSON.parse(sessionStorage.getItem(RESTORE_SESSION_KEY) || "null");
+  } catch {
+    sessionStorage.removeItem(RESTORE_SESSION_KEY);
+  }
+  const rootSnapshot = await getDoc(tDoc());
+  const activeManifestId = rootSnapshot.data()?.maintenance?.enabled === true
+    ? rootSnapshot.data().maintenance.restoreManifestId
+    : null;
+  const recovery = selectRestoreRecovery({
+    activeManifestId,
+    savedState,
+    payload,
+    newManifestId: `restore-${Date.now()}-${crypto.randomUUID()}`,
+  });
+  const manifestId = recovery.manifestId;
+  sessionStorage.setItem(RESTORE_SESSION_KEY, JSON.stringify({ manifestId, payload }));
+  const call = (name, payload) => httpsCallable(functions, name)({ tournamentId: TID, ...payload });
+  if (recovery.supersede) {
+    await call("supersedeRestore", { priorManifestId: recovery.priorManifestId, manifestId, ...payload });
+  } else {
+    await call("beginRestore", { manifestId, ...payload });
+  }
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+    await call("resumeRestore", { manifestId, chunkIndex, chunk: chunks[chunkIndex] });
+  }
+  let pruneResult;
+  do {
+    pruneResult = (await call("pruneRestore", { manifestId })).data;
+  } while (!pruneResult?.pruned);
   await call("verifyRestore", { manifestId });
   await call("promoteRestore", { manifestId });
+  sessionStorage.removeItem(RESTORE_SESSION_KEY);
   return { manifestId };
 }

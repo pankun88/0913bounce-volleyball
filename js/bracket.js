@@ -27,7 +27,10 @@ export function seedOrder(n) {
  * callers receive public match documents only.
  */
 export function hasApprovedOfficialResult(match) {
-  return Number.isInteger(match?.officialRevision) && match.officialRevision > 0;
+  if (!Number.isInteger(match?.officialRevision) || match.officialRevision <= 0) return false;
+  if (match.retracted === true || match.officialCurrent === false || match.isOfficialCurrent === false) return false;
+  if (["retracted", "superseded", "non_current"].includes(match.officialStatus)) return false;
+  return match.status === "done";
 }
 
 /** Return only score/result fields that may be shown to spectators or exported. */
@@ -55,6 +58,23 @@ export function officialResultFields(match) {
     setsWonB: Number.isFinite(match.setsWonB) ? match.setsWonB : null,
     pointsForA: Number.isFinite(match.pointsForA) ? match.pointsForA : null,
     pointsForB: Number.isFinite(match.pointsForB) ? match.pointsForB : null,
+  };
+}
+
+/**
+ * Return the spectator-safe representation of a match. Bracket structure stays
+ * visible before result approval, including BYE placement, but score and winner
+ * data remains private.
+ */
+export function publicMatchView(match) {
+  if (hasApprovedOfficialResult(match)) return match;
+  const status = ["empty", "waiting", "pending", "bye_pending", "bye", "in_progress"].includes(match.status)
+    ? match.status
+    : "pending";
+  return {
+    ...match,
+    ...officialResultFields(match),
+    status,
   };
 }
 
@@ -381,6 +401,7 @@ export function recordMatchResult(matches, matchId, sets, evaluateFn) {
   const match = byId[matchId];
   if (!match) return matches;
 
+  const previousWinnerId = match.winnerTeam?.id || null;
   const evald = evaluateFn(sets);
   match.sets = sets;
 
@@ -389,12 +410,47 @@ export function recordMatchResult(matches, matchId, sets, evaluateFn) {
     match.winnerSide = evald.winner;
     match.winnerTeam = evald.winner === 'A' ? match.teamA : match.teamB;
 
+    if (previousWinnerId && previousWinnerId !== match.winnerTeam?.id) {
+      invalidateDescendantResults(matches, matchId);
+    }
     pushWinnerForward(match, byId);
   } else {
     match.status = evald.status; // 'pending' | 'in_progress'
   }
 
   return matches;
+}
+
+/**
+ * Remove every downstream result that depended on a changed upstream winner.
+ * The bracket structure remains intact, but the affected upstream slot and all
+ * descendant score/result state are reset so a stale local score cannot publish.
+ * @returns {string[]} invalidated descendant match ids
+ */
+export function invalidateDescendantResults(matches, matchId) {
+  const byId = indexById(matches);
+  const invalidated = [];
+  const visit = (sourceId) => {
+    const source = byId[sourceId];
+    const next = source?.nextMatchId ? byId[source.nextMatchId] : null;
+    if (!next) return;
+
+    if (source.nextSlot === 'A') {
+      next.teamA = null;
+      next.teamASource = null;
+    } else {
+      next.teamB = null;
+      next.teamBSource = null;
+    }
+    next.sets = [];
+    next.winnerSide = null;
+    next.winnerTeam = null;
+    next.status = next.teamA && next.teamB ? 'pending' : 'waiting';
+    invalidated.push(next.id);
+    visit(next.id);
+  };
+  visit(matchId);
+  return invalidated;
 }
 
 /**

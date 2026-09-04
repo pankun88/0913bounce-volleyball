@@ -1,8 +1,9 @@
 import {
   subscribeTournamentInfo, subscribeGroups, subscribeTeams,
-  subscribePrelimMatches, subscribeFinalMatches,
+  subscribePrelimMatches, subscribeFinalMatches, getServerClockOffset,
 } from "./firestore-service.js";
 import { evaluatePrelimMatch, computeGroupStandings } from "./match-logic.js";
+import { publicMatchView } from "./bracket.js";
 import { renderBracket, displayTeamName } from "./bracket-render.js";
 import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
 
@@ -24,6 +25,25 @@ let venueTimer = null;
 let venueConfigKey = "";
 let venueDisplayLocked = isVenueMode;
 let maintenanceActive = false;
+let venueServerTimeOffsetMs = null;
+let venueClockRequest = null;
+let venueClockRetry = null;
+const FEED_IDS = ["tournament", "groups", "teams", "prelim", "men-final", "women-final"];
+const feedHealth = Object.fromEntries(FEED_IDS.map((id) => [id, { state: "pending", message: "" }]));
+const feedIdByLabel = {
+  "대회정보": "tournament",
+  "대회정보 구독": "tournament",
+  "조 목록": "groups",
+  "조 목록 구독": "groups",
+  "팀 목록": "teams",
+  "팀 목록 구독": "teams",
+  "예선경기": "prelim",
+  "예선경기 구독": "prelim",
+  "men 본선경기": "men-final",
+  "men 본선경기 구독": "men-final",
+  "women 본선경기": "women-final",
+  "women 본선경기 구독": "women-final",
+};
 
 initTabs();
 initDivisionSwitch();
@@ -32,34 +52,46 @@ initBracketFullscreen();
 activateTab(activeTab, false);
 document.body.classList.toggle("venue-mode", venueDisplayLocked);
 applyVenueDisplaySettings();
+document.addEventListener("visibilitychange", () => {
+  if (!isVenueMode || document.visibilityState !== "visible") return;
+  stopVenueTimer();
+  renderUnsyncedVenueStatus();
+  venueServerTimeOffsetMs = null;
+  venueConfigKey = "";
+  ensureVenueServerClock();
+});
 
-subscribeTournamentInfo((info) => {
-  hideErrorBanner();
+subscribeTournamentInfo((info, metadata) => {
+  setFeedSnapshot("tournament", metadata);
   tournamentInfo = info || {};
-  maintenanceActive = tournamentInfo.maintenance?.active === true;
+  maintenanceActive = tournamentInfo.maintenance?.enabled === true;
   document.getElementById("dashTitle").textContent = tournamentInfo.name || "바운스발리볼";
   setMaintenanceMode();
   applyVenueDisplaySettings();
   renderActiveDivision();
 });
 
-subscribeGroups((data) => {
+subscribeGroups((data, metadata) => {
+  setFeedSnapshot("groups", metadata);
   allGroups = data;
   renderActiveDivision();
 });
 
-subscribeTeams((data) => {
+subscribeTeams((data, metadata) => {
+  setFeedSnapshot("teams", metadata);
   allTeams = data;
   renderActiveDivision();
 });
 
-subscribePrelimMatches((data) => {
+subscribePrelimMatches((data, metadata) => {
+  setFeedSnapshot("prelim", metadata);
   allPrelimMatches = data;
   renderActiveDivision();
 });
 
 DIVISIONS.forEach((division) => {
-  subscribeFinalMatches(division, (data) => {
+  subscribeFinalMatches(division, (data, metadata) => {
+    setFeedSnapshot(`${division}-final`, metadata);
     finalMatchesByDivision[division] = data;
     if (division === activeDivision) renderFinalBracket();
   });
@@ -75,22 +107,6 @@ function divisionData(division = activeDivision) {
       .filter((match) => match.division === division && groupIds.has(match.groupId))
       .map(publicMatchView),
     finalMatches: finalMatchesByDivision[division].map(publicMatchView),
-  };
-}
-
-function publicMatchView(match) {
-  if (Number.isInteger(match.officialRevision) && match.officialRevision > 0) return match;
-  return {
-    ...match,
-    sets: [],
-    result: null,
-    winnerSide: null,
-    winnerTeam: null,
-    setsWonA: 0,
-    setsWonB: 0,
-    pointsForA: 0,
-    pointsForB: 0,
-    status: match.status === "in_progress" ? "in_progress" : "pending",
   };
 }
 
@@ -135,12 +151,28 @@ function renderActiveDivision() {
 function setMaintenanceMode() {
   const notice = document.getElementById("maintenanceNotice");
   const liveContent = document.getElementById("dashboardLiveContent");
+  const liveStatus = document.querySelector(".live-dot");
   notice.hidden = !maintenanceActive;
   liveContent.hidden = maintenanceActive;
   document.getElementById("dashDivisionSwitch").hidden = maintenanceActive;
+  if (liveStatus) {
+    liveStatus.classList.toggle("is-maintenance", maintenanceActive);
+    liveStatus.setAttribute("role", "status");
+    liveStatus.setAttribute("aria-live", "polite");
+    liveStatus.setAttribute("aria-label", maintenanceActive ? "점검 중" : "실시간 데이터 상태");
+    if (maintenanceActive) {
+      liveStatus.dataset.feedHealth = "maintenance";
+      liveStatus.textContent = "점검 중";
+    }
+  }
   if (maintenanceActive) {
+    stopVenueTimer();
+    venueConfigKey = "";
+    document.getElementById("venueSwitcher").hidden = true;
     document.getElementById("dashPrelim").replaceChildren();
     document.getElementById("dashBracketContainer").replaceChildren();
+  } else {
+    updateFeedHealth();
   }
 }
 
@@ -168,10 +200,15 @@ function updateDivisionSwitchState() {
 
 function applyVenueDisplaySettings() {
   const config = tournamentInfo.venueDisplay || {};
-  const hasSavedSettings = ["auto", "men", "women"].includes(config.mode);
-  venueDisplayLocked = isVenueMode || hasSavedSettings;
+  venueDisplayLocked = isVenueMode;
   document.body.classList.toggle("venue-mode", venueDisplayLocked);
   updateDivisionSwitchState();
+  if (maintenanceActive) {
+    stopVenueTimer();
+    document.getElementById("venueSwitcher").hidden = true;
+    venueConfigKey = "";
+    return;
+  }
   placeVenueStatus();
 
   if (!venueDisplayLocked) {
@@ -183,8 +220,9 @@ function applyVenueDisplaySettings() {
 
   const mode = ["auto", "men", "women"].includes(config.mode) ? config.mode : "auto";
   const intervalSeconds = [10, 15, 20, 30].includes(Number(config.intervalSeconds)) ? Number(config.intervalSeconds) : 15;
-  const cycleStartedAt = Number(config.cycleStartedAt) || Date.now();
-  const key = `${mode}:${intervalSeconds}:${cycleStartedAt}`;
+  const cycleStartedAt = timestampMillis(config.cycleStartedAt);
+  const serverTimeOffsetMs = venueServerTimeOffsetMs;
+  const key = `${mode}:${intervalSeconds}:${cycleStartedAt}:${serverTimeOffsetMs}`;
   if (key === venueConfigKey) return;
   venueConfigKey = key;
   stopVenueTimer();
@@ -197,15 +235,46 @@ function applyVenueDisplaySettings() {
     renderPinnedVenueStatus(mode);
     return;
   }
+  if (!Number.isFinite(cycleStartedAt) || !Number.isFinite(serverTimeOffsetMs)) {
+    renderUnsyncedVenueStatus();
+    ensureVenueServerClock();
+    return;
+  }
 
-  const sync = () => syncVenueCycle(intervalSeconds, cycleStartedAt);
+  const sync = () => syncVenueCycle(intervalSeconds, cycleStartedAt, serverTimeOffsetMs);
   sync();
   venueTimer = window.setInterval(sync, 250);
 }
 
-function syncVenueCycle(intervalSeconds, cycleStartedAt) {
+function ensureVenueServerClock() {
+  if (!isVenueMode || maintenanceActive || venueClockRequest || Number.isFinite(venueServerTimeOffsetMs)) return;
+  if (venueClockRetry) {
+    window.clearTimeout(venueClockRetry);
+    venueClockRetry = null;
+  }
+  venueClockRequest = getServerClockOffset()
+    .then((offset) => {
+      venueServerTimeOffsetMs = offset;
+      venueConfigKey = "";
+      applyVenueDisplaySettings();
+    })
+    .catch(() => {
+      venueServerTimeOffsetMs = null;
+      stopVenueTimer();
+      renderUnsyncedVenueStatus();
+      venueClockRetry = window.setTimeout(() => {
+        venueClockRetry = null;
+        ensureVenueServerClock();
+      }, 5000);
+    })
+    .finally(() => {
+      venueClockRequest = null;
+    });
+}
+
+function syncVenueCycle(intervalSeconds, cycleStartedAt, serverTimeOffsetMs) {
   const intervalMs = intervalSeconds * 1000;
-  const elapsed = Math.max(0, Date.now() - cycleStartedAt);
+  const elapsed = Math.max(0, (Date.now() + serverTimeOffsetMs) - cycleStartedAt);
   const slot = Math.floor(elapsed / intervalMs);
   const elapsedInSlot = elapsed % intervalMs;
   const current = slot % 2 === 0 ? "men" : "women";
@@ -231,6 +300,22 @@ function renderPinnedVenueStatus(division) {
   document.getElementById("venueProgressTrack").hidden = true;
 }
 
+function renderUnsyncedVenueStatus() {
+  document.getElementById("venueCurrentDivision").textContent = "송출 동기화 대기";
+  document.getElementById("venueNextDivision").textContent = "서버 기준 시간이 확인되면 자동 전환됩니다";
+  document.getElementById("venueCountdown").textContent = "";
+  document.getElementById("venueProgressTrack").hidden = true;
+}
+
+function timestampMillis(value) {
+  if (Number.isFinite(value)) return Number(value);
+  if (value && typeof value.toMillis === "function") {
+    const millis = value.toMillis();
+    return Number.isFinite(millis) ? millis : null;
+  }
+  return null;
+}
+
 function stopVenueTimer() {
   if (venueTimer) window.clearInterval(venueTimer);
   venueTimer = null;
@@ -250,16 +335,49 @@ function placeVenueStatus() {
 function initConnectionWatch() {
   window.addEventListener("firestore-error", (e) => {
     const { label, err } = e.detail;
-    const code = err && err.code ? ` (${err.code})` : "";
-    showErrorBanner(`⚠️ ${label} 실패${code}: ${err && err.message ? err.message : err}\nFirestore 보안 규칙이 게시되어 있는지 Firebase 콘솔에서 확인해주세요.`);
+    setFeedError(feedIdByLabel[label], `${label} 실패${err?.code ? ` (${err.code})` : ""}`);
   });
   window.addEventListener("firestore-timeout", (e) => {
-    showErrorBanner(
-      `⚠️ "${e.detail.label}" 실시간 연결이 응답하지 않습니다.\n` +
-      `광고 차단/보안 확장 프로그램이 Firestore 실시간 연결을 막고 있을 수 있습니다 — 확장 프로그램을 끄거나 시크릿창에서 다시 열어보세요.\n` +
-      `그래도 안 되면 다른 네트워크(예: 휴대폰 테더링)에서 시도해보세요.`
-    );
+    setFeedError(feedIdByLabel[e.detail.label], `"${e.detail.label}" 실시간 연결이 응답하지 않습니다.`);
   });
+}
+
+function setFeedSnapshot(id, metadata) {
+  const feed = feedHealth[id];
+  if (!feed) return;
+  const confirmed = metadata && metadata.fromCache === false && metadata.hasPendingWrites === false;
+  feed.state = confirmed ? (feed.state === "error" || feed.state === "cache" ? "recovered" : "healthy") : "cache";
+  feed.message = confirmed ? "" : `${id} 데이터가 서버에서 확인되지 않았습니다.`;
+  updateFeedHealth();
+}
+
+function setFeedError(ids, message) {
+  for (const id of Array.isArray(ids) ? ids : [ids]) {
+    if (!id || !feedHealth[id]) continue;
+    feedHealth[id].state = "error";
+    feedHealth[id].message = message;
+  }
+  updateFeedHealth();
+}
+
+function updateFeedHealth() {
+  const failures = FEED_IDS.filter((id) => ['error', 'cache'].includes(feedHealth[id].state));
+  const pending = FEED_IDS.filter((id) => feedHealth[id].state === "pending");
+  const liveStatus = document.querySelector(".live-dot");
+  if (liveStatus && !maintenanceActive) {
+    const state = failures.length ? "degraded" : pending.length ? "pending" : "live";
+    liveStatus.dataset.feedHealth = state;
+    liveStatus.textContent = failures.length ? `일부 연결 지연 (${failures.length})` : pending.length ? "연결 확인 중" : "실시간 중계중";
+    liveStatus.setAttribute("aria-label", failures.length
+      ? `데이터 연결 저하: ${failures.join(", ")}`
+      : pending.length ? `데이터 연결 확인 중: ${pending.join(", ")}`
+      : "모든 데이터 연결 정상");
+  }
+  if (failures.length) {
+    showErrorBanner(`⚠️ 일부 실시간 데이터 연결이 지연되고 있습니다: ${failures.map((id) => feedHealth[id].message || id).join(" / ")}`);
+  } else {
+    hideErrorBanner();
+  }
 }
 
 function showErrorBanner(text) {
@@ -419,18 +537,27 @@ function renderPrelim() {
     groupMatches.forEach((match) => {
       const evaluated = evaluatePrelimMatch(match.sets || []);
       const scoreText = (match.sets || []).filter((set) => Number(set.a) > 0 || Number(set.b) > 0).map((set) => `${set.a}:${set.b}`).join(" / ");
-      const badge = evaluated.result === "A" ? `<span class="badge win">${escapeHtml(teamName(match.teamA, state))} 승</span>`
-        : evaluated.result === "B" ? `<span class="badge win">${escapeHtml(teamName(match.teamB, state))} 승</span>`
-        : evaluated.result === "draw" ? '<span class="badge draw">무승부</span>'
-        : evaluated.status === "in_progress" ? '<span class="badge">경기중</span>'
-        : '<span class="badge">경기전</span>';
       const row = document.createElement("div");
       row.className = "row";
       row.style.justifyContent = "space-between";
       row.style.padding = "6px 2px";
       row.style.borderBottom = "1px solid var(--line)";
       row.style.fontSize = "13px";
-      row.innerHTML = `<span>${escapeHtml(teamName(match.teamA, state))} vs ${escapeHtml(teamName(match.teamB, state))} <span style="color:var(--muted);">${scoreText}</span></span>${badge}`;
+      const summary = document.createElement("span");
+      summary.append(document.createTextNode(`${teamName(match.teamA, state)} vs ${teamName(match.teamB, state)} `));
+      const score = document.createElement("span");
+      score.style.color = "var(--muted)";
+      score.textContent = scoreText;
+      summary.appendChild(score);
+      row.appendChild(summary);
+      const result = document.createElement("span");
+      result.className = evaluated.result === "A" || evaluated.result === "B" ? "badge win"
+        : evaluated.result === "draw" ? "badge draw" : "badge";
+      result.textContent = evaluated.result === "A" ? `${teamName(match.teamA, state)} 승`
+        : evaluated.result === "B" ? `${teamName(match.teamB, state)} 승`
+          : evaluated.result === "draw" ? "무승부"
+            : evaluated.status === "in_progress" ? "경기중" : "경기전";
+      row.appendChild(result);
       matchList.appendChild(row);
     });
     card.appendChild(matchList);

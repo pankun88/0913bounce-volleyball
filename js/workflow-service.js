@@ -6,7 +6,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
 import { auth, db, functions } from "./firebase-init.js";
-import { TOURNAMENT_ID } from "./score-workflow.js";
+import { TOURNAMENT_ID } from "./firebase-config.js";
 
 const base = (collection, id) => doc(db, "tournaments", TOURNAMENT_ID, collection, id);
 const workflowRef = (matchKey) => base("scoreWorkflows", matchKey);
@@ -19,7 +19,7 @@ function required(value, message) {
   return value;
 }
 function transitionId(matchKey, event, token, revision = 0) {
-  return `${matchKey}:${event}:${token}:${revision}`;
+  return `recorder:${matchKey}:${event}:${token}:${revision}`;
 }
 function scoreSnapshot(score) {
   const sets = Array.isArray(score?.sets) ? score.sets.slice(0, 3).map((set) => ({ a: Number(set.a), b: Number(set.b) })) : [];
@@ -59,6 +59,9 @@ export async function resumeCurrentMatch({ matchKey, courtId, queueRevision, rec
 export async function claimCurrentMatch({ matchKey, courtId, queueRevision, recorderName, token = crypto.randomUUID() }) {
   const normalizedRecorderName = typeof recorderName === "string" ? recorderName.trim() : "";
   required(normalizedRecorderName, "기록관 이름을 선택하세요.");
+  if (typeof token !== "string" || token.length < 16 || token.length > 128) {
+    throw new Error("유효한 경기 잠금 토큰이 필요합니다.");
+  }
   return runTransaction(db, async (tx) => {
     const [queueSnap, assignmentSnap, workflowSnap] = await Promise.all([tx.get(queueRef(courtId)), tx.get(assignmentRef(matchKey)), tx.get(workflowRef(matchKey))]);
     const queue = required(queueSnap.data(), "대기열이 없습니다."); const assignment = required(assignmentSnap.data(), "배정이 없습니다."); const workflow = required(workflowSnap.data(), "워크플로가 없습니다.");

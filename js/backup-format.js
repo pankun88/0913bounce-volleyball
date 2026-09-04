@@ -8,10 +8,26 @@ const PRIVATE_BACKUP_KEYS = new Set([
   "admins", "adminmembers", "adminuids", "adminids", "recordergrant", "recordergrants",
   "grant", "grants", "recorderaccess", "accessconfig",
 ]);
+const RESTORABLE_ROOT_FIELDS = [
+  "name", "qualifyPerGroup", "venueDisplay", "courtTopologyRevision",
+];
+const BUSINESS_PATH = /^tournaments\/([^/]+)\/(?:(groups|teams|prelimMatches|officialRevisions|courts|courtAssignments|courtQueues|scoreWorkflows|auditEvents)\/([^/]+)|divisions\/(men|women)\/finalMatches\/([^/]+))$/;
+const FIRESTORE_VALUE_TAG = "__bounceFirestoreValue";
 
 function safeBackupValue(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
   if (Array.isArray(value)) return value.map(safeBackupValue);
-  if (!value || typeof value !== "object") return value;
+  if (typeof value !== "object") invalidBackup();
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) invalidBackup();
+  if (Object.hasOwn(value, FIRESTORE_VALUE_TAG)) {
+    if (Object.keys(value).length !== 3 || value[FIRESTORE_VALUE_TAG] !== "timestamp" ||
+        typeof value.seconds !== "string" || !/^(?:0|-[1-9]\d*|[1-9]\d*)$/.test(value.seconds) ||
+        !Number.isInteger(value.nanoseconds) || value.nanoseconds < 0 || value.nanoseconds >= 1_000_000_000) {
+      invalidBackup();
+    }
+    return { [FIRESTORE_VALUE_TAG]: "timestamp", seconds: value.seconds, nanoseconds: value.nanoseconds };
+  }
   return Object.fromEntries(Object.entries(value)
     .filter(([key]) => !PRIVATE_BACKUP_KEYS.has(key.toLowerCase()))
     .map(([key, item]) => [key, safeBackupValue(item)]));
@@ -21,11 +37,97 @@ function invalidBackup() {
   throw new Error("올바른 백업 파일이 아닙니다.");
 }
 
+export function restorableRootData(info) {
+  if (info == null) return {};
+  if (typeof info !== "object" || Array.isArray(info) ||
+      (Object.getPrototypeOf(info) !== Object.prototype && Object.getPrototypeOf(info) !== null)) invalidBackup();
+  return Object.fromEntries(RESTORABLE_ROOT_FIELDS
+    .filter((field) => Object.hasOwn(info, field))
+    .map((field) => [field, safeBackupValue(info[field])]));
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  }
+  return value;
+}
+
+export function restorePayloadMatches(savedPayload, payload) {
+  return JSON.stringify(canonical(savedPayload)) === JSON.stringify(canonical(payload));
+}
+
+export function selectRestoreRecovery({ activeManifestId, savedState, payload, newManifestId }) {
+  const reuseSaved = Boolean(
+    activeManifestId
+    && savedState?.manifestId === activeManifestId
+    && restorePayloadMatches(savedState.payload, payload)
+  );
+  const manifestId = reuseSaved ? savedState.manifestId : newManifestId;
+  return {
+    manifestId,
+    priorManifestId: activeManifestId || null,
+    reuseSaved,
+    supersede: Boolean(activeManifestId && activeManifestId !== manifestId),
+  };
+}
+
+/**
+ * Convert the server's exact-restorable path chunks into the portable v3
+ * backup shape used by import normalization and downloaded backup files.
+ */
+export function backupFromServerExport(response) {
+  if (!response || response.version !== 3 || typeof response.tournamentId !== "string" ||
+      !Array.isArray(response.chunks)) invalidBackup();
+  const backup = {
+    app: "bounce-volleyball",
+    type: "backup",
+    version: 3,
+    tournamentId: response.tournamentId,
+    info: restorableRootData(response.rootData),
+    groups: [],
+    teams: [],
+    prelimMatches: [],
+    finalMatches: { men: [], women: [] },
+    officialRevisions: [],
+    courts: [],
+    courtAssignments: [],
+    courtQueues: [],
+    scoreWorkflows: [],
+    auditEvents: [],
+  };
+  const collections = {
+    groups: backup.groups,
+    teams: backup.teams,
+    prelimMatches: backup.prelimMatches,
+    officialRevisions: backup.officialRevisions,
+    courts: backup.courts,
+    courtAssignments: backup.courtAssignments,
+    courtQueues: backup.courtQueues,
+    scoreWorkflows: backup.scoreWorkflows,
+    auditEvents: backup.auditEvents,
+  };
+  const paths = new Set();
+  response.chunks.forEach((chunk) => {
+    if (!chunk || !Array.isArray(chunk.documents)) invalidBackup();
+    chunk.documents.forEach((item) => {
+      const match = typeof item?.path === "string" && BUSINESS_PATH.exec(item.path);
+      if (!match || match[1] !== response.tournamentId || !item.data ||
+          typeof item.data !== "object" || Array.isArray(item.data) || paths.has(item.path)) invalidBackup();
+      paths.add(item.path);
+      if (match[2]) collections[match[2]].push({ id: match[3], data: safeBackupValue(item.data) });
+      else backup.finalMatches[match[4]].push({ id: match[5], data: safeBackupValue(item.data) });
+    });
+  });
+  return normalizeV3(backup);
+}
+
 function documentArray(value) {
   if (!Array.isArray(value)) invalidBackup();
   const ids = new Set();
   value.forEach((item) => {
-    if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id ||
+    if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id || item.id.includes("/") ||
         !item.data || typeof item.data !== "object" || Array.isArray(item.data) || ids.has(item.id)) {
       invalidBackup();
     }
@@ -85,9 +187,23 @@ function validateQueueBackup(queues, assignments, workflows) {
 }
 
 function normalizeV3(data) {
+  const allowedFields = [
+    "app", "type", "version", "tournamentId", "info",
+    "groups", "teams", "prelimMatches", "finalMatches", "officialRevisions",
+    "courts", "courtAssignments", "courtQueues", "scoreWorkflows", "auditEvents",
+  ];
+  if (data.app !== "bounce-volleyball"
+      || data.tournamentId !== "main"
+      || !Object.hasOwn(data, "info")
+      || !data.info || typeof data.info !== "object" || Array.isArray(data.info)
+      || Object.keys(data).length !== allowedFields.length
+      || allowedFields.some((field) => !Object.hasOwn(data, field))
+      || Object.keys(data).some((field) => !allowedFields.includes(field))) {
+    invalidBackup();
+  }
   const requiredArrays = [
     "groups", "teams", "prelimMatches", "officialRevisions", "courts",
-    "courtAssignments", "courtQueues", "scoreWorkflows", "auditEvents", "restoreManifests",
+    "courtAssignments", "courtQueues", "scoreWorkflows", "auditEvents",
   ];
   requiredArrays.forEach((field) => documentArray(data[field]));
   if (!data.finalMatches || !Array.isArray(data.finalMatches.men) || !Array.isArray(data.finalMatches.women)) {
@@ -95,63 +211,18 @@ function normalizeV3(data) {
   }
   documentArray(data.finalMatches.men);
   documentArray(data.finalMatches.women);
-  if (!data.maintenance || typeof data.maintenance !== "object" || Array.isArray(data.maintenance) ||
-      typeof data.maintenance.enabled !== "boolean") {
-    invalidBackup();
-  }
-
   data.courtAssignments.forEach(({ data: assignment }) => {
     if (!Number.isInteger(assignment.attemptCount) || assignment.attemptCount < 0) invalidBackup();
   });
   validateQueueBackup(data.courtQueues, data.courtAssignments, data.scoreWorkflows);
+  data.info = restorableRootData(data.info);
   return data;
 }
 
-/**
- * Normalize only known safe backup schemas. v1/v2 remain migration input
- * (version 2); unresolved legacy data is never relabeled as schema v3.
- */
+/** Portable backups have one exact, type-preserving schema: v3. */
 export function normalizeBackupData(rawData) {
   const data = safeBackupValue(rawData);
   if (!data || data.type !== "backup") invalidBackup();
-
-  if (data.version === 1) {
-    if (!Array.isArray(data.groups) || !Array.isArray(data.teams) ||
-        !Array.isArray(data.prelimMatches) || !Array.isArray(data.finalMatches)) {
-      invalidBackup();
-    }
-
-    const tournamentName = String(data.info?.name || "").toLowerCase();
-    const division = /girl|여자|여성/.test(tournamentName) ? "women" : "men";
-    const addDivision = (item) => ({
-      ...item,
-      data: { ...(item.data || {}), division },
-    });
-    const info = data.info ? { ...data.info } : data.info;
-    if (info && typeof info.qualifyPerGroup === "number") {
-      info.qualifyPerGroup = { [division]: info.qualifyPerGroup };
-    }
-
-    return {
-      ...data,
-      version: 2,
-      info,
-      groups: data.groups.map(addDivision),
-      teams: data.teams.map(addDivision),
-      prelimMatches: data.prelimMatches.map(addDivision),
-      finalMatches: {
-        men: division === "men" ? data.finalMatches : [],
-        women: division === "women" ? data.finalMatches : [],
-      },
-    };
-  }
-
-  if (data.version === 2 && Array.isArray(data.groups) && Array.isArray(data.teams) &&
-      Array.isArray(data.prelimMatches) && data.finalMatches &&
-      Array.isArray(data.finalMatches.men) && Array.isArray(data.finalMatches.women)) {
-    return data;
-  }
-
   if (data.version === 3) return normalizeV3(data);
   invalidBackup();
 }

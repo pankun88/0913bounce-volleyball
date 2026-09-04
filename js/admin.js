@@ -1,22 +1,22 @@
 import { isFirebaseConfigured, db } from "./firebase-init.js";
 import {
-  collection, doc, getDoc, getDocs, onSnapshot,
+  collection, doc, getDoc, getDocs, onSnapshot, serverTimestamp, updateDoc,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { watchAuthState, login, logout, requestPasswordReset, changePassword, describeAuthError } from "./auth-service.js";
 import {
   saveTournamentInfo, subscribeTournamentInfo,
-  addGroup, reorderGroups, deleteGroup, deleteAllGroups, subscribeGroups,
-  addTeam, deleteTeam, moveAndReorderTeam, deleteAllTeams, subscribeTeams,
-  generatePrelimMatchesForGroup, subscribePrelimMatches, reorderPrelimMatches, clearAllPrelimMatches,
-  setGroupMatchMode, setGroupRingOrder, clearPrelimMatchesForGroup, generateRingMatchesForGroup, resetAllRingOrders,
-  publishFinalBracket, subscribeFinalMatches, clearFinalBracket,
+  addGroup, reorderGroups, subscribeGroups,
+  addTeam, moveAndReorderTeam, subscribeTeams,
+  mutatePrelimStructure, subscribePrelimMatches, reorderPrelimMatches,
+  setGroupMatchMode, setGroupRingOrder,
+  publishFinalBracket, subscribeFinalMatches,
   exportAllData, importAllData,
 } from "./firestore-service.js";
-import { evaluatePrelimMatch, computeGroupStandings, validateSetScore } from "./match-logic.js";
-import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam, generateBracket } from "./bracket.js";
+import { evaluatePrelimMatch, evaluateFinalMatch, computeGroupStandings, computeAutomaticQualifiers, validateSetScore } from "./match-logic.js";
+import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
 import { renderBracket } from "./bracket-render.js";
 import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
-import { normalizeRingOrder, getRingMatchPairs, renderRingDiagram } from "./ring-bracket.js";
+import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
 import { orderExistingRoundRobinMatchIds } from "./schedule.js";
 import { adminWorkflowCallable } from "./workflow-service.js";
 import { reconcilePlannerAssignments } from "./score-workflow.js";
@@ -36,6 +36,9 @@ let groups = [];
 let teams = [];
 let prelimMatches = [];
 let finalMatches = [];
+let authoritativeFinalMatches = [];
+let finalDraftBaseline = [];
+let finalScoreDrafts = new Map();
 let seedSelection = []; // 본선 진출팀 id 순서 (시드순)
 let seedAutoMode = true; // true면 예선 순위 기준 추천 진출팀을 매 렌더마다 자동으로 채움 (체크박스/화살표를 직접 조작하면 false로 바뀜)
 let pendingAutoSelectGroupName = null; // 방금 추가한 조 이름 — 팀 등록 select에 자동 선택용
@@ -47,6 +50,8 @@ let isAddingTeam = false; // 저장 응답 전 중복 클릭/Enter로 같은 팀
 // 일단 화면(로컬)에서만 반영해두고, 관리자가 "관객 화면에 공개" 버튼을 눌러야만
 // Firestore에 저장돼 대시보드에 실제로 공유된다.
 let bracketPublishPending = false;
+let bracketPublishConflict = false;
+let bracketPublishInFlight = false;
 let unsubscribeFinalMatches = null;
 let reviewAssignments = [];
 let reviewWorkflows = new Map();
@@ -55,17 +60,59 @@ let reviewCourts = new Map();
 let reviewAudits = new Map();
 const reviewFinalMatchesByDivision = { men: [], women: [] };
 let correctionPreview = null;
+let correctionPreviewGeneration = 0;
 let unsubscribeWorkflowReviews = [];
 let workflowDraftAssignments = [];
 let workflowDraftCourts = [];
 let workflowDirty = false;
 let workflowSaveInProgress = false;
+let workflowTopologyBaseline = 0;
+let workflowQueueRevisionBaseline = {};
 let tournamentResetInProgress = false;
 let tournamentResetState = null;
 const TOURNAMENT_RESET_STATE_KEY = "bounce-volleyball:tournament-reset";
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
+
+function cloneFinalMatches(matches) {
+  return structuredClone(matches || []);
+}
+
+function finalBaselineDescriptor(matches) {
+  return (matches || [])
+    .map((match) => ({
+      id: match.id,
+      lastTransitionId: match.lastTransitionId ?? null,
+      officialRevision: Number(match.officialRevision) || 0,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function sameFinalBaseline(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function resetFinalDraft(matches = authoritativeFinalMatches) {
+  authoritativeFinalMatches = cloneFinalMatches(matches);
+  finalMatches = cloneFinalMatches(matches);
+  finalDraftBaseline = finalBaselineDescriptor(matches);
+  finalScoreDrafts = new Map();
+  bracketPublishPending = false;
+  bracketPublishConflict = false;
+}
+
+function discardFinalDraft() {
+  resetFinalDraft(authoritativeFinalMatches);
+  renderFinalBracket();
+  renderFinalTeamPicker();
+}
+
+function finalMutationAllowed() {
+  if (!bracketPublishInFlight) return true;
+  showToast("본선 공개 처리 중입니다. 완료 후 다시 시도하세요.", 3000);
+  return false;
+}
 
 function syncDivisionThemeScopes() {
   ["divisionSetupSession", "tab-prelim", "tab-final"].forEach((id) => {
@@ -110,11 +157,17 @@ function refreshActiveDivisionData() {
 
 function rebindFinalMatches() {
   unsubscribeFinalMatches?.();
-  finalMatches = [];
+  resetFinalDraft([]);
   renderFinalBracket();
   renderFinalTeamPicker();
   unsubscribeFinalMatches = subscribeFinalMatches(activeDivision, (data) => {
-    finalMatches = data;
+    authoritativeFinalMatches = cloneFinalMatches(data);
+    invalidateCorrectionPreview("공식 경기 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
+    if (!bracketPublishPending) {
+      resetFinalDraft(data);
+    } else if (!sameFinalBaseline(finalDraftBaseline, finalBaselineDescriptor(data))) {
+      bracketPublishConflict = true;
+    }
     if (!workflowDirty) resetWorkflowDraft();
     else refreshWorkflowMatchMetadata();
     renderFinalBracket();
@@ -163,6 +216,7 @@ subscribeTournamentInfo((info) => {
 
 subscribeGroups((data) => {
   allGroups = data;
+  invalidateCorrectionPreview("조 정보가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
@@ -170,6 +224,7 @@ subscribeGroups((data) => {
 
 subscribeTeams((data) => {
   allTeams = data;
+  invalidateCorrectionPreview("팀 정보가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
@@ -177,6 +232,7 @@ subscribeTeams((data) => {
 
 subscribePrelimMatches((data) => {
   allPrelimMatches = data;
+  invalidateCorrectionPreview("공식 경기 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
@@ -450,6 +506,7 @@ function subscribeWorkflowReviews() {
   unsubscribeWorkflowReviews = [
     onSnapshot(collection(db, ...root, "courtAssignments"), (snap) => {
       reviewAssignments = snap.docs.map((item) => ({ id: item.id, ...item.data() }));
+      invalidateCorrectionPreview("코트 배정 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       if (!workflowDirty) resetWorkflowDraft();
       renderScoreReviews();
       renderWorkflowCourtPlanner();
@@ -458,15 +515,18 @@ function subscribeWorkflowReviews() {
     }, (err) => reportError("검수 목록 구독", err)),
     onSnapshot(collection(db, ...root, "scoreWorkflows"), (snap) => {
       reviewWorkflows = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      invalidateCorrectionPreview("기록·잠금 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       renderScoreReviews();
       renderPrelimViews();
     }, (err) => reportError("워크플로 구독", err)),
     onSnapshot(collection(db, ...root, "courtQueues"), (snap) => {
       reviewQueues = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      invalidateCorrectionPreview("코트 대기열 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       renderWorkflowCourtPlanner();
     }, (err) => reportError("코트 대기열 구독", err)),
     onSnapshot(collection(db, ...root, "courts"), (snap) => {
       reviewCourts = new Map(snap.docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      invalidateCorrectionPreview("코트 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       if (!workflowDirty) resetWorkflowDraft();
       renderWorkflowCourtPlanner();
       renderScoreReviews();
@@ -482,6 +542,7 @@ function subscribeWorkflowReviews() {
     }, (err) => reportError("검수 감사 로그 구독", err)),
     ...Object.keys(reviewFinalMatchesByDivision).map((division) => subscribeFinalMatches(division, (matches) => {
       reviewFinalMatchesByDivision[division] = matches;
+      invalidateCorrectionPreview("공식 경기 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
       if (!workflowDirty) resetWorkflowDraft();
       else refreshWorkflowMatchMetadata();
       renderScoreReviews();
@@ -514,7 +575,9 @@ function workflowMatchOptions() {
         || Boolean(match.result)
         || (Array.isArray(match.sets) && match.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0)),
     })),
-    ...Object.entries(reviewFinalMatchesByDivision).flatMap(([divisionId, matches]) => matches.map((match) => ({
+    ...Object.entries(reviewFinalMatchesByDivision).flatMap(([divisionId, matches]) => matches
+      .filter((match) => !["empty", "bye_pending", "bye"].includes(match.status))
+      .map((match) => ({
       matchKey: `final:${divisionId}:${match.id}`,
       matchType: "final",
       matchId: match.id,
@@ -527,7 +590,7 @@ function workflowMatchOptions() {
       hasOfficialHistory: (match.officialRevision || 0) > 0
         || Boolean(match.result || match.winner || match.winnerTeam)
         || (Array.isArray(match.sets) && match.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0)),
-    }))),
+      }))),
   ];
 }
 
@@ -555,6 +618,10 @@ function resetWorkflowDraft() {
       courtId: persisted.get(option.matchKey)?.courtId || null,
     }));
   workflowDirty = false;
+  workflowTopologyBaseline = Number(tournamentInfo.courtTopologyRevision || 0);
+  workflowQueueRevisionBaseline = Object.fromEntries(
+    [...reviewQueues].map(([courtId, queue]) => [courtId, Number(queue.queueRevision || 0)]),
+  );
 }
 
 async function reloadWorkflowAuthoritativeState({ preserveDraft = false } = {}) {
@@ -579,6 +646,11 @@ async function reloadWorkflowAuthoritativeState({ preserveDraft = false } = {}) 
   renderScoreReviews();
   renderPrelimViews();
   renderFinalBracket();
+}
+
+async function mutatePrelimStructureAndRefresh(operation, data = {}) {
+  await mutatePrelimStructure(operation, activeDivision, data);
+  await reloadWorkflowAuthoritativeState();
 }
 
 function refreshWorkflowMatchMetadata() {
@@ -838,10 +910,10 @@ async function saveCourtWorkflow(button) {
       courts: workflowDraftCourts.map((court) => ({ id: court.id, name: normalizeCourtName(court.name), recorderName: court.recorderName.trim() })),
       assignmentsByCourt,
       unassignedAssignments,
-      expectedTopologyRevision: Number(tournamentInfo.courtTopologyRevision || 0),
-      expectedQueueRevisions: Object.fromEntries(
-        [...reviewQueues].map(([courtId, queue]) => [courtId, Number(queue.queueRevision || 0)]),
-      ),
+      // Keep the baseline captured with this draft: accepting live snapshots here
+      // would silently overwrite a concurrent topology or queue change.
+      expectedTopologyRevision: workflowTopologyBaseline,
+      expectedQueueRevisions: workflowQueueRevisionBaseline,
     }));
     if (result) {
       await reloadWorkflowAuthoritativeState();
@@ -1028,12 +1100,12 @@ function renderScoreReviews() {
     row.dataset.reviewMatch = assignment.id;
     row.dataset.divisionTheme = assignment.divisionId || assignment.division || "men";
     const audit = reviewAudits.get(assignment.id);
-    const submittedAt = audit?.createdAt?.toDate?.()?.toLocaleString?.()
-      || workflow.submittedAt?.toDate?.()?.toLocaleString?.()
+    const submittedAt = workflow.submittedAt?.toDate?.()?.toLocaleString?.()
+      || audit?.createdAt?.toDate?.()?.toLocaleString?.()
       || workflow.updatedAt?.toDate?.()?.toLocaleString?.()
       || "";
     const author = isSubmitted
-      ? (audit?.actor?.name || workflow.submittedBy?.name || workflow.lock?.recorderName || "기록관")
+      ? (workflow.submission?.recorder?.name || "기록관")
       : (workflow.lock?.recorderName || "기록관");
     const scoreText = formatSets(workflow.submittedSnapshot || workflow.draft);
     const header = document.createElement("div");
@@ -1062,8 +1134,12 @@ function renderScoreReviews() {
     row.append(header, matchup, meta, actions);
     const approve = document.createElement("button");
     approve.className = "btn primary small";
-    approve.textContent = "승인";
+    approve.textContent = assignment.matchType === "final" ? "공개 초안에 반영" : "승인";
     approve.addEventListener("click", async () => {
+      if (assignment.matchType === "final") {
+        stageSubmittedFinalReview(assignment, workflow);
+        return;
+      }
       const ok = await runWorkflowButton(approve, "점수 승인", () => adminWorkflowCallable("approveScoreReview", {
         matchKey: assignment.id,
         expectedSubmissionVersion: workflow.submissionVersion,
@@ -1084,11 +1160,9 @@ function renderScoreReviews() {
       }));
       if (ok) showToast("반려했습니다.");
     });
-    const edit = document.createElement("button");
-    edit.className = "btn small";
-    edit.textContent = "수정·승인";
-    edit.addEventListener("click", () => openAdminScoreModal(assignment, workflow));
-    if (isSubmitted) actions.append(approve, reject, edit);
+    if (isSubmitted) {
+      actions.append(approve, reject);
+    }
     if (workflow.lock) {
       const release = document.createElement("button");
       release.className = "btn danger small";
@@ -1134,27 +1208,39 @@ function renderCorrectionMatchOptions() {
   });
 }
 
-function openAdminScoreModal(assignment, workflow) {
-  const final = assignment.matchType === "final";
-  const display = scoreReviewDisplay(assignment);
-  openScoreModal({
-    teamAName: display.teamA,
-    teamBName: display.teamB,
-    setLabels: final ? ["1세트 (10점)", "2세트 (10점)", "3세트 (7점)"] : ["1세트 (10점)", "2세트 (10점)"],
-    targets: final ? [10, 10, 7] : [10, 10],
-    existingSets: workflow.submittedSnapshot?.sets || workflow.draft?.sets || [],
-    onSave: async (sets) => {
-      const reason = requiredReason("관리자 직접 수정");
-      if (!reason) throw new Error("정정 사유는 필수입니다.");
-      await adminWorkflowCallable("directEditOfficialScore", {
-        matchKey: assignment.id,
-        score: { sets },
-        reason,
-        expectedOfficialRevision: workflow.officialRevision || 0,
-      });
-      showToast("관리자 수정 점수를 승인했습니다.");
-    },
-  });
+function invalidateCorrectionPreview(message = "정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.") {
+  correctionPreview = null;
+  correctionPreviewGeneration += 1;
+  const applyButton = document.getElementById("applyCorrectionBtn");
+  if (applyButton) applyButton.disabled = true;
+  const preview = document.getElementById("correctionPreview");
+  if (preview) preview.textContent = message;
+}
+
+function stageSubmittedFinalReview(assignment, workflow) {
+  const division = assignment.divisionId || assignment.division;
+  if (division !== activeDivision) {
+    showToast(`${DIVISION_LABELS[division] || division} 본선으로 전환한 뒤 공개 초안에 반영하세요.`, 4000);
+    return;
+  }
+  if (!finalMutationAllowed()) return;
+  const match = finalMatches.find((item) => item.id === assignment.matchId);
+  const sets = workflow.submittedSnapshot?.sets || workflow.draft?.sets;
+  if (!match || !Array.isArray(sets) || evaluateFinalMatch(sets).status !== "done") {
+    showToast("현재 본선 대진과 제출 점수를 확인할 수 없습니다.", 4000);
+    return;
+  }
+  const official = authoritativeFinalMatches.find((item) => item.id === match.id);
+  const changed = JSON.stringify(official?.sets || []) !== JSON.stringify(sets);
+  const reason = (official?.officialRevision || 0) > 0 && changed
+    ? requiredReason("승인된 본선 점수 정정")
+    : "";
+  if ((official?.officialRevision || 0) > 0 && changed && !reason) {
+    showToast("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
+    return;
+  }
+  stageFinalScoreDraft(match.id, sets, reason);
+  showToast("제출 점수를 로컬 본선 초안에 반영했습니다. 관객 화면에 공개해야 확정됩니다.");
 }
 
 // ---------------- 대회설정: 대회명 ----------------
@@ -1164,6 +1250,7 @@ function bindStaticHandlers() {
     button.addEventListener("click", () => {
       const nextDivision = button.dataset.division;
       if (nextDivision === activeDivision) return;
+      if (!finalMutationAllowed()) return;
       if (bracketPublishPending && !confirm(`${divisionLabel()}의 공개하지 않은 본선 대진 변경사항을 버리고 ${DIVISION_LABELS[nextDivision]}로 전환할까요?`)) return;
       activeDivision = nextDivision;
       document.body.dataset.division = activeDivision;
@@ -1198,7 +1285,13 @@ function bindStaticHandlers() {
   document.getElementById("saveQualifyPerGroupBtn").addEventListener("click", async () => {
     const qualifyPerGroup = Math.max(1, Number(document.getElementById("qualifyPerGroupInput").value) || 2);
     try {
-      await saveTournamentInfo({ qualifyPerGroup: { ...(tournamentInfo.qualifyPerGroup || {}), [activeDivision]: qualifyPerGroup } });
+      await updateDoc(
+        doc(db, "tournaments", TOURNAMENT_ID),
+        {
+          [`qualifyPerGroup.${activeDivision}`]: qualifyPerGroup,
+          updatedAt: serverTimestamp(),
+        },
+      );
       seedAutoMode = true; // 진출 팀 수 설정을 바꿨으니 추천 진출팀을 다시 계산해서 보여준다
       showToast(`${divisionLabel()} 조별 진출 팀 수를 저장했습니다`);
     } catch (err) {
@@ -1214,7 +1307,7 @@ function bindStaticHandlers() {
     if (!groups.length) return showToast("이미 등록된 조가 없습니다");
     if (!confirm(`${divisionLabel()}의 모든 조를 삭제할까요? 소속 팀은 모두 미배정 상태가 되고, 해당 조의 예선 대진/결과도 함께 삭제됩니다.`)) return;
     try {
-      await deleteAllGroups(activeDivision);
+      await mutatePrelimStructureAndRefresh("delete_all_groups");
       showToast(`${divisionLabel()} 조를 모두 초기화했습니다`);
     } catch (err) {
       reportError("조 초기화", err);
@@ -1230,7 +1323,7 @@ function bindStaticHandlers() {
     if (!teams.length) return showToast("이미 등록된 팀이 없습니다");
     if (!confirm(`${divisionLabel()}의 모든 팀을 삭제할까요? 예선·본선 경기 기록도 함께 삭제됩니다.`)) return;
     try {
-      await deleteAllTeams(activeDivision);
+      await mutatePrelimStructureAndRefresh("delete_all_teams");
       showToast(`${divisionLabel()} 팀을 모두 초기화했습니다`);
     } catch (err) {
       reportError("팀 초기화", err);
@@ -1242,8 +1335,7 @@ function bindStaticHandlers() {
     if (!prelimMatches.length && !hasRingPlacement) return showToast("초기화할 예선 경기가 없습니다");
     if (!confirm(`${divisionLabel()} 모든 조의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
     try {
-      await clearAllPrelimMatches(activeDivision);
-      await resetAllRingOrders(activeDivision);
+      await mutatePrelimStructureAndRefresh("clear_division_prelim");
       ringSelection = null;
       showToast(`${divisionLabel()} 예선을 초기화했습니다`);
     } catch (err) {
@@ -1254,14 +1346,15 @@ function bindStaticHandlers() {
   document.getElementById("generateBracketBtn").addEventListener("click", onGenerateBracket);
   document.getElementById("publishBracketBtn").addEventListener("click", handlePublishBracket);
   document.getElementById("clearBracketBtn").addEventListener("click", async () => {
-    if (!confirm(`${divisionLabel()} 본선 대진표를 초기화할까요? 입력된 점수도 모두 사라집니다.`)) return;
-    try {
-      await clearFinalBracket(activeDivision);
-      bracketPublishPending = false;
-      showToast(`${divisionLabel()} 대진표를 초기화했습니다`);
-    } catch (err) {
-      reportError("대진표 초기화", err);
-    }
+    if (!finalMutationAllowed()) return;
+    if (!confirm(`${divisionLabel()}의 아직 시작하지 않은 본선 대진표를 초기화할까요? 기록이 시작된 경기가 있으면 안전을 위해 초기화가 거부됩니다.`)) return;
+    finalMatches = [];
+    finalScoreDrafts = new Map();
+    bracketPublishPending = true;
+    bracketPublishConflict = false;
+    renderFinalBracket();
+    renderFinalTeamPicker();
+    showToast(`${divisionLabel()} 대진표 초기화를 준비했습니다. 관객 화면에 공개해야 반영됩니다.`);
   });
 
   document.getElementById("exportCsvBtn").addEventListener("click", () => {
@@ -1277,7 +1370,10 @@ function bindStaticHandlers() {
     const mode = document.getElementById("venueDisplayMode").value;
     const intervalSeconds = Number(document.getElementById("venueDisplayInterval").value);
     try {
-      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds, cycleStartedAt: Date.now() } });
+      const clock = await adminWorkflowCallable("getServerClock", {});
+      const cycleStartedAt = Number(clock?.serverTimeMs);
+      if (!Number.isFinite(cycleStartedAt)) throw new Error("서버 기준 시간을 확인할 수 없습니다.");
+      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds, cycleStartedAt } });
       showToast("경기장 송출 설정을 저장했습니다");
     } catch (err) {
       reportError("경기장 송출 설정 저장", err);
@@ -1364,22 +1460,43 @@ function bindStaticHandlers() {
   ["setupCourtsBtn", "setupWorkflowBtn"].forEach((id) => {
     document.getElementById(id).addEventListener("click", (e) => saveCourtWorkflow(e.currentTarget));
   });
+  document.getElementById("correctionMatchKeys").addEventListener("change", () => {
+    invalidateCorrectionPreview("선택이 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
+  });
   document.getElementById("previewCorrectionBtn").addEventListener("click", async (e) => {
     const matchKeys = [...document.getElementById("correctionMatchKeys").selectedOptions]
       .map((option) => option.value)
       .filter(Boolean);
     if (!matchKeys.length) return showToast("정정할 경기를 선택하세요.");
+    const previewGeneration = correctionPreviewGeneration;
     const result = await runWorkflowButton(e.currentTarget, "정정 미리보기", () => adminWorkflowCallable("previewApprovedCorrection", { matchKeys }));
     if (!result) return;
-    correctionPreview = { matchKeys, result };
+    const currentMatchKeys = [...document.getElementById("correctionMatchKeys").selectedOptions]
+      .map((option) => option.value)
+      .filter(Boolean);
+    if (previewGeneration !== correctionPreviewGeneration
+      || currentMatchKeys.length !== matchKeys.length
+      || currentMatchKeys.some((matchKey, index) => matchKey !== matchKeys[index])) {
+      invalidateCorrectionPreview("미리보기 중 선택 또는 서버 상태가 변경되었습니다. 다시 미리보기를 실행하세요.");
+      return;
+    }
+    if (!result.planToken) {
+      invalidateCorrectionPreview("서버 계획 토큰을 받지 못해 정정 미리보기를 적용할 수 없습니다.");
+      return;
+    }
     const active = matchKeys.filter((key) => reviewWorkflows.get(key)?.lock);
-    const targetText = (result.targets || []).map((target) => {
+    const targetLabels = (result.targets || []).map((target) => {
       const assignment = reviewAssignments.find((item) => item.id === target.matchKey);
-      if (!assignment) return "경기 정보 불러오는 중";
+      const court = reviewCourts.get(target.courtId);
+      const courtName = formatCourtName(court?.name || court?.displayName, "코트 정보 불러오는 중");
+      if (!assignment) return `[${target.matchKey}] ${courtName} · 경기 정보 불러오는 중`;
       const display = scoreReviewDisplay(assignment);
-      return `${display.heading} (${display.teams})`;
-    }).join(", ");
-    correctionPreview.expectedQueueRevision = result.expectedQueueRevision;
+      return `[${target.matchKey}] ${courtName} · ${display.divisionName} · ${display.matchParts.join(" · ")} (${display.teams})`;
+    });
+    correctionPreview = {
+      planToken: result.planToken,
+      targetLabels,
+    };
     const matchLabel = (matchKey) => {
       const assignment = reviewAssignments.find((item) => item.id === matchKey);
       return assignment ? scoreReviewDisplay(assignment).heading : "없음";
@@ -1387,24 +1504,21 @@ function bindStaticHandlers() {
     const replay = (result.projection?.replayMatchKeys || []).map(matchLabel);
     const inPlace = (result.projection?.inPlaceMatchKeys || []).map(matchLabel);
     document.getElementById("correctionPreview").textContent = active.length
-      ? `활성 경기 충돌: ${active.join(", ")}. active affected 경기는 정정을 적용할 수 없습니다.`
-      : `대상: ${targetText}. 제자리 유지: ${inPlace.join(", ") || "없음"}; 재경기 대기: ${replay.join(", ") || "없음"}; 변경 전 ${matchLabel(result.projection?.before?.currentMatchKey)} → ${matchLabel(result.projection?.before?.nextMatchKey)}, 변경 후 ${matchLabel(result.projection?.after?.currentMatchKey)} → ${matchLabel(result.projection?.after?.nextMatchKey)}.`;
+      ? `대상: ${targetLabels.join(", ") || "없음"}. 활성 경기 충돌: ${active.join(", ")}. active affected 경기는 정정을 적용할 수 없습니다.`
+      : `대상: ${targetLabels.join(", ") || "없음"}. 제자리 유지: ${inPlace.join(", ") || "없음"}; 재경기 대기: ${replay.join(", ") || "없음"}; 변경 전 ${matchLabel(result.projection?.before?.currentMatchKey)} → ${matchLabel(result.projection?.before?.nextMatchKey)}, 변경 후 ${matchLabel(result.projection?.after?.currentMatchKey)} → ${matchLabel(result.projection?.after?.nextMatchKey)}.`;
     document.getElementById("applyCorrectionBtn").disabled = active.length > 0;
   });
   document.getElementById("applyCorrectionBtn").addEventListener("click", async (e) => {
     if (!correctionPreview) return;
     const reason = requiredReason("승인 결과 정정");
     if (!reason) return showToast("정정 사유는 필수입니다.");
-    if (!confirm("미리보기한 정정을 서버 계획대로 적용할까요?")) return;
+    if (!confirm(`다음 미리보기 대상 정정을 서버 계획대로 적용할까요?\n${correctionPreview.targetLabels.join("\n")}`)) return;
     const result = await runWorkflowButton(e.currentTarget, "승인 결과 정정", () => adminWorkflowCallable("applyApprovedCorrection", {
-      matchKeys: correctionPreview.matchKeys,
+      planToken: correctionPreview.planToken,
       reason,
-      expectedQueueRevision: correctionPreview.expectedQueueRevision,
     }));
     if (result) {
-      correctionPreview = null;
-      document.getElementById("applyCorrectionBtn").disabled = true;
-      document.getElementById("correctionPreview").textContent = "정정을 적용했습니다. 대기열이 서버 계획으로 갱신되었습니다.";
+      invalidateCorrectionPreview("정정을 적용했습니다. 대기열이 서버 계획으로 갱신되었습니다.");
     }
   });
   document.getElementById("createMigrationBtn").addEventListener("click", async (e) => {
@@ -1558,7 +1672,7 @@ function renderGroupList() {
     pill.querySelector("button").addEventListener("click", async () => {
       if (!confirm(`${divisionLabel()} '${g.name}' 조를 삭제할까요? (소속 팀은 무소속이 됩니다)`)) return;
       try {
-        await deleteGroup(g.id);
+        await mutatePrelimStructureAndRefresh("delete_group", { groupId: g.id });
       } catch (err) {
         reportError("조 삭제", err);
       }
@@ -1671,7 +1785,7 @@ function createTeamPill(t, groupId) {
   pill.querySelector("button").addEventListener("click", async () => {
     if (!confirm(`${divisionLabel()} '${t.name}' 팀을 삭제할까요?`)) return;
     try {
-      await deleteTeam(t.id);
+      await mutatePrelimStructureAndRefresh("delete_team", { teamId: t.id });
     } catch (err) {
       reportError("팀 삭제", err);
     }
@@ -1765,6 +1879,12 @@ async function persistTeamDrop(draggedId, targetGroupId, targetId = null, insert
   const draggedTeam = teams.find((team) => team.id === draggedId);
   if (!draggedTeam) return;
   const sameGroup = draggedTeam.groupId === targetGroupId;
+  if (!sameGroup && prelimMatches.some((match) => (
+    match.groupId === draggedTeam.groupId || match.groupId === targetGroupId
+  ))) {
+    showToast("예선 대진이 생성된 조 사이에서는 팀을 옮길 수 없습니다. 해당 조의 예선을 먼저 초기화하세요.", 5000);
+    return;
+  }
   const currentIds = teams.filter((team) => team.groupId === targetGroupId).map((team) => team.id);
   if (sameGroup && targetIds.every((id, index) => id === currentIds[index])) return;
   try {
@@ -1814,8 +1934,7 @@ async function handleResetGroupPrelim(group) {
   if (!hasMatches && !hasRingPlacement) return showToast(`${group.name}에 초기화할 내용이 없습니다`);
   if (!confirm(`${divisionLabel()} '${group.name}'의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
   try {
-    await clearPrelimMatchesForGroup(group.id);
-    await setGroupRingOrder(group.id, []);
+    await mutatePrelimStructureAndRefresh("clear_group_prelim", { groupId: group.id, ringOrder: [] });
     ringSelection = null;
     showToast(`${group.name} 예선을 초기화했습니다`);
   } catch (err) {
@@ -1844,13 +1963,19 @@ async function applyRingOrderChange(group, nextRingOrder) {
     return;
   }
   try {
-    await setGroupRingOrder(group.id, nextRingOrder);
-    const pairs = getRingMatchPairs(nextRingOrder);
-    if (pairs) {
-      await generateRingMatchesForGroup(group.id, pairs);
+    if (nextRingOrder.length >= 2 && nextRingOrder.every(Boolean)) {
+      await mutatePrelimStructureAndRefresh("generate_group_ring", {
+        groupId: group.id,
+        ringOrder: nextRingOrder,
+      });
       showToast(`${group.name} 대진이 확정되었습니다`);
     } else if (groupHasPrelimMatches(group.id)) {
-      await clearPrelimMatchesForGroup(group.id);
+      await mutatePrelimStructureAndRefresh("clear_group_prelim", {
+        groupId: group.id,
+        ringOrder: nextRingOrder,
+      });
+    } else {
+      await setGroupRingOrder(group.id, nextRingOrder);
     }
   } catch (err) {
     reportError("링크제 배치", err);
@@ -1930,7 +2055,10 @@ function buildRoundRobinControls(g, groupTeams) {
   btn.addEventListener("click", async () => {
     if (!confirmIfResultsWillReset(g.id, g.name, `'${g.name}' 예선 대진을 (재)생성할까요? 기존 결과는 초기화됩니다.`)) return;
     try {
-      await generatePrelimMatchesForGroup(g.id, groupTeams.map((t) => t.id));
+      await mutatePrelimStructureAndRefresh("generate_group_round_robin", {
+        groupId: g.id,
+        teamIds: groupTeams.map((team) => team.id),
+      });
       showToast(`${g.name} 대진을 생성했습니다`);
     } catch (err) {
       reportError("예선 대진 생성", err);
@@ -1946,10 +2074,6 @@ function buildRingControls(g, groupTeams) {
 
   const groupTeamIds = groupTeams.map((t) => t.id);
   const ringOrder = normalizeRingOrder(g.ringOrder, groupTeamIds);
-  if (JSON.stringify(ringOrder) !== JSON.stringify(g.ringOrder || [])) {
-    setGroupRingOrder(g.id, ringOrder).catch(() => {});
-  }
-
   const poolTeams = groupTeams.filter((t) => !ringOrder.includes(t.id));
   const filled = ringOrder.length > 0 && ringOrder.every((id) => id);
   const placedCount = ringOrder.filter(Boolean).length;
@@ -2357,7 +2481,93 @@ function teamName(id) {
   return t ? t.name : "?";
 }
 
+function canonicalOfficialRevision(value) {
+  if (value == null) return 0;
+  return Number.isInteger(value) ? value : null;
+}
+
+function prelimDirectScoreContext(matchId) {
+  const match = allPrelimMatches.find((item) => item.id === matchId);
+  const assignment = reviewAssignments.find((item) => (
+    (item.matchKey || item.id) === matchId && (item.matchType || "prelim") === "prelim"
+  ));
+  const workflow = reviewWorkflows.get(matchId);
+  if (!match || !assignment || !workflow) {
+    return { error: "코트 배정과 기록 워크플로가 준비된 예선 경기만 관리자 점수 입력을 할 수 있습니다." };
+  }
+
+  const states = [assignment.publicStatus, workflow.draftState, workflow.status]
+    .filter(Boolean)
+    .map((state) => String(state).toLowerCase());
+  if (workflow.lock || states.some((state) => state === "editing" || state === "locked")) {
+    return { error: "기록관이 점수를 입력 중이거나 잠금 상태입니다. 기록관 작업이 끝난 뒤 진행하세요." };
+  }
+  if (states.some((state) => state === "submitted" || state === "under_review")) {
+    return { error: "기록관 점수가 제출되어 검수 중입니다. 점수를 바꾸지 말고 승인하거나 반려하여 정정을 요청하세요." };
+  }
+  if (states.some((state) => [
+    "rejected", "replay", "replay_required", "rework", "rework_required",
+  ].includes(state))) {
+    return { error: "반려 또는 재입력 절차가 진행 중인 경기입니다. 기록관의 재입력·재제출을 기다리세요." };
+  }
+
+  const officialRevision = canonicalOfficialRevision(match.officialRevision);
+  const assignmentRevision = canonicalOfficialRevision(assignment.officialRevision);
+  const workflowRevision = canonicalOfficialRevision(workflow.officialRevision);
+  if (officialRevision == null || officialRevision !== assignmentRevision || officialRevision !== workflowRevision) {
+    return { error: "공식 점수 버전이 변경되었거나 동기화되지 않았습니다. 최신 상태를 확인한 뒤 다시 여세요." };
+  }
+
+  const pristine = assignment.publicStatus === "scheduled"
+    && workflow.draftState === "idle"
+    && !(workflow.draft?.sets?.length)
+    && !workflow.submittedSnapshot
+    && (workflow.draftRevision ?? 0) === 0
+    && (workflow.submissionVersion ?? 0) === 0
+    && (assignment.attemptCount ?? 0) === 0;
+  const approved = assignment.publicStatus === "completed" && workflow.draftState === "approved";
+  if (!pristine && !approved) {
+    return { error: "관리자 직접 입력은 아직 기록되지 않은 배정 경기 또는 승인된 공식 점수의 정정에만 사용할 수 있습니다." };
+  }
+
+  const courtId = assignment.courtId || null;
+  let queueRevision = null;
+  if (pristine && courtId) {
+    const queue = reviewQueues.get(courtId);
+    if (!Number.isInteger(queue?.queueRevision)) {
+      return { error: "배정 코트의 대기열 정보를 확인할 수 없습니다. 코트 대기열이 동기화된 뒤 다시 시도하세요." };
+    }
+    queueRevision = queue.queueRevision;
+  }
+  return {
+    matchId,
+    officialRevision,
+    queueRevision,
+    courtId,
+    teamAId: match.teamA || null,
+    teamBId: match.teamB || null,
+    requiresQueueCas: pristine && Boolean(courtId),
+  };
+}
+
+function prelimDirectScoreContextIsCurrent(snapshot) {
+  const current = prelimDirectScoreContext(snapshot.matchId);
+  return !current.error
+    && current.matchId === snapshot.matchId
+    && current.officialRevision === snapshot.officialRevision
+    && current.queueRevision === snapshot.queueRevision
+    && current.courtId === snapshot.courtId
+    && current.teamAId === snapshot.teamAId
+    && current.teamBId === snapshot.teamBId
+    && current.requiresQueueCas === snapshot.requiresQueueCas;
+}
+
 function openPrelimScoreModal(match) {
+  const snapshot = prelimDirectScoreContext(match.id);
+  if (snapshot.error) {
+    showToast(snapshot.error, 5000);
+    return;
+  }
   openScoreModal({
     teamAName: teamName(match.teamA),
     teamBName: teamName(match.teamB),
@@ -2365,14 +2575,19 @@ function openPrelimScoreModal(match) {
     targets: [10, 10],
     existingSets: match.sets || [],
     onSave: async (sets) => {
+      if (!prelimDirectScoreContextIsCurrent(snapshot)) {
+        throw new Error("경기·팀·코트·대기열 또는 공식 점수 버전이 변경되었습니다. 최신 상태에서 점수 입력을 다시 여세요.");
+      }
       const reason = requiredReason("관리자 직접 수정");
       if (!reason) throw new Error("정정 사유는 필수입니다.");
-      await adminWorkflowCallable("directEditOfficialScore", {
-        matchKey: match.id,
+      const request = {
+        matchKey: snapshot.matchId,
         score: { sets },
         reason,
-        expectedOfficialRevision: reviewWorkflows.get(match.id)?.officialRevision || 0,
-      });
+        expectedOfficialRevision: snapshot.officialRevision,
+      };
+      if (snapshot.requiresQueueCas) request.expectedQueueRevision = snapshot.queueRevision;
+      await adminWorkflowCallable("directEditOfficialScore", request);
       showToast("관리자 수정 점수를 승인했습니다.");
     },
   });
@@ -2401,16 +2616,23 @@ function computeRecommendedSeeds() {
       // groupSize(조 인원수)를 함께 넘겨, 인원수가 적은 조의 진출팀이 부전승보다 실제
       // 경기를 먼저 배정받도록 한다(buildCrossGroupSeedOrder, bracket.js) - 조 구성이
       // 어떻든(인원수가 조마다 다르더라도) 그대로 적용되는 일반 규칙이다.
-      return { groupId: g.id, groupSize: groupTeams.length, standings: computeGroupStandings(groupTeams, groupMatches) };
+      const standings = computeGroupStandings(groupTeams, groupMatches);
+      return {
+        groupId: g.id,
+        groupSize: groupTeams.length,
+        standings,
+        qualifiers: computeAutomaticQualifiers(standings, n),
+      };
     })
     .filter(Boolean);
 
   const tiers = [];
   for (let rank = 1; rank <= n; rank++) {
     const tier = [];
-    standingsByGroup.forEach(({ groupId, groupSize, standings }) => {
-      const found = standings.find((s) => s.rank === rank);
-      if (found) tier.push({ teamId: found.teamId, groupId, groupSize });
+    standingsByGroup.forEach(({ groupId, groupSize, qualifiers }) => {
+      qualifiers
+        .filter((s) => s.rank === rank)
+        .forEach((s) => tier.push({ teamId: s.teamId, groupId, groupSize }));
     });
     if (tier.length) tiers.push(tier);
   }
@@ -2426,7 +2648,11 @@ function buildQualifyReasonText(standings, s) {
   if (!tied.length) return base;
   const tiedNames = tied.map((o) => o.name).join(", ");
   if (s.needsLottery) {
-    return `${base} → ${tiedNames}와 동률, 상대전적도 같아 추첨으로 결정 필요`;
+    const lotteryPeers = standings
+      .filter((o) => o.teamId !== s.teamId && o.rank === s.rank)
+      .map((o) => o.name)
+      .join(", ");
+    return `${base} → ${lotteryPeers}와 동률, 상대전적도 같아 추첨으로 결정 필요`;
   }
   return `${base} → ${tiedNames}와 동률, 상대전적(승자승)으로 ${s.rank}위 결정`;
 }
@@ -2434,6 +2660,7 @@ function buildQualifyReasonText(standings, s) {
 function renderFinalTeamPicker() {
   const el = document.getElementById("finalTeamPicker");
   el.innerHTML = "";
+  const qualifyCount = Math.max(1, Number(tournamentInfo.qualifyPerGroup?.[activeDivision]) || 2);
 
   // 예선 순위 기준 추천 진출팀을 그대로 쓰는 중이면 매 렌더마다 최신 결과로 다시 계산한다
   if (seedAutoMode) {
@@ -2464,10 +2691,22 @@ function renderFinalTeamPicker() {
     const groupMatches = prelimMatches.filter((m) => m.groupId === g.id).sort((a, b) => (a.round || 0) - (b.round || 0));
     const standings = computeGroupStandings(groupTeams, groupMatches);
     const standingById = Object.fromEntries(standings.map((s) => [s.teamId, s]));
+    const cutoffLotteryRanks = [...new Set(
+      standings
+        .filter((s) => s.needsLottery)
+        .filter((s) => {
+          const sameRank = standings.filter((other) => other.rank === s.rank);
+          return s.rank <= qualifyCount && s.rank + sameRank.length - 1 > qualifyCount;
+        })
+        .map((s) => s.rank)
+    )];
 
     const sub = document.createElement("div");
     sub.style.marginBottom = "10px";
-    sub.innerHTML = `<div style="font-weight:700; font-size:13px; margin-bottom:6px;">${escapeHtml(g.name)}</div>`;
+    const cutoffWarning = cutoffLotteryRanks.length
+      ? '<div class="lottery-flag">추첨 대상 동률이 진출선에 걸쳐 있어 자동 선택이 완료되지 않았습니다. 오프라인 추첨 승자를 직접 선택하세요.</div>'
+      : "";
+    sub.innerHTML = `<div style="font-weight:700; font-size:13px; margin-bottom:6px;">${escapeHtml(g.name)}</div>${cutoffWarning}`;
     groupTeams
       .sort((a, b) => ((standingById[a.id] && standingById[a.id].rank) || 99) - ((standingById[b.id] && standingById[b.id].rank) || 99))
       .forEach((t) => {
@@ -2537,12 +2776,14 @@ function teamGroupRankLabel(teamId) {
  * 만들어 화면에 보여주고, 부전승 배치·자리 조정까지 모두 마친 뒤 "관객 화면에 공개"를
  * 눌러야 비로소 관객 화면(대시보드)에 한 번에 반영된다. */
 async function onGenerateBracket() {
+  if (!finalMutationAllowed()) return;
   if (seedSelection.length < 2) return showToast("본선 진출팀을 2팀 이상 선택하세요");
   if (seedSelection.length > 32) return showToast("본선 진출팀은 최대 32팀까지 지원합니다");
   if (!confirm(`${divisionLabel()} ${seedSelection.length}팀으로 본선 대진표를 생성할까요? 기존 대진표는 초기화됩니다.`)) return;
   const teamsInSeedOrder = seedSelection.map((id) => ({ id, name: teamName(id) }));
   const { matches } = generateBracket(teamsInSeedOrder);
   finalMatches = matches;
+  finalScoreDrafts = new Map();
   bracketPublishPending = true;
   renderFinalBracket();
   renderFinalTeamPicker();
@@ -2571,18 +2812,20 @@ function updateBracketPublishBar() {
   if (!bar) return;
 
   // 대진표가 아직 없으면 막대 자체를 숨긴다.
-  const hasBracket = Array.isArray(finalMatches) && finalMatches.length > 0;
+  const hasBracket = finalMatches.length > 0 || authoritativeFinalMatches.length > 0 || bracketPublishPending;
   bar.style.display = hasBracket ? "flex" : "none";
-  bar.classList.toggle("is-pending", bracketPublishPending);
+  bar.classList.toggle("is-pending", bracketPublishPending || bracketPublishConflict);
 
   if (msg) {
-    msg.textContent = bracketPublishPending
+    msg.textContent = bracketPublishConflict
+      ? "공개 기준이 변경되었습니다. 로컬 초안을 버린 뒤 최신 대진표를 확인하세요."
+      : bracketPublishPending
       ? "공개하지 않은 변경/기록이 있습니다. 버튼을 눌러야 관객 화면에 반영됩니다."
       : "모든 변경사항이 관객 화면에 공개되어 있습니다.";
   }
   if (btn) {
-    btn.disabled = !bracketPublishPending;
-    btn.textContent = bracketPublishPending ? "관객 화면에 공개" : "공개 완료";
+    btn.disabled = (!bracketPublishPending && !bracketPublishConflict) || bracketPublishInFlight;
+    btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : bracketPublishPending ? "관객 화면에 공개" : "공개 완료";
   }
 }
 
@@ -2590,17 +2833,50 @@ function updateBracketPublishBar() {
  * 반영해서 대시보드(관객 화면)에 실제로 공유한다. 6강·준결승·결승 등 매 라운드 결과를 입력한 뒤
  * 이 버튼을 눌러 그때그때 공개할 수 있다. */
 async function handlePublishBracket() {
-  if (!bracketPublishPending) return;
+  if ((!bracketPublishPending && !bracketPublishConflict) || bracketPublishInFlight) return;
+  if (bracketPublishConflict) {
+    if (!confirm("최신 공개본과 충돌했습니다. 로컬 본선 초안과 점수 기록을 버릴까요?")) return;
+    discardFinalDraft();
+    showToast("로컬 본선 초안을 버리고 최신 공개본을 불러왔습니다.");
+    return;
+  }
+  bracketPublishInFlight = true;
+  updateBracketPublishBar();
   try {
-    // 대진표를 새로 생성했다면 경기 수/아이디 구성이 이전 공개분과 달라질 수 있으므로
-    // (단순 덮어쓰기가 아니라) 더 이상 없는 경기는 지우고 전부 교체하는 publishFinalBracket을 쓴다.
-    await publishFinalBracket(activeDivision, finalMatches);
-    bracketPublishPending = false;
+    const response = await publishFinalBracket(
+      activeDivision,
+      finalDraftBaseline,
+      finalMatches.map(finalStructureMatch),
+      [...finalScoreDrafts.values()],
+    );
+    const canonicalMatches = response.matches || response.finalMatches;
+    if (!Array.isArray(canonicalMatches)) throw new Error("공개 결과에 표준 본선 대진표가 없습니다.");
+    resetFinalDraft(canonicalMatches);
     updateBracketPublishBar();
     showToast(`${divisionLabel()} 대진표를 관객 화면에 공개했습니다`);
   } catch (err) {
     reportError("관객 화면 공개", err);
+  } finally {
+    bracketPublishInFlight = false;
+    updateBracketPublishBar();
   }
+}
+
+function finalStructureMatch(match) {
+  const {
+    sets, result, winner, winnerSide, winnerTeam,
+    setsWonA, setsWonB, pointsForA, pointsForB,
+    officialRevision, lastTransitionId,
+    ...structure
+  } = match;
+  if (structure.status === "done" || structure.status === "in_progress") structure.status = "pending";
+  if (structure.round > 1) {
+    structure.teamA = null;
+    structure.teamB = null;
+    structure.teamASource = null;
+    structure.teamBSource = null;
+  }
+  return structure;
 }
 
 /**
@@ -2645,6 +2921,7 @@ function renderByeUnassignedPanel() {
  * 자리 배치는 결과가 아니라 위치 조정이므로, 곧바로 Firestore에 저장해 관객 화면에 공유하지
  * 않고 일단 로컬에만 반영해 둔다 — "관객 화면에 공개"를 눌러야 실제로 공유된다. */
 async function handlePlaceByeTeam(match) {
+  if (!finalMutationAllowed()) return;
   const result = placeByeTeam(finalMatches, match.id);
   if (!result.ok) {
     const msg = {
@@ -2662,6 +2939,7 @@ async function handlePlaceByeTeam(match) {
 /** 확정 대기 중인 부전승을 관리자가 직접 확정해, 남은 팀을 다음 라운드로 올린다.
  * 이 역시 자리/진출 조정의 연장이므로 곧바로 공유하지 않고 로컬에만 반영한다. */
 async function handleConfirmBye(match) {
+  if (!finalMutationAllowed()) return;
   const result = confirmBye(finalMatches, match.id);
   if (!result.ok) {
     const msg = {
@@ -2681,6 +2959,7 @@ async function handleConfirmBye(match) {
  * 오해할 수 있으므로, 일단 로컬 화면에만 반영해 두고 "관객 화면에 공개"를 눌러야만
  * Firestore에 저장돼 대시보드에 공유된다. */
 async function handleBracketSlotSwap(fromSlot, toSlot) {
+  if (!finalMutationAllowed()) return;
   const result = swapFinalSeedSlots(finalMatches, fromSlot, toSlot);
   if (!result.ok) {
     const msg = {
@@ -2697,30 +2976,100 @@ async function handleBracketSlotSwap(fromSlot, toSlot) {
 }
 
 function openFinalScoreModal(match) {
+  if (!finalMutationAllowed()) return;
+  if (isFinalScoreStagingBlocked(match)) {
+    showToast("기록관 워크플로가 진행 중인 본선 경기는 로컬로 점수를 수정할 수 없습니다.", 4000);
+    return;
+  }
+  const modalContext = finalScoreModalContext(match);
   openScoreModal({
     teamAName: match.teamA ? match.teamA.name : "",
     teamBName: match.teamB ? match.teamB.name : "",
     setLabels: ["1세트 (10점)", "2세트 (10점)", "3세트 (7점, 필요시만)"],
     targets: [10, 10, 7],
     existingSets: match.sets || [],
+    requireComplete: true,
     onSave: async (sets) => {
-      const reason = requiredReason("관리자 직접 수정");
-      if (!reason) throw new Error("정정 사유는 필수입니다.");
-      const matchKey = `final:${activeDivision}:${match.id}`;
-      await adminWorkflowCallable("directEditOfficialScore", {
-        matchKey,
-        score: { sets },
-        reason,
-        expectedOfficialRevision: reviewWorkflows.get(matchKey)?.officialRevision || 0,
-      });
-      showToast("관리자 수정 점수를 승인했습니다.");
+      if (!finalMutationAllowed()) throw new Error("본선 공개 처리 중입니다. 완료 후 다시 입력하세요.");
+      if (!finalScoreModalContextIsCurrent(modalContext)) {
+        bracketPublishConflict = true;
+        updateBracketPublishBar();
+        throw new Error("대진 또는 공개 기준이 변경되었습니다. 로컬 초안을 버리고 최신 대진표를 확인하세요.");
+      }
+      const result = evaluateFinalMatch(sets);
+      if (result.status !== "done") throw new Error("본선 점수는 승자가 확정된 완전한 경기 결과여야 합니다.");
+      const official = authoritativeFinalMatches.find((item) => item.id === modalContext.matchId);
+      const approved = (official?.officialRevision || 0) > 0;
+      const scoreChanged = JSON.stringify(official?.sets || []) !== JSON.stringify(sets);
+      if (approved && !scoreChanged) {
+        showToast("승인된 본선 점수와 동일합니다. 공개할 변경사항이 없습니다.");
+        return;
+      }
+      const correctionReason = approved && scoreChanged ? requiredReason("승인된 본선 점수 정정") : null;
+      if (approved && scoreChanged && !correctionReason) throw new Error("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
+
+      stageFinalScoreDraft(modalContext.matchId, sets, correctionReason || "");
+      showToast("본선 점수를 로컬 초안에 저장했습니다. 아직 관객 화면에 공개되지 않았습니다.");
     },
   });
 }
 
+function finalScoreModalContext(match) {
+  return {
+    division: activeDivision,
+    baseline: structuredClone(finalDraftBaseline),
+    authoritativeBaseline: finalBaselineDescriptor(authoritativeFinalMatches),
+    matchId: match.id,
+    teamAId: match.teamA?.id || null,
+    teamBId: match.teamB?.id || null,
+  };
+}
+
+function finalScoreModalContextIsCurrent(context) {
+  const match = finalMatches.find((item) => item.id === context.matchId);
+  return context.division === activeDivision
+    && sameFinalBaseline(context.baseline, finalDraftBaseline)
+    && sameFinalBaseline(context.authoritativeBaseline, finalBaselineDescriptor(authoritativeFinalMatches))
+    && Boolean(match)
+    && (match.teamA?.id || null) === context.teamAId
+    && (match.teamB?.id || null) === context.teamBId;
+}
+
+function stageFinalScoreDraft(matchId, sets, reason) {
+  const current = finalMatches.find((item) => item.id === matchId);
+  if (!current) throw new Error("본선 경기를 찾을 수 없습니다.");
+  const result = evaluateFinalMatch(sets);
+  if (result.status !== "done") throw new Error("본선 점수는 승자가 확정된 완전한 경기 결과여야 합니다.");
+  const previousWinnerId = current.winnerTeam?.id || null;
+  if (previousWinnerId && previousWinnerId !== (result.winner === "A" ? current.teamA?.id : current.teamB?.id)) {
+    invalidateDescendantResults(finalMatches, matchId).forEach((id) => finalScoreDrafts.delete(id));
+  }
+  recordMatchResult(finalMatches, matchId, sets, evaluateFinalMatch);
+  const workflow = reviewWorkflows.get(`final:${activeDivision}:${matchId}`);
+  finalScoreDrafts.set(matchId, {
+    matchId, sets: structuredClone(sets), reason,
+    expectedSubmissionVersion: workflow?.submissionVersion || 0,
+  });
+  bracketPublishPending = true;
+  renderFinalBracket();
+}
+
+function isFinalScoreStagingBlocked(match) {
+  const matchKey = `final:${activeDivision}:${match.id}`;
+  const workflow = reviewWorkflows.get(matchKey);
+  const assignment = reviewAssignments.find((item) => item.id === matchKey);
+  const states = [workflow?.draftState, workflow?.status, assignment?.publicStatus, match.workflowStatus]
+    .filter(Boolean)
+    .map((state) => String(state).toLowerCase());
+  return Boolean(workflow?.lock) || states.some((state) => [
+    "editing", "locked", "submitted", "rejected", "replay", "replay_required",
+    "rework_required", "under_review", "in_progress",
+  ].includes(state));
+}
+
 // ---------------- 모달 / 토스트 ----------------
 
-function openScoreModal({ teamAName, teamBName, setLabels, targets, existingSets, onSave }) {
+function openScoreModal({ teamAName, teamBName, setLabels, targets, existingSets, requireComplete = false, onSave }) {
   const root = document.getElementById("modalRoot");
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -2777,6 +3126,11 @@ function openScoreModal({ teamAName, teamBName, setLabels, targets, existingSets
     errorMsg.classList.remove("show");
 
     const sets = rawSets.filter((s, i) => i < 2 || s.a > 0 || s.b > 0); // 3세트는 입력 없으면 제외
+    if (requireComplete && evaluateFinalMatch(sets).status !== "done") {
+      errorMsg.textContent = "본선 경기는 승자가 확정된 완전한 점수를 입력하세요.";
+      errorMsg.classList.add("show");
+      return;
+    }
     saveBtn.disabled = true;
     try {
       await onSave(sets);

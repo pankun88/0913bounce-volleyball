@@ -4,12 +4,15 @@ import {
   evaluatePrelimMatch,
   evaluateFinalMatch,
   computeGroupStandings,
+  computeAutomaticQualifiers,
   validateSetScore,
 } from './match-logic.js';
-import { generateBracket, recordMatchResult, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, roundLabel } from './bracket.js';
+import { generateBracket, recordMatchResult, invalidateDescendantResults, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, publicMatchView, roundLabel } from './bracket.js';
 import { generateRoundRobin, orderExistingRoundRobinMatchIds } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
-import { normalizeBackupData } from './backup-format.js';
+import {
+  backupFromServerExport, normalizeBackupData, restorableRootData, selectRestoreRecovery,
+} from './backup-format.js';
 import {
   courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
 } from './court-display.js';
@@ -19,6 +22,63 @@ function check(label, cond) {
   if (cond) { pass++; }
   else { fail++; console.error('FAIL:', label); }
 }
+
+// ---- public match view ----
+const unapprovedByePending = publicMatchView({
+  status: 'bye_pending',
+  teamA: { id: 'bye-team', name: '부전승 팀' },
+  teamB: null,
+});
+const retractedOfficial = publicMatchView({
+  status: 'done',
+  officialRevision: 3,
+  officialCurrent: false,
+  sets: [{ a: 10, b: 2 }, { a: 10, b: 3 }],
+  result: 'A',
+  winner: 'A',
+});
+check('retracted official result is hidden despite historical revision',
+  retractedOfficial.status === 'pending'
+    && retractedOfficial.sets.length === 0
+    && retractedOfficial.result === null
+    && retractedOfficial.winner === null);
+check('public view preserves bye_pending status and team placement',
+  unapprovedByePending.status === 'bye_pending' && unapprovedByePending.teamA?.id === 'bye-team' && unapprovedByePending.teamB === null);
+check('public view preserves confirmed bye status', publicMatchView({ status: 'bye' }).status === 'bye');
+const unapprovedInProgress = publicMatchView({
+  status: 'in_progress',
+  sets: [{ a: 25, b: 0 }],
+  result: 'A',
+  winner: 'A',
+  winnerSide: 'A',
+  winnerTeam: { id: 'bye-team', name: '부전승 팀' },
+  setsWonA: 1,
+  setsWonB: 0,
+  pointsForA: 25,
+  pointsForB: 0,
+});
+check('public view preserves in_progress status while hiding unapproved scores and winners',
+  unapprovedInProgress.status === 'in_progress'
+    && unapprovedInProgress.sets.length === 0
+    && unapprovedInProgress.result === null
+    && unapprovedInProgress.winner === null
+    && unapprovedInProgress.winnerSide === null
+    && unapprovedInProgress.winnerTeam === null
+    && unapprovedInProgress.setsWonA === null
+    && unapprovedInProgress.setsWonB === null
+    && unapprovedInProgress.pointsForA === null
+    && unapprovedInProgress.pointsForB === null);
+const approvedPublicMatch = {
+  officialRevision: 1,
+  status: 'done',
+  sets: [{ a: 25, b: 22 }],
+  result: 'A',
+  winner: 'A',
+  winnerSide: 'A',
+  winnerTeam: { id: 'winner' },
+};
+check('public view leaves approved official matches unchanged',
+  publicMatchView(approvedPublicMatch) === approvedPublicMatch);
 
 // ---- court display ----
 check('court input stores only identifier', normalizeCourtName(' A코트 ') === 'A');
@@ -62,7 +122,7 @@ check(
   reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-3').courtOrder === 1,
 );
 
-// ---- backup format migration ----
+// ---- backup format boundary ----
 const legacyBackup = {
   type: 'backup', version: 1,
   info: { name: '기존 여자부', qualifyPerGroup: 2 },
@@ -71,19 +131,101 @@ const legacyBackup = {
   prelimMatches: [{ id: 'p1', data: { teamA: 't1' } }],
   finalMatches: [{ id: 'f1', data: { status: 'done' } }],
 };
-const migratedBackup = normalizeBackupData(legacyBackup);
-check('legacy backup migrates to women division', migratedBackup.teams[0].data.division === 'women');
-check('legacy final matches migrate to women bracket', migratedBackup.finalMatches.men.length === 0 && migratedBackup.finalMatches.women.length === 1);
-check('legacy qualify count becomes division-specific', migratedBackup.info.qualifyPerGroup.women === 2);
-
 const legacyMenBackup = {
   ...legacyBackup,
   info: { name: '기존 남자부', qualifyPerGroup: 3 },
 };
-const migratedMenBackup = normalizeBackupData(legacyMenBackup);
-check('legacy backup migrates to men division', migratedMenBackup.teams[0].data.division === 'men');
-check('legacy final matches migrate to men bracket', migratedMenBackup.finalMatches.men.length === 1 && migratedMenBackup.finalMatches.women.length === 0);
-check('legacy men qualify count becomes division-specific', migratedMenBackup.info.qualifyPerGroup.men === 3);
+for (const [label, backup] of [['women', legacyBackup], ['men', legacyMenBackup]]) {
+  let rejected = false;
+  try {
+    normalizeBackupData(backup);
+  } catch {
+    rejected = true;
+  }
+  check(`legacy ${label} backup is rejected instead of pseudo-migrated`, rejected);
+}
+
+const protectedRoot = {
+  name: '복원 대회',
+  qualifyPerGroup: { women: 2 },
+  venueDisplay: '체육관',
+  courtTopologyRevision: 4,
+  maintenance: { enabled: true },
+  recorderFeatureEnabled: true,
+  updatedAt: 'server timestamp',
+  admins: ['admin'],
+  accessCode: 'secret',
+};
+const allowedRoot = restorableRootData(protectedRoot);
+check('backup root allowlists only restorable settings',
+  JSON.stringify(allowedRoot) === JSON.stringify({
+    name: '복원 대회',
+    qualifyPerGroup: { women: 2 },
+    venueDisplay: '체육관',
+    courtTopologyRevision: 4,
+  }));
+check('backup root omits protected operational fields',
+  !Object.hasOwn(allowedRoot, 'maintenance') && !Object.hasOwn(allowedRoot, 'recorderFeatureEnabled') &&
+  !Object.hasOwn(allowedRoot, 'updatedAt') && !Object.hasOwn(allowedRoot, 'admins') &&
+  !Object.hasOwn(allowedRoot, 'accessCode'));
+
+const emptyV3Backup = normalizeBackupData({
+  app: 'bounce-volleyball',
+  type: 'backup',
+  version: 3,
+  tournamentId: 'main',
+  info: protectedRoot,
+  groups: [],
+  teams: [],
+  prelimMatches: [],
+  finalMatches: { men: [], women: [] },
+  officialRevisions: [],
+  courts: [],
+  courtAssignments: [],
+  courtQueues: [],
+  scoreWorkflows: [],
+  auditEvents: [],
+});
+check('v3 backup accepts empty business document lists',
+  emptyV3Backup.groups.length === 0 && emptyV3Backup.teams.length === 0 &&
+  emptyV3Backup.prelimMatches.length === 0 && emptyV3Backup.finalMatches.men.length === 0 &&
+  emptyV3Backup.finalMatches.women.length === 0 && emptyV3Backup.auditEvents.length === 0);
+let unexpectedEnvelopeRejected = false;
+try {
+  normalizeBackupData({ ...emptyV3Backup, maintenance: { enabled: true } });
+} catch {
+  unexpectedEnvelopeRejected = true;
+}
+check('v3 backup rejects unexpected operational envelope fields', unexpectedEnvelopeRejected);
+
+const serverExportBackup = backupFromServerExport({
+  version: 3,
+  tournamentId: 'main',
+  rootData: protectedRoot,
+  chunks: [{ documents: [
+    { path: 'tournaments/main/groups/g1', data: { name: 'A조' } },
+    { path: 'tournaments/main/divisions/women/finalMatches/f1', data: { round: 1 } },
+  ] }],
+});
+check('server export adapter maps exact document paths to v3 backup collections',
+  serverExportBackup.groups[0].id === 'g1' && serverExportBackup.finalMatches.women[0].id === 'f1');
+check('server export adapter preserves only allowed root fields',
+  !Object.hasOwn(serverExportBackup.info, 'maintenance') && !Object.hasOwn(serverExportBackup, 'restoreManifests'));
+check('downloaded v3 backup passes its own exact import parser',
+  normalizeBackupData(serverExportBackup).tournamentId === 'main');
+const retryPayload = { rootData: { name: '복원 대회' }, chunks: [] };
+const savedRestore = { manifestId: 'restore-saved', payload: retryPayload };
+check('restore recovery reuses same-session manifest for identical payload',
+  selectRestoreRecovery({ activeManifestId: 'restore-saved', savedState: savedRestore, payload: retryPayload, newManifestId: 'restore-new' }).manifestId === 'restore-saved');
+check('restore recovery supersedes an observed foreign lease',
+  (() => {
+    const recovery = selectRestoreRecovery({ activeManifestId: 'restore-foreign', savedState: savedRestore, payload: retryPayload, newManifestId: 'restore-new' });
+    return recovery.supersede && recovery.manifestId === 'restore-new' && recovery.priorManifestId === 'restore-foreign';
+  })());
+check('restore recovery never reuses a terminal saved manifest without an active lease',
+  selectRestoreRecovery({ activeManifestId: null, savedState: savedRestore, payload: retryPayload, newManifestId: 'restore-new' }).manifestId === 'restore-new');
+check('restore recovery replaces saved manifest for changed payload',
+  selectRestoreRecovery({ activeManifestId: null, savedState: savedRestore, payload: { rootData: {}, chunks: [] }, newManifestId: 'restore-new' }).manifestId === 'restore-new');
 
 // ---- getSetWinner ----
 check('10:0 -> A', getSetWinner(10, 0, 10) === 'A');
@@ -134,6 +276,11 @@ check('prelim 1 set only -> in_progress', r.status === 'in_progress' && r.result
 r = evaluatePrelimMatch([]);
 check('prelim no sets -> pending', r.status === 'pending');
 
+r = evaluatePrelimMatch([{ a: 10.5, b: 2 }, { a: 10, b: 2 }]);
+check('prelim decimal score never completes', r.status !== 'done' && r.result === null);
+r = evaluatePrelimMatch([{ a: 11, b: 0 }, { a: 10, b: 2 }]);
+check('prelim unreachable terminal never completes', r.status !== 'done' && r.result === null);
+
 // ---- evaluateFinalMatch ----
 r = evaluateFinalMatch([{ a: 10, b: 5 }, { a: 10, b: 6 }]);
 check('final 2-0 A win, no 3rd set needed', r.winner === 'A' && r.status === 'done' && r.setsWonA === 2);
@@ -143,6 +290,10 @@ check('final 1-1 then 3rd set 7pt A win', r.winner === 'A' && r.setsWonA === 2 &
 
 r = evaluateFinalMatch([{ a: 10, b: 5 }, { a: 8, b: 10 }, { a: 6, b: 5 }]);
 check('final 3rd set not yet decided (6:5 target7)', r.status === 'in_progress' && r.winner === null);
+r = evaluateFinalMatch([{ a: 10, b: 5 }, { a: 10, b: 6 }, { a: 7, b: 2 }]);
+check('final unreachable third set never completes', r.status !== 'done' && r.winner === null);
+r = evaluateFinalMatch([{ a: 10, b: 5 }, { a: 10, b: 6.5 }]);
+check('final decimal score never completes', r.status !== 'done' && r.winner === null);
 
 // ---- computeGroupStandings ----
 const teams = [{ id: 't1', name: '1반' }, { id: 't2', name: '2반' }, { id: 't3', name: '3반' }];
@@ -159,6 +310,108 @@ check('t3 points = 1(draw)+3(win)=4', byId.t3.points === 4);
 check('t2 points = 0', byId.t2.points === 0);
 check('t1 rank 1 or t3 rank1 (tie resolved by setDiff/pointDiff/h2h)', byId.t1.rank === 1 || byId.t3.rank === 1);
 check('t2 ranked last', byId.t2.rank === 3);
+check('complete standings are not provisional', standings.every((s) => !s.provisional));
+
+const zeroScheduledStandings = computeGroupStandings(
+  [{ id: 'a', name: 'A팀' }, { id: 'b', name: 'B팀' }],
+  [],
+);
+check(
+  'zero scheduled matches leave standings provisional and unqualified',
+  zeroScheduledStandings.every((s) => s.provisional && !s.needsLottery)
+    && computeAutomaticQualifiers(zeroScheduledStandings, 1).length === 0,
+);
+const partialScheduledStandings = computeGroupStandings(
+  [{ id: 'a', name: 'A팀' }, { id: 'b', name: 'B팀' }, { id: 'c', name: 'C팀' }],
+  [
+    { teamA: 'a', teamB: 'b', sets: [{ a: 10, b: 0 }, { a: 10, b: 0 }] },
+    { teamA: 'a', teamB: 'c', sets: [] },
+  ],
+);
+check(
+  'partial scheduled matches leave standings provisional and unqualified',
+  partialScheduledStandings.every((s) => s.provisional && !s.needsLottery)
+    && computeAutomaticQualifiers(partialScheduledStandings, 1).length === 0,
+);
+const forgedStandings = computeGroupStandings(
+  [{ id: 'a', name: 'A팀' }, { id: 'b', name: 'B팀' }],
+  [{
+    teamA: 'a', teamB: 'b',
+    sets: [{ a: 10.5, b: 0 }, { a: 10, b: 0 }],
+    status: 'done', result: 'A', setsWonA: 2, setsWonB: 0, pointsForA: 20, pointsForB: 0,
+  }],
+);
+check(
+  'standings ignore forged completed aggregate fields',
+  forgedStandings.every((s) => s.played === 0 && s.provisional),
+);
+
+const twoTeamTieStandings = computeGroupStandings(
+  [{ id: 'a', name: 'A팀' }, { id: 'b', name: 'B팀' }],
+  [{ teamA: 'a', teamB: 'b', sets: [{ a: 10, b: 0 }, { a: 0, b: 10 }] }],
+);
+check(
+  '2팀 미해소 동률은 공동 순위와 추첨 필요로 표시',
+  twoTeamTieStandings.every((s) => s.rank === 1 && s.needsLottery),
+);
+
+const partialHeadToHeadTeams = ['a', 'b', 'c', 'd', 'e', 'f'].map((id) => ({ id, name: `${id}팀` }));
+const decisiveMatch = (teamA, teamB, result) => ({
+  teamA,
+  teamB,
+  sets: result === 'A' ? [{ a: 10, b: 0 }, { a: 10, b: 0 }] : [{ a: 0, b: 10 }, { a: 0, b: 10 }],
+});
+const drawMatch = (teamA, teamB) => ({
+  teamA,
+  teamB,
+  sets: [{ a: 10, b: 0 }, { a: 0, b: 10 }],
+});
+const partialHeadToHeadStandings = computeGroupStandings(partialHeadToHeadTeams, [
+  decisiveMatch('a', 'b', 'A'), decisiveMatch('a', 'c', 'A'), drawMatch('a', 'd'),
+  drawMatch('b', 'c'), decisiveMatch('b', 'd', 'A'), decisiveMatch('c', 'd', 'A'),
+  decisiveMatch('a', 'e', 'B'), decisiveMatch('a', 'f', 'B'),
+  decisiveMatch('b', 'e', 'A'), decisiveMatch('b', 'f', 'B'),
+  decisiveMatch('c', 'e', 'B'), decisiveMatch('c', 'f', 'A'),
+  decisiveMatch('d', 'e', 'A'), decisiveMatch('d', 'f', 'A'),
+]);
+const partialHeadToHeadById = Object.fromEntries(partialHeadToHeadStandings.map((s) => [s.teamId, s]));
+check(
+  '부분 승자승 순서는 1, 2, 2, 4위로 경쟁 순위를 매긴다',
+  partialHeadToHeadById.a.rank === 1
+    && partialHeadToHeadById.b.rank === 2
+    && partialHeadToHeadById.c.rank === 2
+    && partialHeadToHeadById.d.rank === 4,
+);
+check(
+  '부분 승자승에서 같은 하위 그룹만 추첨 필요로 표시',
+  !partialHeadToHeadById.a.needsLottery
+    && partialHeadToHeadById.b.needsLottery
+    && partialHeadToHeadById.c.needsLottery
+    && !partialHeadToHeadById.d.needsLottery,
+);
+
+const tiedCutoffStandings = [
+  { teamId: 'first', rank: 1 },
+  { teamId: 'tied-a', rank: 2 },
+  { teamId: 'tied-b', rank: 2 },
+  { teamId: 'fourth', rank: 4 },
+];
+check(
+  '진출선에 걸친 공동 순위는 자동 선택하지 않는다',
+  JSON.stringify(computeAutomaticQualifiers(tiedCutoffStandings, 2).map((s) => s.teamId)) === JSON.stringify(['first']),
+);
+check(
+  '진출선 안에 완전히 들어온 공동 순위는 함께 자동 선택한다',
+  JSON.stringify(computeAutomaticQualifiers(tiedCutoffStandings, 3).map((s) => s.teamId)) === JSON.stringify(['first', 'tied-a', 'tied-b']),
+);
+check(
+  '동률과 무관한 확정 순위는 계속 자동 선택한다',
+  JSON.stringify(computeAutomaticQualifiers([
+    { teamId: 'first', rank: 1 },
+    { teamId: 'second', rank: 2 },
+    { teamId: 'third', rank: 3 },
+  ], 2).map((s) => s.teamId)) === JSON.stringify(['first', 'second']),
+);
 
 // ---- bracket: power of two / seed order ----
 check('nextPowerOfTwo(6)=8', nextPowerOfTwo(6) === 8);
@@ -189,6 +442,19 @@ let final = m8.find((m) => m.round === 3);
 check('final filled after semis', final.teamA && final.teamB);
 recordMatchResult(m8, final.id, [{ a: 10, b: 5 }, { a: 10, b: 5 }], evaluateFinalMatch);
 check('final done', final.status === 'done' && final.winnerTeam);
+
+// ---- bracket: local correction preview clears stale descendants ----
+const previewTeams = Array.from({ length: 4 }, (_, i) => ({ id: `P${i + 1}`, name: `${i + 1}번` }));
+const { matches: previewMatches } = generateBracket(previewTeams);
+const previewRound1 = previewMatches.filter((m) => m.round === 1);
+previewRound1.forEach((m) => recordMatchResult(
+  previewMatches, m.id, [{ a: 10, b: 5 }, { a: 10, b: 5 }], evaluateFinalMatch,
+));
+const previewFinal = previewMatches.find((m) => m.round === 2);
+recordMatchResult(previewMatches, previewFinal.id, [{ a: 10, b: 5 }, { a: 10, b: 5 }], evaluateFinalMatch);
+const invalidatedPreview = invalidateDescendantResults(previewMatches, previewRound1[0].id);
+check('upstream correction preview invalidates descendant result', invalidatedPreview.includes(previewFinal.id)
+  && previewFinal.sets.length === 0 && previewFinal.winnerTeam === null && previewFinal.status === 'waiting');
 
 // ---- bracket: 6 teams -> 2 byes (자동 배치/확정 금지: 미배정(empty) 상태로만 생성되어야 함) ----
 const teams6 = Array.from({ length: 6 }, (_, i) => ({ id: `S${i + 1}`, name: `${i + 1}시드` }));
@@ -571,6 +837,10 @@ function validateRoundRobin(n) {
   });
   check(`roundRobin(${n}) no duplicate pairs`, !dup);
   check(`roundRobin(${n}) no self-play`, !selfPlay);
+  check(
+    `roundRobin(${n}) display order is dense and unique`,
+    rr.every((m, index) => m.round === index + 1),
+  );
   // each team plays exactly n-1 matches
   const playCount = {};
   ids.forEach((id) => (playCount[id] = 0));

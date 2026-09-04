@@ -9,6 +9,6 @@ export const firebaseConfig = {
   appId: "1:597078666146:web:82506fb2476afb997060fb",
 };
 
-// 한 대회 단위로 데이터를 구분하는 ID. 같은 Firebase 프로젝트로 여러 대회를
-// 운영하려면 대회마다 다른 문자열로 바꿔서 사용하세요.
+// 이 배포는 Rules·Functions와 함께 단일 대회 루트 `main`에 고정되어 있다.
+// 클라이언트에서 이 값만 바꾸면 서버와 권한 경계가 분리되므로 변경하지 않는다.
 export const TOURNAMENT_ID = "main";

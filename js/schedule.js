@@ -17,7 +17,7 @@ export function generateRoundRobin(teamIds) {
       const a = arr[i];
       const b = arr[n - 1 - i];
       if (a !== null && b !== null) {
-        matches.push({ teamA: a, teamB: b, round: r + 1 });
+        matches.push({ teamA: a, teamB: b, round: matches.length + 1 });
       }
     }
     arr = [arr[0], ...arr.slice(2), arr[1]];

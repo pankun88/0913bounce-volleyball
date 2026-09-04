@@ -37,9 +37,9 @@ export async function createFixture() {
   return {
     env,
     anonymous: () => env.unauthenticatedContext().firestore(),
-    recorder: () => env.authenticatedContext(IDS.recorder).firestore(),
-    staleRecorder: () => env.authenticatedContext(IDS.stale).firestore(),
-    ungrantedRecorder: () => env.authenticatedContext(IDS.ungranted).firestore(),
+    recorder: () => env.authenticatedContext(IDS.recorder, { firebase: { sign_in_provider: 'google.com' } }).firestore(),
+    staleRecorder: () => env.authenticatedContext(IDS.stale, { firebase: { sign_in_provider: 'google.com' } }).firestore(),
+    ungrantedRecorder: () => env.authenticatedContext(IDS.ungranted, { firebase: { sign_in_provider: 'google.com' } }).firestore(),
     admin: () => env.authenticatedContext(IDS.admin).firestore(),
     seed: async (fn) => {
       let result;

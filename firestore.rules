@@ -19,6 +19,33 @@ service cloud.firestore {
       return tournament(tournamentId).data.get('maintenance', {}).get('enabled', false) != true;
     }
 
+    function validTournamentRootUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['name', 'qualifyPerGroup', 'venueDisplay', 'updatedAt'])
+        && changed.hasAny(['updatedAt'])
+        && request.resource.data.updatedAt == request.time
+        && (!changed.hasAny(['name'])
+          || (request.resource.data.name is string
+            && request.resource.data.name.size() > 0
+            && request.resource.data.name.size() <= 200))
+        && (!changed.hasAny(['qualifyPerGroup'])
+          || (request.resource.data.qualifyPerGroup is map
+            && request.resource.data.qualifyPerGroup.size() > 0
+            && request.resource.data.qualifyPerGroup.keys().hasOnly(['men', 'women'])
+            && request.resource.data.qualifyPerGroup.get('men', 1) is int
+            && request.resource.data.qualifyPerGroup.get('men', 1) >= 1
+            && request.resource.data.qualifyPerGroup.get('men', 1) <= 64
+            && request.resource.data.qualifyPerGroup.get('women', 1) is int
+            && request.resource.data.qualifyPerGroup.get('women', 1) >= 1
+            && request.resource.data.qualifyPerGroup.get('women', 1) <= 64))
+        && (!changed.hasAny(['venueDisplay'])
+          || (request.resource.data.venueDisplay is map
+            && request.resource.data.venueDisplay.keys().hasOnly(['mode', 'intervalSeconds', 'cycleStartedAt'])
+            && request.resource.data.venueDisplay.mode in ['auto', 'men', 'women']
+            && request.resource.data.venueDisplay.intervalSeconds in [10, 15, 20, 30]
+            && request.resource.data.venueDisplay.cycleStartedAt is number));
+    }
+
     function accessConfig(tournamentId) {
       return get(/databases/$(database)/documents/tournaments/$(tournamentId)/recorderAccess/config);
     }
@@ -31,11 +58,43 @@ service cloud.firestore {
       let config = accessConfig(tournamentId);
       let grant = get(/databases/$(database)/documents/tournaments/$(tournamentId)/recorderGrants/$(request.auth.uid));
       return request.auth != null
+        && (isAdmin()
+          || request.auth.token.get('firebase', {}).get('sign_in_provider', '') == 'google.com')
         && root.data.get('maintenance', {}).get('enabled', false) != true
         && root.data.recorderFeatureEnabled == true
         && config.data.enabled == true
         && grant.data.uid == request.auth.uid
         && grant.data.version == config.data.version;
+    }
+
+    function validRecorderAuditPayload(tournamentId, transitionId) {
+      let event = request.resource.data;
+      let beforeWorkflow = get(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(event.matchKey));
+      let afterWorkflow = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(event.matchKey));
+      return event.keys().hasOnly([
+          'transitionId', 'eventType', 'reason', 'matchKey', 'actor', 'before', 'after', 'createdAt'
+        ])
+        && event.actor is map
+        && event.actor.keys().hasOnly(['uid'])
+        && event.before is map
+        && event.after is map
+        && (
+          (event.eventType in ['recorder_start', 'rejected_reclaim']
+            && event.before.keys().hasOnly(['lock', 'draftState'])
+            && event.after.keys().hasOnly(['lock', 'draftState'])
+            && event.before.lock == beforeWorkflow.data.lock
+            && event.before.draftState == beforeWorkflow.data.draftState
+            && event.after.lock == afterWorkflow.data.lock
+            && event.after.draftState == afterWorkflow.data.draftState)
+          ||
+          (event.eventType == 'draft_save'
+            && event.before.keys().hasOnly(['draft', 'lock'])
+            && event.after.keys().hasOnly(['draft', 'lock'])
+            && event.before.draft == beforeWorkflow.data.get('draft', null)
+            && event.before.lock == beforeWorkflow.data.lock
+            && event.after.draft == afterWorkflow.data.draft
+            && event.after.lock == afterWorkflow.data.lock)
+        );
     }
 
     function assignment(tournamentId, matchKey) {
@@ -55,6 +114,8 @@ service cloud.firestore {
       let transitionId = request.resource.data.lastTransitionId;
       let event = auditAfter(tournamentId, transitionId);
       return transitionId is string
+        && transitionId.size() <= 512
+        && transitionId.matches('^recorder:.*')
         && event.data.transitionId == transitionId
         && event.data.matchKey == matchKey
         && event.data.eventType == eventType
@@ -89,6 +150,8 @@ service cloud.firestore {
       let court = get(/databases/$(database)/documents/tournaments/$(tournamentId)/courts/$(currentAssignment.data.courtId));
       return request.resource.data.lock.uid == request.auth.uid
         && request.resource.data.lock.token is string
+        && request.resource.data.lock.token.size() >= 16
+        && request.resource.data.lock.token.size() <= 128
         && request.resource.data.lock.recorderName is string
         && request.resource.data.lock.recorderName.size() > 0
         && court.data.get('recorderName', '').size() > 0
@@ -107,6 +170,13 @@ service cloud.firestore {
       let nextAssignment = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/courtAssignments/$(matchKey));
       return nextAssignment.data.publicStatus == publicStatus
         && nextAssignment.data.lastTransitionId == request.resource.data.lastTransitionId;
+    }
+
+    function claimAttemptCountValid(tournamentId, matchKey) {
+      let currentAssignment = assignment(tournamentId, matchKey);
+      let nextAssignment = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/courtAssignments/$(matchKey));
+      let currentAttemptCount = currentAssignment.data.get('attemptCount', 0);
+      return nextAssignment.data.attemptCount == (currentAttemptCount < 1 ? 1 : currentAttemptCount);
     }
 
     function queueUnchanged(tournamentId, matchKey) {
@@ -139,11 +209,13 @@ service cloud.firestore {
               || resource.data.draftState == 'rejected')
         && resource.data.lock == null
         && request.resource.data.draftState == 'editing'
+        && request.resource.data.resumeDraftState == resource.data.draftState
         && ownsNewLock(tournamentId, matchKey)
         && auditHasNewLock(tournamentId)
         && request.resource.data.draftRevision == resource.data.draftRevision
         && request.resource.data.officialRevision == resource.data.officialRevision
         && assignmentAfter(tournamentId, matchKey, 'in_progress')
+        && claimAttemptCountValid(tournamentId, matchKey)
         && queueUnchanged(tournamentId, matchKey)
         && hasTransitionAudit(
           tournamentId, matchKey,
@@ -190,46 +262,39 @@ service cloud.firestore {
         && hasTransitionAudit(tournamentId, matchKey, 'submission_complete', 'submission_complete');
     }
 
-    function assignmentMatchesWorkflow(tournamentId, matchKey) {
-      let workflow = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(matchKey));
-      return (workflow.data.draftState == 'editing'
-              && request.resource.data.publicStatus == 'in_progress')
-        || (workflow.data.draftState == 'idle'
-              && request.resource.data.publicStatus == 'scheduled')
-        || (workflow.data.draftState == 'rejected'
-              && request.resource.data.publicStatus == 'replay_required')
-        || (workflow.data.draftState == 'submitted'
-              && request.resource.data.publicStatus == 'under_review');
-    }
-
-    function queueMatchesWorkflow(tournamentId, courtId) {
-      let priorQueue = get(/databases/$(database)/documents/tournaments/$(tournamentId)/courtQueues/$(courtId));
-      let currentWorkflow = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(priorQueue.data.currentMatchKey));
-      return currentWorkflow.data.draftState in ['idle', 'rejected', 'submitted']
-        && request.resource.data.queueRevision == priorQueue.data.queueRevision + 1;
+    function validAssignmentClaim(tournamentId, matchKey) {
+      let workflow = get(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(matchKey));
+      let nextWorkflow = getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(matchKey));
+      return ((resource.data.publicStatus == 'scheduled' && workflow.data.draftState == 'idle')
+              || (resource.data.publicStatus == 'replay_required' && workflow.data.draftState == 'rejected'))
+        && request.resource.data.publicStatus == 'in_progress'
+        && nextWorkflow.data.draftState == 'editing'
+        && nextWorkflow.data.resumeDraftState == workflow.data.draftState
+        && nextWorkflow.data.lastTransitionId == request.resource.data.lastTransitionId
+        && claimAttemptCountValid(tournamentId, matchKey);
     }
 
     match /tournaments/{tournamentId} {
       allow read: if isMain(tournamentId);
       allow create, delete: if false;
-      allow update: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
+      allow update: if isMain(tournamentId)
+        && isAdmin()
+        && isNotMaintained(tournamentId)
+        && validTournamentRootUpdate();
 
       match /groups/{groupId} {
         allow read: if isMain(tournamentId);
-        allow write: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
+        allow create, update: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
+        allow delete: if false;
       }
       match /teams/{teamId} {
         allow read: if isMain(tournamentId);
-        allow write: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
+        allow create, update: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
+        allow delete: if false;
       }
       match /prelimMatches/{matchId} {
         allow read: if isMain(tournamentId);
-        allow create: if isMain(tournamentId)
-          && isAdmin() && isNotMaintained(tournamentId)
-          && request.resource.data.sets.size() == 0
-          && request.resource.data.status == 'pending'
-          && request.resource.data.result == null;
-        allow delete: if isMain(tournamentId) && isAdmin() && isNotMaintained(tournamentId);
+        allow create, delete: if false;
         allow update: if isMain(tournamentId)
           && isAdmin() && isNotMaintained(tournamentId)
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
@@ -255,9 +320,7 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['publicStatus', 'attemptCount', 'lastTransitionId'])
           && request.resource.data.lastTransitionId is string
-          && assignmentMatchesWorkflow(tournamentId, matchKey)
-          && getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(matchKey)).data.lastTransitionId
-              == request.resource.data.lastTransitionId;
+          && validAssignmentClaim(tournamentId, matchKey);
         allow create, delete: if false;
       }
       match /courtQueues/{courtId} {
@@ -310,11 +373,15 @@ service cloud.firestore {
         allow update, delete: if false;
         allow create: if isMain(tournamentId)
           && request.auth != null
+          && hasCurrentRecorderGrant(tournamentId)
           && isNotMaintained(tournamentId)
+          && transitionId.size() <= 512
+          && transitionId.matches('^recorder:.*')
           && request.resource.data.transitionId == transitionId
           && request.resource.data.actor.uid == request.auth.uid
           && request.resource.data.createdAt == request.time
           && request.resource.data.matchKey is string
+          && validRecorderAuditPayload(tournamentId, transitionId)
           && getAfter(/databases/$(database)/documents/tournaments/$(tournamentId)/scoreWorkflows/$(request.resource.data.matchKey)).data.lastTransitionId
               == transitionId;
       }

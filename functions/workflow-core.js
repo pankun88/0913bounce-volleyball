@@ -1,3 +1,5 @@
+// This workflow is intentionally single-tournament.  Callable entry points
+// reject every caller-provided identifier other than this canonical root.
 const TOURNAMENT_ID = 'main';
 
 const READY = 'ready';
@@ -164,6 +166,22 @@ function projectCourtQueue(queue, assignments, workflows) {
   return projectQueue(cloneQueue(queue, { priorityEntries, normalCursorMatchKey }), assignments, workflows);
 }
 
+/**
+ * Removes a set of match keys from a court topology without retaining stale
+ * queue ownership.  Persistence and state-history validation belong to the
+ * caller; this is deliberately a pure projection.
+ */
+function planCourtRemoval(assignments, workflows, removedMatchKeys) {
+  const removed = new Set(removedMatchKeys);
+  const survivingAssignments = Object.fromEntries(
+    Object.entries(assignments).filter(([matchKey]) => !removed.has(matchKey)),
+  );
+  const survivingWorkflows = Object.fromEntries(
+    Object.entries(workflows).filter(([matchKey]) => !removed.has(matchKey)),
+  );
+  return { assignments: survivingAssignments, workflows: survivingWorkflows };
+}
+
 function insertPriorityEntry(queue, assignments, workflows, entry) {
   if (!entry || !entry.matchKey || !entry.kind) throw new Error('Priority entry requires matchKey and kind');
   assertQueueOwnership(queue, assignments, workflows);
@@ -257,7 +275,7 @@ function planCorrectionReplay(queue, assignments, workflows, targets, transition
     const workflow = workflowFor(nextWorkflows, matchKey);
     if (classifyCorrectionTarget(assignment, workflow) === 'in_place') continue;
     nextAssignments[matchKey] = { ...assignment, publicStatus: 'replay_required' };
-    nextWorkflows[matchKey] = { ...workflow, draftState: 'idle', lock: null };
+    nextWorkflows[matchKey] = { ...workflow, draftState: 'rejected', lock: null };
     nextQueue = insertPriorityEntry(nextQueue, nextAssignments, nextWorkflows, {
       matchKey,
       kind: 'correction_replay',
@@ -285,6 +303,7 @@ export {
   selectQueueView,
   projectQueue,
   projectCourtQueue,
+  planCourtRemoval,
   insertPriorityEntry,
   consumeCurrentAndAdvance,
   projectReturnState,
