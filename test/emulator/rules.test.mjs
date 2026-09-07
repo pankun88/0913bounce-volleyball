@@ -54,6 +54,82 @@ export async function runRulesSuite() {
       await assertFails(getDoc(doc(denied, path('scoreWorkflows', 'M1'))));
     }
     await assertSucceeds(getDoc(doc(db, path('scoreWorkflows', 'M1'))));
+    const otherRecorderDb = f.env.authenticatedContext('other-recorder', {
+      firebase: { sign_in_provider: 'google.com' },
+    }).firestore();
+    await f.seed(async (admin) => {
+      await setDoc(doc(admin, path('recorderGrants', 'other-recorder')), {
+        uid: 'other-recorder',
+        version: 2,
+        status: 'active',
+        issuedAt: Timestamp.fromMillis(Date.now() - 60_000),
+        expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),
+      });
+      await setDoc(doc(admin, path('scoreWorkflows', 'terminal-submitted')), {
+        matchKey: 'terminal-submitted',
+        draftState: 'submitted',
+        lock: null,
+        submissionVersion: 1,
+        submission: { version: 1, recorder: { uid: IDS.recorder, name: 'Recorder One' } },
+      });
+      await setDoc(doc(admin, path('scoreWorkflows', 'terminal-approved')), {
+        matchKey: 'terminal-approved',
+        draftState: 'approved',
+        lock: null,
+        submissionVersion: 1,
+        submission: { version: 1, recorder: { uid: IDS.recorder, name: 'Recorder One' } },
+      });
+      await setDoc(doc(admin, path('scoreWorkflows', 'terminal-direct-approved')), {
+        matchKey: 'terminal-direct-approved',
+        draftState: 'approved',
+        lock: null,
+        officialRevision: 2,
+        submissionVersion: 1,
+        submission: { version: 1, recorder: { uid: IDS.recorder, name: 'Recorder One' } },
+      });
+      await setDoc(doc(admin, path('courtAssignments', 'terminal-queue-advanced')), {
+        matchKey: 'terminal-queue-advanced',
+        matchType: 'prelim',
+        courtId: 'terminal-court',
+        publicStatus: 'completed',
+      });
+      await setDoc(doc(admin, path('courtQueues', 'terminal-court')), {
+        courtId: 'terminal-court',
+        currentMatchKey: 'terminal-next',
+        nextMatchKey: null,
+      });
+      await setDoc(doc(admin, path('scoreWorkflows', 'terminal-queue-advanced')), {
+        matchKey: 'terminal-queue-advanced',
+        draftState: 'approved',
+        lock: null,
+        submissionVersion: 1,
+        submission: { version: 1, recorder: { uid: IDS.recorder, name: 'Recorder One' } },
+      });
+      await setDoc(doc(admin, path('scoreWorkflows', 'terminal-direct-pristine')), {
+        matchKey: 'terminal-direct-pristine',
+        draftState: 'approved',
+        lock: null,
+        submissionVersion: 0,
+      });
+      await setDoc(doc(admin, path('scoreWorkflows', 'terminal-invalid-submission')), {
+        matchKey: 'terminal-invalid-submission',
+        draftState: 'approved',
+        lock: null,
+        submissionVersion: 2,
+        submission: { version: 1, recorder: { uid: IDS.recorder } },
+      });
+    });
+    for (const key of ['terminal-submitted', 'terminal-approved', 'terminal-direct-approved', 'terminal-queue-advanced']) {
+      await assertSucceeds(getDoc(doc(db, path('scoreWorkflows', key))));
+      await assertFails(getDoc(doc(otherRecorderDb, path('scoreWorkflows', key))));
+    }
+    await assertFails(getDoc(doc(db, path('scoreWorkflows', 'terminal-direct-pristine'))));
+    await assertFails(getDoc(doc(otherRecorderDb, path('scoreWorkflows', 'terminal-direct-pristine'))));
+    await assertFails(getDoc(doc(db, path('scoreWorkflows', 'terminal-invalid-submission'))));
+    await assertFails(getDoc(doc(otherRecorderDb, path('scoreWorkflows', 'terminal-invalid-submission'))));
+    await assertFails(updateDoc(doc(db, path('scoreWorkflows', 'terminal-approved')), {
+      draftState: 'idle',
+    }));
     await f.seed(async (admin) => {
       await updateDoc(doc(admin, 'tournaments/main'), { maintenance: { enabled: true } });
     });

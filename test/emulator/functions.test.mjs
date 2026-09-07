@@ -2117,15 +2117,36 @@ export async function runFunctionsSuite() {
       },
       chunks: [{
         documents: [{
+          path: path('groups', 'restore-men-group'),
+          data: {
+            name: '복원 남자 A조',
+            division: 'men',
+            ringOrder: ['restore-kept-team'],
+          },
+        }, {
           path: path('teams', 'restore-kept-team'),
           data: {
             name: '백업 팀',
             division: 'men',
+            groupId: 'restore-men-group',
             createdAt: {
               __bounceFirestoreValue: 'timestamp',
               seconds: '1700000000',
               nanoseconds: 123000000,
             },
+          },
+        }, {
+          path: 'tournaments/main/divisions/men/finalMatches/restore-unresolved-final',
+          data: {
+            round: 1,
+            index: 0,
+            status: 'waiting',
+            teamA: null,
+            teamB: null,
+            teamASource: null,
+            teamBSource: null,
+            nextMatchId: null,
+            nextSlot: null,
           },
         }],
       }],
@@ -2140,6 +2161,108 @@ export async function runFunctionsSuite() {
       JSON.stringify(exportedBackup).includes('__bounceFirestoreValue'),
       true,
       'backup-export-tags-firestore-values-before-json-download',
+    );
+    const domainPayload = (manifestId, documents) => ({
+      ...restorePayload,
+      manifestId,
+      chunks: [{ documents }],
+    });
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-missing-group', [{
+      path: path('teams', 'domain-team'),
+      data: { name: '조 없는 팀', division: 'men', groupId: 'missing-group' },
+    }])), /graph|group|team/i, 'restore-rejects-team-with-missing-group');
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-missing-team', [{
+      path: path('groups', 'domain-group'),
+      data: { name: 'A조', division: 'men' },
+    }, {
+      path: path('teams', 'domain-team'),
+      data: { name: '팀', division: 'men', groupId: 'domain-group' },
+    }, {
+      path: path('prelimMatches', 'domain-prelim'),
+      data: {
+        groupId: 'domain-group',
+        division: 'men',
+        teamA: 'missing-team',
+        teamB: 'domain-team',
+      },
+    }])), /graph|group|team|preliminary/i, 'restore-rejects-preliminary-missing-team');
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-cross-group', [{
+      path: path('groups', 'domain-group-a'),
+      data: { name: 'A조', division: 'men' },
+    }, {
+      path: path('groups', 'domain-group-b'),
+      data: { name: 'B조', division: 'men' },
+    }, {
+      path: path('teams', 'domain-team-a'),
+      data: { name: 'A팀', division: 'men', groupId: 'domain-group-a' },
+    }, {
+      path: path('teams', 'domain-team-b'),
+      data: { name: 'B팀', division: 'men', groupId: 'domain-group-b' },
+    }, {
+      path: path('prelimMatches', 'domain-cross-group-match'),
+      data: {
+        groupId: 'domain-group-a',
+        division: 'men',
+        teamA: 'domain-team-a',
+        teamB: 'domain-team-b',
+      },
+    }])), /graph|group|team|preliminary/i, 'restore-rejects-preliminary-cross-group-team');
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-cross-division', [{
+      path: path('groups', 'domain-group'),
+      data: { name: '남자 A조', division: 'men' },
+    }, {
+      path: path('teams', 'domain-team'),
+      data: { name: '여자 팀', division: 'women', groupId: 'domain-group' },
+    }])), /graph|group|team|division/i, 'restore-rejects-team-cross-division-group');
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-same-prelim-team', [{
+      path: path('groups', 'domain-group'),
+      data: { name: '남자 A조', division: 'men' },
+    }, {
+      path: path('teams', 'domain-team'),
+      data: { name: '남자 팀', division: 'men', groupId: 'domain-group' },
+    }, {
+      path: path('prelimMatches', 'domain-same-prelim'),
+      data: {
+        groupId: 'domain-group',
+        division: 'men',
+        teamA: 'domain-team',
+        teamB: 'domain-team',
+      },
+    }])), /graph|preliminary|team/i, 'restore-rejects-preliminary-same-team');
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-final-missing-team', [{
+      path: 'tournaments/main/divisions/men/finalMatches/domain-final-missing-team',
+      data: {
+        round: 1,
+        index: 0,
+        status: 'waiting',
+        teamA: { id: 'missing-final-team' },
+        teamB: null,
+      },
+    }])), /graph|final|team/i, 'restore-rejects-final-missing-team');
+    await assert.rejects(call(functions, 'beginRestore', domainPayload('domain-final-cross-division', [{
+      path: path('teams', 'domain-women-team'),
+      data: { name: '여자 팀', division: 'women', groupId: null },
+    }, {
+      path: 'tournaments/main/divisions/men/finalMatches/domain-final-cross-division',
+      data: {
+        round: 1,
+        index: 0,
+        status: 'waiting',
+        teamA: { id: 'domain-women-team' },
+        teamB: null,
+      },
+    }])), /graph|final|team|division/i, 'restore-rejects-final-cross-division-team');
+    const rejectedDomainRestore = await f.seed(async (db) => ({
+      tournament: await getDoc(doc(db, 'tournaments/main')),
+      manifests: await getDocs(collection(db, 'tournaments/main/restoreManifests')),
+      staleTeam: await getDoc(doc(db, path('teams', 'restore-stale-team'))),
+    }));
+    assert.equal(rejectedDomainRestore.tournament.data().maintenance?.enabled, false, 'domain-rejection-keeps-maintenance-disabled');
+    assert.equal(rejectedDomainRestore.staleTeam.exists(), true, 'domain-rejection-keeps-existing-data');
+    assert.equal(
+      rejectedDomainRestore.manifests.docs.some((snap) => snap.id.startsWith('domain-')),
+      false,
+      'domain-rejection-creates-no-manifest',
     );
     await assert.rejects(call(functions, 'beginRestore', {
       ...restorePayload,
@@ -2218,6 +2341,23 @@ export async function runFunctionsSuite() {
       ...data, manifestId: 'exact-restore-replacement', chunkIndex: 0, chunk: replacementPayload.chunks[0],
     });
     await assert.rejects(call(functions, 'verifyRestore', { ...data, manifestId: 'exact-restore-replacement' }), /pruned/i, 'restore-verify-before-prune-rejected');
+    await f.seed((db) => setDoc(doc(db, path('teams', 'restore-kept-team')), { name: '변조' }, { merge: true }));
+    await assert.rejects(
+      call(functions, 'pruneRestore', { ...data, manifestId: 'exact-restore-replacement' }),
+      /checksum|path|graph/i,
+      'restore-prune-rejects-target-corruption-before-delete',
+    );
+    const failedPruneState = await f.seed(async (db) => ({
+      manifest: await getDoc(doc(db, path('restoreManifests', 'exact-restore-replacement'))),
+      staleTeam: await getDoc(doc(db, path('teams', 'restore-stale-team'))),
+      staleMatch: await getDoc(doc(db, path('prelimMatches', 'restore-stale-match'))),
+      maintenance: await getDoc(doc(db, 'tournaments/main')),
+    }));
+    assert.equal(failedPruneState.manifest.data().prunedAt, undefined, 'restore-prune-corruption-does-not-mark-pruned');
+    assert.equal(failedPruneState.staleTeam.exists(), true, 'restore-prune-corruption-keeps-unrelated-team');
+    assert.equal(failedPruneState.staleMatch.exists(), true, 'restore-prune-corruption-keeps-unrelated-match');
+    assert.equal(failedPruneState.maintenance.data().maintenance?.enabled, true, 'restore-prune-corruption-keeps-maintenance');
+    await f.seed((db) => setDoc(doc(db, path('teams', 'restore-kept-team')), { name: '백업 팀' }, { merge: true }));
     let pruneResult;
     do {
       pruneResult = await call(functions, 'pruneRestore', { ...data, manifestId: 'exact-restore-replacement' });
@@ -2244,6 +2384,9 @@ export async function runFunctionsSuite() {
     assert.equal(pruned[0].data().maintenance?.restoreManifestId, 'exact-restore-replacement', 'restore-prune-keeps-manifest-lease');
     assert.equal(pruned[1].exists(), true, 'restore-keeps-backed-up-team');
     assert.equal(pruned[1].data().createdAt.toMillis(), 1_700_000_000_123, 'restore-round-trips-firestore-timestamp');
+    assert.equal((await f.seed((db) => getDoc(
+      doc(db, 'tournaments/main/divisions/men/finalMatches/restore-unresolved-final'),
+    ))).exists(), true, 'restore-preserves-unresolved-final-slot');
     pruned.slice(2, 6).forEach((snap) => assert.equal(snap.exists(), false, `restore-deletes-stale-${snap.ref.id}`));
     pruned.slice(6).forEach((snap) => assert.equal(snap.exists(), true, `restore-preserves-protected-${snap.ref.id}`));
     await f.seed((db) => setDoc(doc(db, path('teams', 'restore-kept-team')), { name: '변조' }));

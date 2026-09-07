@@ -6,19 +6,41 @@ import {
   canResumeCurrentMatch, claimRecorderDraft, recorderReason, resumeRecorderDraft, saveRecorderDraft,
   submitRecorderDraft, cancelRecorderDraft, operationId, recorderSessionId, rotateRecorderSessionId,
   reconcileRecorderCourtQueue, startLeaseHeartbeat, subscribeAssignment, subscribeCourt, subscribeWorkflow,
+  fetchRecorderWorkflow,
 } from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, normalizePlayedSets, validateSetScore } from "./match-logic.js";
 import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-display.js";
+import {
+  cloneRecorderDraft, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
+  recorderDataState, resolveRecorderConflict, writeStoredRecorderDraft,
+} from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
-const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","courtMessage","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","backToEditButton","submitButton","successPanel","successTitle","nextSameButton","switchRecorderButton"].map((id) => [id, $(id)]));
+const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","courtMessage","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","backToEditButton","submitButton","successPanel","successTitle","nextSameButton","switchRecorderButton"].map((id) => [id, $(id)]));
 let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "";
 let stop = [], courtStops = [], matchStops = [], officialStop = () => {}, heartbeat, channel, reconcilingQueue = false;
 const tabInstanceId = crypto.randomUUID();
 let renderedFormKey = "";
-const edit = { token: null, serverDraft: null, localDraft: null, dirty: false, touched: new Set(), reviewedPayload: null, request: "idle", savedRevision: null, pendingSubmit: null, pendingEnd: null, pendingDiscard: null };
+let activeStorageKey = "";
+const edit = {
+  token: null, serverDraft: null, localDraft: null, dirty: false, touched: new Set(), reviewedPayload: null,
+  request: "idle", savedRevision: null, inputVersion: 0, pendingSave: null, saveConflict: null,
+  pendingSubmit: null, pendingEnd: null, pendingDiscard: null,
+};
+const dataHealth = Object.fromEntries(["courts","teams","groups","queue","court","assignment","workflow","official"]
+  .map((key) => [key, { status: "idle", error: null }]));
+const dataLabels = {
+  courts: "코트 목록", teams: "팀 목록", groups: "조 목록", queue: "코트 대기열",
+  court: "코트 정보", assignment: "경기 배정", workflow: "점수 워크플로", official: "공식 경기",
+};
+const storageFailureMessages = {
+  blocked: "이 기기의 임시 점수 저장이 차단되었습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
+  malformed: "이 기기의 임시 점수가 손상되어 불러오지 못했습니다. 현재 화면의 점수를 확인한 뒤 저장하세요.",
+  invalid: "이 기기의 임시 점수를 저장할 수 없습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
+};
 const isFinal = () => ["final", "tournament", "finals"].includes(assignment?.matchType) || ["final", "finals"].includes(assignment?.phase);
 const scoreKey = () => auth.currentUser && matchKey ? `recorder-score:${TOURNAMENT_ID}:${matchKey}:${auth.currentUser.uid}` : "";
+const storageKeyForEdit = () => activeStorageKey || scoreKey();
 const status = (text) => { ui.connectionStatus.textContent = text; };
 const action = (text) => { ui.actionStatus.textContent = text; ui.actionStatus.hidden = !text; };
 const reasonCode = (error) => error?.details?.reason || error?.details?.code || "";
@@ -27,27 +49,117 @@ const focus = (element) => requestAnimationFrame(() => element?.focus());
 const displayCourt = (court) => formatCourtName(court, "이름 없는 코트");
 const name = (side) => courtTeamNames(official, teams)?.[side] || (side === "a" ? "A팀" : "B팀");
 const resolved = () => assignment?.dependencyReady !== false && Boolean(official?.teamA && official?.teamB);
-const draftCopy = (value) => value ? { sets: value.sets.map(({ a, b }) => ({ a, b })) } : null;
-function storeDraft() { if (edit.localDraft && scoreKey()) localStorage.setItem(scoreKey(), JSON.stringify({ draft: edit.localDraft, touched: [...edit.touched], revision: edit.savedRevision })); }
-function clearStored() { if (scoreKey()) localStorage.removeItem(scoreKey()); }
+const draftCopy = (value) => cloneRecorderDraft(value);
+const getLocalStorage = () => {
+  try { return globalThis.localStorage; } catch { return null; }
+};
+function setStorageStatus(reason) {
+  if (!ui.storageStatus) return;
+  ui.storageStatus.textContent = storageFailureMessages[reason] || storageFailureMessages.blocked;
+  ui.storageStatus.hidden = false;
+}
+function clearStorageStatus() {
+  if (ui.storageStatus) { ui.storageStatus.textContent = ""; ui.storageStatus.hidden = true; }
+}
+function readStored() {
+  const result = readStoredRecorderDraft(getLocalStorage(), storageKeyForEdit());
+  if (!result.ok) setStorageStatus(result.reason);
+  return result;
+}
+function storeDraft() {
+  if (!edit.localDraft || !storageKeyForEdit()) return false;
+  const result = writeStoredRecorderDraft(getLocalStorage(), storageKeyForEdit(), {
+    draft: edit.localDraft, touched: [...edit.touched], revision: edit.savedRevision,
+  });
+  if (result.ok) clearStorageStatus();
+  else setStorageStatus(result.reason);
+  return result.ok;
+}
+function clearStored() {
+  if (!storageKeyForEdit()) return true;
+  const result = removeStoredRecorderDraft(getLocalStorage(), storageKeyForEdit());
+  if (!result.ok) setStorageStatus(result.reason);
+  else clearStorageStatus();
+  return result.ok;
+}
+function setDataState(key, state, error = null) {
+  if (!dataHealth[key]) return;
+  dataHealth[key] = recorderDataState(dataHealth[key], state, error);
+  renderDataState();
+}
+function relevantDataKeys() {
+  const keys = ["courts", "teams", "groups"];
+  if (courtId) keys.push("queue", "court");
+  if (matchKey) keys.push("assignment", "workflow", "official");
+  return keys;
+}
+function authoritativeDataReady() {
+  return relevantDataKeys().every((key) => dataHealth[key]?.status === "ready");
+}
+function authActionsReady() {
+  const uid = authState?.user?.uid || auth.currentUser?.uid || null;
+  return authState?.kind === "ready" && Boolean(uid && readyUid === uid) && navigator.onLine !== false;
+}
+function actionsReady() {
+  return authActionsReady() && authoritativeDataReady();
+}
+function setSnapshotState(key, metadata) {
+  setDataState(key, metadata?.fromCache ? "loading" : "ready");
+}
+function renderDataState() {
+  if (!ui.dataStatus || !ui.retryDataButton) return;
+  const problems = relevantDataKeys()
+    .map((key) => ({ key, ...dataHealth[key] }))
+    .filter(({ status }) => status !== "ready");
+  if (!problems.length) {
+    ui.dataStatus.hidden = true;
+    ui.dataStatus.textContent = "";
+    ui.retryDataButton.hidden = true;
+    return;
+  }
+  const errors = problems.filter(({ status }) => status === "error");
+  const names = [...new Set(problems.map(({ key }) => dataLabels[key]))].join(", ");
+  ui.dataStatus.hidden = false;
+  ui.dataStatus.textContent = errors.length
+    ? `${names}를 확인하지 못했습니다. 최신 권위 데이터를 받은 뒤 다시 시도하세요.`
+    : `${names}를 확인하는 중입니다. 잠시 기다려 주세요.`;
+  ui.retryDataButton.hidden = false;
+  ui.retryDataButton.disabled = busy || !authActionsReady();
+}
+function applyActionGate() {
+  const blocked = !actionsReady();
+  const actionButtons = [ui.claimButton, ui.saveButton, ui.reviewButton, ui.endButton, ui.discardButton,
+    ui.confirmDiscardButton, ui.keepDraftButton, ui.backToEditButton, ui.submitButton];
+  actionButtons.forEach((button) => {
+    if (button) button.disabled = busy || blocked;
+  });
+  ui.scoreFields.disabled = busy || blocked;
+  ui.scoreFields.setAttribute("aria-busy", String(busy));
+  ui.courtSelect.disabled = busy || Boolean(edit.token);
+  renderDataState();
+}
 function setBusy(value) {
   busy = value; edit.request = value ? "pending" : "idle";
-  [ui.googleLoginButton,ui.accessCodeButton,ui.claimButton,ui.saveButton,ui.reviewButton,ui.endButton,ui.discardButton,ui.confirmDiscardButton,ui.keepDraftButton,ui.backToEditButton,ui.submitButton].forEach((button) => { if (button) button.disabled = value; });
-  ui.scoreFields.disabled = value; ui.scoreFields.setAttribute("aria-busy", String(value)); ui.courtSelect.disabled = value || Boolean(edit.token);
+  [ui.googleLoginButton,ui.accessCodeButton].forEach((button) => { if (button) button.disabled = value; });
+  applyActionGate();
 }
 function fenceAmbiguousOperation() {
   if (edit.pendingSubmit) {
     ui.backToEditButton.disabled = true;
-    ui.submitButton.disabled = false;
+    ui.submitButton.disabled = !actionsReady();
   }
   if (edit.pendingEnd) {
     ui.scoreFields.disabled = true;
     [ui.saveButton, ui.reviewButton, ui.discardButton].forEach((button) => { button.disabled = true; });
-    ui.endButton.disabled = false;
+    ui.endButton.disabled = !actionsReady();
   }
   if (edit.pendingDiscard) {
     ui.keepDraftButton.disabled = true;
-    ui.confirmDiscardButton.disabled = false;
+    ui.confirmDiscardButton.disabled = !actionsReady();
+  }
+  if (edit.pendingSave || edit.saveConflict) {
+    ui.saveButton.disabled = true;
+    ui.reviewButton.disabled = true;
   }
 }
 function stopAll() { stop.forEach((fn) => fn()); stop = []; courtStops.forEach((fn) => fn()); courtStops = []; matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {}; heartbeat?.stop(); heartbeat = null; }
@@ -96,7 +208,7 @@ function renderForm() {
   ui.scoreLegend.textContent = `${name("a")} vs ${name("b")} 점수`; ui.scoreFields.replaceChildren(ui.scoreLegend);
   targets.forEach((target, i) => {
     const row = document.createElement("div"); row.className = "score-row"; const label = document.createElement("label"); label.textContent = `${i + 1}세트 · ${target}점`;
-    const input = (side) => { const node = document.createElement("input"); node.type = "number"; node.inputMode = "numeric"; node.min = "0"; node.max = "15"; node.value = previous.sets[i]?.[side] ?? ""; node.setAttribute("aria-label", `${i + 1}세트 ${name(side)} 점수`); node.addEventListener("input", () => { edit.dirty = true; edit.touched.add(`${i}-${side}`); edit.localDraft = { sets: formScore().sets.map((set) => ({ a: set.a, b: set.b })) }; edit.reviewedPayload = null; storeDraft(); action("미저장"); updateThird(); }); return node; };
+    const input = (side) => { const node = document.createElement("input"); node.type = "number"; node.inputMode = "numeric"; node.min = "0"; node.max = "15"; node.value = previous.sets[i]?.[side] ?? ""; node.setAttribute("aria-label", `${i + 1}세트 ${name(side)} 점수`); node.addEventListener("input", () => { edit.inputVersion += 1; edit.dirty = true; edit.touched.add(`${i}-${side}`); edit.localDraft = { sets: formScore().sets.map((set) => ({ a: set.a, b: set.b })) }; edit.reviewedPayload = null; const stored = storeDraft(); action(stored ? "미저장" : "미저장 · 이 화면의 점수를 별도로 기록하세요."); updateThird(); }); return node; };
     const a = input("a"), b = input("b"), left = document.createElement("div"), right = document.createElement("div"), colon = document.createElement("span"); left.className = right.className = "score-entry"; colon.textContent = ":"; left.append(Object.assign(document.createElement("span"), { textContent: name("a") }), a); right.append(Object.assign(document.createElement("span"), { textContent: name("b") }), b); row.append(label,left,colon,right); ui.scoreFields.append(row);
   });
   const updateThird = () => { if (!isFinal()) return; const inputs = ui.scoreFields.querySelectorAll(".score-row:nth-of-type(3) input"); const first = formScore().sets.slice(0,2).map((set) => ({ a: Number(set.a), b: Number(set.b) })); const enabled = first.every((set) => Number.isFinite(set.a) && Number.isFinite(set.b)) && finalNeedsThirdSet([...first,{a:0,b:0}]); inputs.forEach((input) => { input.disabled = !enabled; if (!enabled) input.value = ""; }); };
@@ -105,12 +217,24 @@ function renderForm() {
 function renderSummary() {
   if (!assignment) return; const view = courtMatchSummary(assignment, official, { teamsById: teams, groupsById: groups }); ui.matchSummary.textContent = `${view.label || "현재 경기"} · ${name("a")} vs ${name("b")}`;
 }
-function handleMatchSubscriptionError(error) {
-  if (authState?.kind === "ready" && /permission-denied/.test(String(error?.code || ""))) {
-    status("경기가 완료되어 다음 경기를 불러오는 중입니다.");
-    return;
+function renderSaveRecovery() {
+  if (!ui.saveRecoveryNotice) return;
+  const pending = edit.pendingSave;
+  const conflict = edit.saveConflict;
+  ui.saveRecoveryNotice.hidden = !pending && !conflict;
+  ui.retrySaveButton.hidden = !pending;
+  ui.keepLocalButton.hidden = !conflict;
+  ui.useServerButton.hidden = !conflict;
+  if (pending) {
+    ui.saveRecoveryTitle.textContent = "저장 결과를 확인하는 중입니다.";
+    ui.saveRecoveryMessage.textContent = "연결이 끊겨 저장 결과를 확인하지 못했습니다. 최신 서버 초안이 같으면 자동으로 저장 완료 처리하며, 다르면 로컬 초안을 유지한 채 선택할 수 있습니다.";
+    ui.retrySaveButton.disabled = busy || !actionsReady();
+  } else if (conflict) {
+    ui.saveRecoveryTitle.textContent = "서버 초안이 변경되었습니다.";
+    ui.saveRecoveryMessage.textContent = "서버의 최신 초안을 덮어쓰지 않았습니다. 로컬 초안을 유지해 새 버전을 기준으로 다시 저장하거나, 서버 초안을 직접 사용할 수 있습니다.";
+    ui.keepLocalButton.disabled = busy || !actionsReady();
+    ui.useServerButton.disabled = busy || !actionsReady();
   }
-  status(recorderReason(error));
 }
 function isStaleTerminalCurrent() {
   return queue?.currentMatchKey === matchKey
@@ -119,8 +243,111 @@ function isStaleTerminalCurrent() {
       || assignment?.publicStatus === "under_review"
       || ["submitted", "approved"].includes(workflow?.draftState));
 }
+let contextVersion = 0;
+function bumpContext() {
+  if (edit.pendingSave?.context?.storageKey) {
+    const pending = edit.pendingSave;
+    const stored = writeStoredRecorderDraft(getLocalStorage(), pending.context.storageKey, {
+      draft: pending.draft,
+      touched: [...pending.touched],
+      revision: pending.expectedRevision,
+    });
+    if (!stored.ok) setStorageStatus(stored.reason);
+  }
+  if (edit.dirty && edit.localDraft && storageKeyForEdit()) storeDraft();
+  contextVersion += 1;
+  edit.pendingSave = null;
+  edit.saveConflict = null;
+}
+function captureContext() {
+  return {
+    version: contextVersion,
+    matchKey,
+    courtId,
+    uid: auth.currentUser?.uid || authState?.user?.uid || null,
+    storageKey: storageKeyForEdit(),
+  };
+}
+function contextIsCurrent(context) {
+  return context.version === contextVersion
+    && context.matchKey === matchKey
+    && context.courtId === courtId
+    && context.uid === (auth.currentUser?.uid || authState?.user?.uid || null);
+}
+function applyWorkflowSnapshot(value, metadata = null) {
+  const remote = value?.draft ? draftCopy(value.draft) : null;
+  const remoteRevision = Number.isInteger(value?.draftRevision) ? value.draftRevision : null;
+  let reconciliation = { status: "ignore" };
+  const pendingSave = edit.pendingSave;
+  if (pendingSave && remoteRevision !== null && (!metadata || !metadata.fromCache)) {
+    reconciliation = reconcileRecorderSnapshot({
+      pendingSave,
+      remoteDraft: remote,
+      remoteRevision,
+    });
+    if (reconciliation.status === "confirmed" && contextIsCurrent(pendingSave.context)) {
+      edit.serverDraft = reconciliation.draft;
+      edit.savedRevision = reconciliation.revision;
+      const changedSinceSave = edit.inputVersion !== pendingSave.inputVersion;
+      if (!changedSinceSave) {
+        edit.localDraft = reconciliation.draft;
+        edit.dirty = false;
+        edit.touched.clear();
+      } else {
+        edit.dirty = true;
+      }
+      edit.pendingSave = null;
+      edit.saveConflict = null;
+      if (changedSinceSave) {
+        const stored = storeDraft();
+        action(stored ? "저장 확인됨 · 이후 변경은 미저장입니다." : "저장 확인됨 · 이후 변경을 별도로 기록하세요.");
+      } else {
+        const cleared = clearStored();
+        action(cleared ? "저장 확인됨" : "저장 확인됨 · 임시 저장 정리에 실패했습니다.");
+      }
+    } else if (reconciliation.status === "conflict" && contextIsCurrent(pendingSave.context)) {
+      edit.saveConflict = {
+        ...reconciliation,
+        localDraft: edit.inputVersion === pendingSave.inputVersion
+          ? reconciliation.localDraft
+          : draftCopy(edit.localDraft),
+      };
+      edit.pendingSave = null;
+      edit.savedRevision = reconciliation.remoteRevision;
+      edit.dirty = true;
+      const stored = storeDraft();
+      action(stored ? "서버 초안 충돌 · 로컬 초안을 보관했습니다." : "서버 초안 충돌 · 화면의 로컬 점수를 별도로 기록하세요.");
+    }
+  }
+  if (edit.saveConflict && remoteRevision !== null && (!metadata || !metadata.fromCache)
+      && remoteRevision > edit.saveConflict.remoteRevision && remote) {
+    edit.saveConflict = {
+      ...edit.saveConflict,
+      remoteDraft: remote,
+      remoteRevision,
+    };
+    edit.savedRevision = remoteRevision;
+  }
+  return { remote, remoteRevision, reconciliation };
+}
+async function reconcileFreshWorkflow(pendingSave) {
+  const fresh = await fetchRecorderWorkflow(pendingSave.context.matchKey);
+  if (!contextIsCurrent(pendingSave.context) || edit.pendingSave !== pendingSave) return "ignore";
+  workflow = fresh;
+  setSnapshotState("workflow", { fromCache: false });
+  if (edit.token && (fresh?.lock?.token !== edit.token || fresh?.lock?.sessionId === undefined)) {
+    edit.token = null;
+    heartbeat?.stop();
+    if (edit.dirty) status("입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.");
+  }
+  const { reconciliation } = applyWorkflowSnapshot(fresh, { fromCache: false });
+  render();
+  return reconciliation.status;
+}
 function render() {
   ui.confirmPanel.hidden = !edit.reviewedPayload;
+  renderDataState();
+  renderSaveRecovery();
   if (!matchKey) { ui.claimButton.hidden = true; ui.scoreForm.hidden = true; return; }
   renderSummary(); const reason = workflow?.rejectionReason || workflow?.reviewReason || workflow?.rejectedReason;
   const correctingRejectedScore = workflow?.draftState === "rejected" || workflow?.resumeDraftState === "rejected";
@@ -128,39 +355,81 @@ function render() {
   const waiting = !resolved(); ui.lockNotice.hidden = !(waiting || (workflow?.lock && !edit.token)); ui.lockNotice.textContent = waiting ? "대진이 확정되기를 기다리고 있습니다. 팀과 이전 경기 결과가 확정되면 입력할 수 있습니다." : "다른 탭 또는 기록관이 입력 중입니다.";
   if (isStaleTerminalCurrent()) {
     ui.claimButton.hidden = false;
-    ui.claimButton.disabled = reconcilingQueue;
+    ui.claimButton.disabled = reconcilingQueue || !actionsReady();
     ui.claimButton.textContent = reconcilingQueue ? "다음 경기 확인 중…" : "다음 경기로 이동";
     ui.scoreForm.hidden = true;
     ui.lockNotice.hidden = false;
     ui.lockNotice.textContent = "이 경기는 관리자가 확정했습니다. 다음 경기로 이동하세요.";
+    applyActionGate();
     return;
   }
   const resumable = canResumeCurrentMatch(workflow, recorder); ui.claimButton.hidden = Boolean(edit.token) || waiting || !(resumable || ["idle","rejected"].includes(workflow?.draftState));
-  ui.claimButton.disabled = waiting; ui.claimButton.textContent = correctingRejectedScore ? "반려 점수 수정" : resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
+  ui.claimButton.disabled = waiting || !actionsReady();
+  ui.claimButton.textContent = correctingRejectedScore ? "반려 점수 수정" : resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
   renderForm();
+  applyActionGate();
+  fenceAmbiguousOperation();
 }
 function attachMatch(key) {
+  if (key !== matchKey) {
+    bumpContext();
+    activeStorageKey = "";
+  }
   matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {}; matchKey = key; renderedFormKey = "";
-  matchStops.push(subscribeAssignment(key, (value) => { assignment = value; attachOfficial(); render(); }, handleMatchSubscriptionError));
-  matchStops.push(subscribeWorkflow(key, (value) => {
+  setDataState("assignment", "loading");
+  setDataState("workflow", "loading");
+  setDataState("official", "idle");
+  matchStops.push(subscribeAssignment(key, (value, metadata) => {
+    setSnapshotState("assignment", metadata);
+    assignment = value;
+    attachOfficial();
+    render();
+  }, (error) => handleMatchSubscriptionError(error, "assignment")));
+  matchStops.push(subscribeWorkflow(key, (value, metadata) => {
+    setSnapshotState("workflow", metadata);
     workflow = value;
     if (edit.token && (value?.lock?.token !== edit.token || value?.lock?.sessionId === undefined)) { edit.token = null; heartbeat?.stop(); if (edit.dirty) status("입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다."); }
-    const remote = value?.draft ? draftCopy(value.draft) : null;
-    if (!edit.dirty && remote && value.draftRevision !== edit.savedRevision) { edit.serverDraft = remote; edit.localDraft = remote; edit.savedRevision = value.draftRevision; }
+    const { remote, remoteRevision } = applyWorkflowSnapshot(value, metadata);
+    if (!edit.dirty && !edit.pendingSave && remote && remoteRevision !== null && remoteRevision !== edit.savedRevision) {
+      edit.serverDraft = remote; edit.localDraft = remote; edit.savedRevision = remoteRevision;
+    }
     render();
-  }, handleMatchSubscriptionError));
+  }, (error) => handleMatchSubscriptionError(error, "workflow")));
+}
+function handleMatchSubscriptionError(error, key = "workflow") {
+  setDataState(key, "error", error);
+  if (authState?.kind === "ready" && /permission-denied/.test(String(error?.code || ""))) {
+    status("경기 상태를 다시 확인할 수 없습니다. 다음 경기로 이동하거나 데이터를 다시 불러오세요.");
+    render();
+    return;
+  }
+  status(recorderReason(error));
+  render();
 }
 function attachOfficial() {
-  if (!assignment?.matchId) return;
+  if (!assignment?.matchId) {
+    official = null;
+    setDataState("official", "ready");
+    return;
+  }
   officialStop(); officialStop = () => {};
+  setDataState("official", "loading");
   const ref = assignment.matchType === "final" ? doc(db,"tournaments",TOURNAMENT_ID,"divisions",assignment.divisionId,"finalMatches",assignment.matchId) : doc(db,"tournaments",TOURNAMENT_ID,"prelimMatches",assignment.matchId);
-  officialStop = onSnapshot(ref, (snap) => { official = snap.exists() ? { id:snap.id,...snap.data() } : null; render(); }, () => { official = null; render(); });
+  officialStop = onSnapshot(ref, { includeMetadataChanges: true }, (snap) => {
+    setSnapshotState("official", snap.metadata);
+    official = snap.exists() ? { id:snap.id,...snap.data() } : null;
+    render();
+  }, (error) => {
+    setDataState("official", "error", error);
+    status(`공식 경기 데이터를 불러오지 못했습니다. ${recorderReason(error)}`);
+    render();
+  });
 }
-function attachCourt(value) {
-  courtStops.forEach((fn) => fn()); courtStops = [];
-  matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {};
-  courtId = value; matchKey = ""; assignment = workflow = official = null; ui.workflowPanel.hidden = !value; if (!value) return;
-  courtStops.push(onSnapshot(doc(db,"tournaments",TOURNAMENT_ID,"courtQueues",value), (snap) => {
+function subscribeCourtStreams() {
+  setDataState("queue", "loading");
+  setDataState("court", "loading");
+  courtStops.push(onSnapshot(doc(db,"tournaments",TOURNAMENT_ID,"courtQueues",courtId), { includeMetadataChanges: true }, (snap) => {
+    setSnapshotState("queue", snap.metadata);
     queue = snap.exists() ? {id:snap.id,...snap.data()} : null;
     if (queue?.currentMatchKey && queue.currentMatchKey !== matchKey) {
       attachMatch(queue.currentMatchKey);
@@ -169,6 +438,9 @@ function attachCourt(value) {
       matchStops = [];
       officialStop();
       officialStop = () => {};
+      setDataState("assignment", "idle");
+      setDataState("workflow", "idle");
+      setDataState("official", "idle");
       matchKey = "";
       assignment = workflow = official = null;
       renderedFormKey = "";
@@ -178,14 +450,66 @@ function attachCourt(value) {
       ui.scoreForm.hidden = true;
     }
     render();
+  }, (error) => {
+    setDataState("queue", "error", error);
+    status(`코트 대기열을 불러오지 못했습니다. ${recorderReason(error)}`);
+    render();
   }));
-  courtStops.push(subscribeCourt(value, (court) => { recorder = court?.recorderName?.trim() || ""; ui.courtMessage.textContent = recorder ? `${recorder} · ${displayCourt(court)}` : "기록관 배정이 없습니다."; }));
+  courtStops.push(subscribeCourt(courtId, (court, metadata) => {
+    setSnapshotState("court", metadata);
+    recorder = court?.recorderName?.trim() || "";
+    ui.courtMessage.textContent = recorder ? `${recorder} · ${displayCourt(court)}` : "기록관 배정이 없습니다.";
+    render();
+  }, (error) => {
+    setDataState("court", "error", error);
+    status(`코트 정보를 불러오지 못했습니다. ${recorderReason(error)}`);
+    render();
+  }));
+}
+function attachCourt(value) {
+  courtStops.forEach((fn) => fn()); courtStops = [];
+  matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {};
+  bumpContext();
+  activeStorageKey = "";
+  courtId = value; matchKey = ""; assignment = workflow = official = null;
+  setDataState("queue", "idle");
+  setDataState("court", "idle");
+  setDataState("assignment", "idle");
+  setDataState("workflow", "idle");
+  setDataState("official", "idle");
+  ui.workflowPanel.hidden = !value;
+  if (!value) { renderDataState(); return; }
+  subscribeCourtStreams();
+  render();
+}
+function subscribeReadyCollections() {
+  stop.forEach((fn) => fn()); stop = [];
+  ["courts", "teams", "groups"].forEach((key) => setDataState(key, "loading"));
+  stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"courts"), { includeMetadataChanges: true }, (snap) => {
+    setSnapshotState("courts", snap.metadata);
+    courts=snap.docs.map((item)=>({id:item.id,...item.data()}));
+    ui.courtSelect.replaceChildren(new Option("이름을 선택하세요",""),...courts.filter((court)=>court.recorderName).map((court)=>new Option(`${court.recorderName} (${displayCourt(court)})`,court.id)));
+    render();
+  }, (error) => { setDataState("courts", "error", error); status(`코트 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render(); }));
+  stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"teams"), { includeMetadataChanges: true }, (snap) => {
+    setSnapshotState("teams", snap.metadata);
+    teams=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render();
+  }, (error) => { setDataState("teams", "error", error); status(`팀 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render(); }));
+  stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"groups"), { includeMetadataChanges: true }, (snap) => {
+    setSnapshotState("groups", snap.metadata);
+    groups=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render();
+  }, (error) => { setDataState("groups", "error", error); status(`조 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render(); }));
 }
 function startReady() {
   stopAll();
-  stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"courts"), (snap) => { courts=snap.docs.map((item)=>({id:item.id,...item.data()})); ui.courtSelect.replaceChildren(new Option("이름을 선택하세요",""),...courts.filter((court)=>court.recorderName).map((court)=>new Option(`${court.recorderName} (${displayCourt(court)})`,court.id))); }));
-  stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"teams"), (snap) => { teams=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render(); }));
-  stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"groups"), (snap) => { groups=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render(); }));
+  subscribeReadyCollections();
+  if (courtId) {
+    setDataState("assignment", "idle");
+    setDataState("workflow", "idle");
+    setDataState("official", "idle");
+    subscribeCourtStreams();
+    if (matchKey) attachMatch(matchKey);
+  }
 }
 function beginHeartbeat() {
   heartbeat?.stop(); heartbeat = startLeaseHeartbeat({ matchKey, token:edit.token, queueRevision:queue?.queueRevision, onRenew:() => {}, onError:(error)=>{ status(recorderReason(error)); if (["ownership_lost", "lease_expired"].includes(reasonCode(error))) { edit.token=null; renderedFormKey=""; render(); } } });
@@ -214,21 +538,40 @@ watchRecorderAuthState((state) => {
   if (transientWhileReady) {
     ui.authPanel.hidden = true;
     ui.courtPanel.hidden = false;
-    ui.saveButton.disabled = true;
-    ui.submitButton.disabled = true;
-    ui.endButton.disabled = true;
-    ui.discardButton.disabled = true;
-    status(state.kind === "offline" ? "오프라인 · 입력은 이 기기에 보관됩니다." : "연결을 다시 확인하고 있습니다.");
+    applyActionGate();
+    if (state.kind === "offline" && edit.dirty) {
+      const stored = storeDraft();
+      status(stored ? "오프라인 · 로컬 초안을 보관했습니다." : "오프라인 · 로컬 초안을 저장할 수 없습니다. 화면을 닫지 마세요.");
+    } else status(state.kind === "offline" ? "오프라인입니다." : "연결을 다시 확인하고 있습니다.");
     return;
   }
   ui.authMessage.textContent = copy[state.kind] || "기록관 권한이 확인되었습니다."; ui.authPanel.hidden = state.kind === "ready"; ui.courtPanel.hidden = state.kind !== "ready"; ui.googleLoginButton.hidden = !["signedOut","wrongProvider","codeRequired","staleGrant"].includes(state.kind); ui.googleLoginButton.textContent = state.user ? "다른 Google 계정 사용" : "Google로 로그인 / 계정 선택"; ui.accessCodeForm.hidden = !["codeRequired","staleGrant"].includes(state.kind);
   if (state.kind === "ready" && !busy) setBusy(false);
-  if (state.kind === "ready" && readyUid !== state.user.uid) { readyUid = state.user.uid; startReady(); }
-  if (state.kind !== "ready" && readyUid) { stopAll(); if (!state.user) clearStored(); edit.token=null; readyUid = null; }
+  if (state.kind === "ready" && readyUid !== state.user.uid) {
+    bumpContext();
+    readyUid = state.user.uid;
+    startReady();
+  }
+  if (state.kind !== "ready" && readyUid) {
+    bumpContext();
+    stopAll();
+    Object.keys(dataHealth).forEach((key) => setDataState(key, "idle"));
+    if (!state.user) clearStored();
+    edit.token=null;
+    readyUid = null;
+  }
   if (authKindChanged && !edit.token) focus(state.kind === "ready" ? ui.courtPanel.querySelector("h2") : ui.authTitle);
 });
-window.addEventListener("online", () => { status("온라인"); heartbeat?.start(); heartbeat?.reconcile(); });
-window.addEventListener("offline", () => { status("오프라인"); heartbeat?.stop(); if(edit.dirty) action("오프라인 로컬 보관"); });
+window.addEventListener("online", () => { status("온라인"); heartbeat?.start(); heartbeat?.reconcile(); applyActionGate(); render(); });
+window.addEventListener("offline", () => {
+  status("오프라인");
+  heartbeat?.stop();
+  if (edit.dirty) {
+    const stored = storeDraft();
+    action(stored ? "오프라인 · 로컬 초안을 보관했습니다." : "오프라인 · 로컬 초안을 저장할 수 없습니다. 화면을 닫지 마세요.");
+  }
+  applyActionGate();
+});
 status(navigator.onLine ? "온라인" : "오프라인");
 document.addEventListener("visibilitychange", () => { if(document.hidden) heartbeat?.stop(); else { heartbeat?.start(); heartbeat?.reconcile(); } });
 window.addEventListener("beforeunload", (event) => { if(edit.dirty || edit.pendingSubmit || edit.pendingEnd || edit.pendingDiscard) { event.preventDefault(); event.returnValue="완료되지 않은 기록관 작업이 있습니다."; } });
@@ -242,8 +585,92 @@ ui.logoutButton.onclick=async()=>{
   await logoutRecorder();
 };
 ui.courtSelect.onchange=()=>{recorder=courts.find((court)=>court.id===ui.courtSelect.value)?.recorderName?.trim()||"";attachCourt(ui.courtSelect.value);};
+async function persistDraft(score, context = captureContext()) {
+  if (!score || !contextIsCurrent(context) || !actionsReady() || !edit.token) return false;
+  const attemptedDraft = draftCopy(score);
+  if (!attemptedDraft) return false;
+  const pending = {
+    context,
+    draft: attemptedDraft,
+    expectedRevision: edit.savedRevision,
+    inputVersion: edit.inputVersion,
+    touched: new Set(edit.touched),
+  };
+  edit.pendingSave = pending;
+  edit.saveConflict = null;
+  setBusy(true);
+  action("저장 중");
+  try {
+    const result = await saveRecorderDraft({
+      matchKey: context.matchKey,
+      token: edit.token,
+      queueRevision: queue?.queueRevision,
+      draft: attemptedDraft,
+      expectedDraftRevision: pending.expectedRevision,
+      final: isFinal(),
+    });
+    if (!contextIsCurrent(context) || edit.pendingSave !== pending) return false;
+    if (!Number.isInteger(result?.draftRevision)) throw Object.assign(new Error("저장 결과를 확인할 수 없습니다."), { code: "unknown" });
+    edit.pendingSave = null;
+    edit.saveConflict = null;
+    edit.serverDraft = attemptedDraft;
+    edit.savedRevision = result.draftRevision;
+    const changedSinceSave = edit.inputVersion !== pending.inputVersion;
+    if (!changedSinceSave) {
+      edit.localDraft = attemptedDraft;
+      edit.dirty = false;
+      edit.touched.clear();
+      const cleared = clearStored();
+      action(cleared
+        ? `저장됨 ${new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"})}`
+        : "저장됨 · 임시 저장 정리에 실패했습니다.");
+    } else {
+      edit.dirty = true;
+      const stored = storeDraft();
+      action(stored ? "저장됨 · 이후 변경은 미저장입니다." : "저장됨 · 이후 변경을 별도로 기록하세요.");
+    }
+    return true;
+  } catch(error) {
+    if (!contextIsCurrent(context) || edit.pendingSave !== pending) return false;
+    const ambiguous = ambiguousNetworkResult(error);
+    const stale = reasonCode(error) === "stale_revision" || /stale_revision/.test(String(error?.message || ""));
+    if (ambiguous || stale) {
+      try {
+        const reconciliationStatus = await reconcileFreshWorkflow(pending);
+        if (reconciliationStatus === "confirmed" || reconciliationStatus === "conflict") {
+          ui.scoreError.textContent = "";
+          return reconciliationStatus === "confirmed";
+        }
+      } catch (refreshError) {
+        status(`최신 서버 초안을 확인하지 못했습니다. ${recorderReason(refreshError)}`);
+      }
+      if (!contextIsCurrent(context) || edit.pendingSave !== pending) return false;
+    }
+    if (!ambiguous && !stale) edit.pendingSave = null;
+    const changedSinceSave = edit.inputVersion !== pending.inputVersion;
+    const localDraft = changedSinceSave ? draftCopy(edit.localDraft) : attemptedDraft;
+    const touched = changedSinceSave ? [...edit.touched] : [...pending.touched];
+    const stored = writeStoredRecorderDraft(getLocalStorage(), context.storageKey, {
+      draft: localDraft,
+      touched,
+      revision: pending.expectedRevision,
+    });
+    if (!stored.ok) setStorageStatus(stored.reason);
+    else clearStorageStatus();
+    action(stored.ok
+      ? (ambiguous || stale ? "최신 서버 초안 확인 중 · 로컬 초안을 보관했습니다." : "저장 실패 · 로컬 초안을 보관했습니다.")
+      : "저장 실패 · 이 화면의 점수를 별도로 기록하세요.");
+    ui.scoreError.textContent = recorderReason(error);
+    return false;
+  } finally {
+    if (contextIsCurrent(context)) {
+      setBusy(false);
+      render();
+    }
+  }
+}
 ui.claimButton.onclick=async()=>{
-  if(!matchKey||busy)return;
+  if(!matchKey||busy||!actionsReady())return;
   if (isStaleTerminalCurrent()) {
     reconcilingQueue = true;
     render();
@@ -263,9 +690,108 @@ ui.claimButton.onclick=async()=>{
     }
     return;
   }
-  setBusy(true); try { const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft; let result; try { result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder}); } catch(error) { if (workflow?.lock?.uid === auth.currentUser?.uid && reasonCode(error) === "ownership_lost" && window.confirm("다른 탭에서 이 경기 입력을 열고 있습니다. 그 탭의 입력권을 이어받을까요? 다른 탭의 저장되지 않은 값은 자동으로 삭제되지 않습니다.")) result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder,takeover:true}); else throw error; } edit.token=result.token; edit.serverDraft=draftCopy(result.draft); edit.localDraft=edit.serverDraft; edit.savedRevision=result.draftRevision; const saved=localStorage.getItem(scoreKey()); if(saved){const parsed=JSON.parse(saved);if(parsed.revision===result.draftRevision){edit.localDraft=parsed.draft;edit.touched=new Set(parsed.touched||[]);edit.dirty=true;}else if(window.confirm("이 기기의 임시 점수가 서버의 최신 초안보다 오래되었습니다. 이전 기기 점수를 불러와 비교할까요?")){edit.localDraft=parsed.draft;edit.touched=new Set(parsed.touched||[]);edit.dirty=true;status("이전 기기 점수를 불러왔습니다. 확인 후 다시 저장하세요.");}else{status("서버의 최신 초안을 불러왔습니다.");}} channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId}); beginHeartbeat(); renderedFormKey=""; render(); focus(ui.scoreFields.querySelector("input")); } catch(error) { status(recorderReason(error)); } finally {setBusy(false);} };
-ui.scoreForm.onsubmit=async(event)=>{event.preventDefault();const check=validate(false);ui.scoreError.textContent=check.ok?"":check.message;if(!check.ok)return;setBusy(true);action("저장 중");try{const result=await saveRecorderDraft({matchKey,token:edit.token,queueRevision:queue?.queueRevision,draft:check.score,expectedDraftRevision:edit.savedRevision,final:isFinal()});edit.serverDraft=draftCopy(check.score);edit.localDraft=draftCopy(check.score);edit.savedRevision=result.draftRevision;edit.dirty=false;clearStored();action(`저장됨 ${new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"})}`);}catch(error){action("오프라인 로컬 보관");storeDraft();ui.scoreError.textContent=recorderReason(error);}finally{setBusy(false);}};
+  const context = captureContext();
+  setBusy(true);
+  try {
+    const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft;
+    let result;
+    try {
+      result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder});
+    } catch(error) {
+      if (workflow?.lock?.uid === auth.currentUser?.uid && reasonCode(error) === "ownership_lost"
+          && window.confirm("다른 탭에서 이 경기 입력을 열고 있습니다. 그 탭의 입력권을 이어받을까요? 다른 탭의 저장되지 않은 값은 자동으로 삭제되지 않습니다.")) {
+        result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder,takeover:true});
+      } else throw error;
+    }
+    if (!contextIsCurrent(context)) return;
+    edit.token=result.token;
+    edit.serverDraft=draftCopy(result.draft);
+    edit.localDraft=edit.serverDraft;
+    edit.savedRevision=result.draftRevision;
+    edit.pendingSave=null;
+    edit.saveConflict=null;
+    edit.touched.clear();
+    edit.dirty=false;
+    activeStorageKey = scoreKey();
+    const saved=readStored();
+    if(saved.ok && saved.found) {
+      const parsed=saved.value;
+      if(parsed.revision===result.draftRevision){
+        edit.localDraft=parsed.draft; edit.touched=new Set(parsed.touched); edit.dirty=true;
+      } else if(window.confirm("이 기기의 임시 점수가 서버의 최신 초안보다 오래되었습니다. 이전 기기 점수를 불러와 비교할까요?")){
+        edit.localDraft=parsed.draft; edit.touched=new Set(parsed.touched); edit.dirty=true;
+        status("이전 기기 점수를 불러왔습니다. 확인 후 다시 저장하세요.");
+      } else status("서버의 최신 초안을 불러왔습니다.");
+    }
+    channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId});
+    beginHeartbeat(); renderedFormKey=""; render(); focus(ui.scoreFields.querySelector("input"));
+  } catch(error) {
+    if (contextIsCurrent(context)) status(recorderReason(error));
+  } finally {
+    if (contextIsCurrent(context)) setBusy(false);
+  }
+};
+ui.scoreForm.onsubmit=async(event)=>{
+  event.preventDefault();
+  if (busy || !actionsReady() || edit.pendingSave || edit.saveConflict) return;
+  const check=validate(false);
+  ui.scoreError.textContent=check.ok?"":check.message;
+  if(!check.ok)return;
+  await persistDraft(check.score);
+};
+ui.retrySaveButton.onclick=async()=>{
+  if (busy || !edit.pendingSave || !actionsReady()) return;
+  const pending = edit.pendingSave;
+  await persistDraft(pending.draft, pending.context);
+};
+ui.keepLocalButton.onclick=async()=>{
+  if (busy || !edit.saveConflict || !actionsReady()) return;
+  const resolution = resolveRecorderConflict("local", {
+    ...edit.saveConflict,
+    localDraft: draftCopy(edit.localDraft) || edit.saveConflict.localDraft,
+  });
+  if (resolution.status !== "retry") return;
+  edit.savedRevision = resolution.expectedRevision;
+  edit.serverDraft = draftCopy(edit.saveConflict.remoteDraft);
+  edit.localDraft = draftCopy(resolution.draft);
+  edit.dirty = true;
+  edit.pendingSave = null;
+  edit.saveConflict = null;
+  const stored = storeDraft();
+  action(stored ? "로컬 초안을 유지합니다. 다시 저장하세요." : "로컬 초안을 유지합니다. 화면의 점수를 별도로 기록하세요.");
+  render();
+};
+ui.useServerButton.onclick=()=>{
+  if (busy || !edit.saveConflict || !actionsReady()) return;
+  const resolution = resolveRecorderConflict("remote", edit.saveConflict);
+  if (resolution.status !== "use_remote") return;
+  edit.serverDraft = resolution.draft;
+  edit.localDraft = resolution.draft;
+  edit.savedRevision = resolution.revision;
+  edit.dirty = false;
+  edit.inputVersion += 1;
+  edit.touched.clear();
+  edit.pendingSave = null;
+  edit.saveConflict = null;
+  const cleared = clearStored();
+  action(cleared ? "서버의 최신 초안을 사용합니다." : "서버 초안을 사용했지만 임시 저장 정리에 실패했습니다.");
+  renderedFormKey = "";
+  render();
+  focus(ui.scoreFields.querySelector("input"));
+};
+ui.retryDataButton.onclick=()=>{
+  if (busy || !readyUid) return;
+  subscribeReadyCollections();
+  if (courtId) {
+    courtStops.forEach((fn) => fn());
+    courtStops = [];
+    subscribeCourtStreams();
+  }
+  if (matchKey) attachMatch(matchKey);
+  render();
+};
 ui.reviewButton.onclick=()=>{
+  if (!actionsReady() || busy || edit.pendingSave || edit.saveConflict) return;
   const check=validate(true);
   ui.scoreError.textContent=check.ok?"":check.message;
   if(!check.ok)return;
@@ -277,10 +803,10 @@ ui.reviewButton.onclick=()=>{
   focus(ui.confirmTitle);
 };
 ui.backToEditButton.onclick=()=>{edit.reviewedPayload=null;render();focus(ui.scoreFields.querySelector("input"));};
-ui.submitButton.onclick=async()=>{if(!edit.reviewedPayload&&!edit.pendingSubmit)return;edit.pendingSubmit ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,score:edit.reviewedPayload,final:isFinal(),operationId:operationId()};setBusy(true);try{await submitRecorderDraft(edit.pendingSubmit);edit.pendingSubmit=null;clearStored();edit.dirty=false;edit.token=null;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();heartbeat?.stop();ui.confirmPanel.hidden=true;ui.successPanel.hidden=false;action("제출 완료");focus(ui.successTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingSubmit=null;ui.scoreError.textContent=recorderReason(error);status(ambiguous?`${recorderReason(error)} 같은 제출 요청으로 결과를 다시 확인하세요.`:`${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`);}finally{setBusy(false);fenceAmbiguousOperation();}};
-ui.endButton.onclick=async()=>{edit.pendingEnd ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:false,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingEnd);edit.pendingEnd=null;edit.token=null;edit.reviewedPayload=null;heartbeat?.stop();status("입력을 종료했습니다. 초안은 보관됩니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingEnd=null;status(ambiguous?`${recorderReason(error)} 같은 종료 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
+ui.submitButton.onclick=async()=>{if((!edit.reviewedPayload&&!edit.pendingSubmit)||!actionsReady())return;edit.pendingSubmit ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,score:edit.reviewedPayload,final:isFinal(),operationId:operationId()};setBusy(true);try{await submitRecorderDraft(edit.pendingSubmit);edit.pendingSubmit=null;const cleared=clearStored();edit.dirty=false;edit.token=null;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();heartbeat?.stop();ui.confirmPanel.hidden=true;ui.successPanel.hidden=false;action(cleared?"제출 완료":"제출 완료 · 임시 저장 정리에 실패했습니다.");focus(ui.successTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingSubmit=null;ui.scoreError.textContent=recorderReason(error);status(ambiguous?`${recorderReason(error)} 같은 제출 요청으로 결과를 다시 확인하세요.`:`${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`);}finally{setBusy(false);fenceAmbiguousOperation();}};
+ui.endButton.onclick=async()=>{if(!actionsReady())return;edit.pendingEnd ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:false,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingEnd);edit.pendingEnd=null;edit.token=null;edit.reviewedPayload=null;heartbeat?.stop();status("입력을 종료했습니다. 초안은 보관됩니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingEnd=null;status(ambiguous?`${recorderReason(error)} 같은 종료 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
 ui.discardButton.onclick=()=>{ui.discardMessage.textContent=`${name("a")} 대 ${name("b")} 경기의 저장 초안을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`;ui.discardPanel.hidden=false;focus(ui.keepDraftButton);};
 ui.keepDraftButton.onclick=()=>{ui.discardPanel.hidden=true;focus(ui.scoreFields.querySelector("input"));};
-ui.confirmDiscardButton.onclick=async()=>{edit.pendingDiscard ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:true,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingDiscard);edit.pendingDiscard=null;clearStored();edit.token=null;edit.dirty=false;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();renderedFormKey="";ui.scoreFields.replaceChildren(ui.scoreLegend);heartbeat?.stop();ui.discardPanel.hidden=true;status("초안을 폐기했습니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingDiscard=null;status(ambiguous?`${recorderReason(error)} 같은 폐기 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
+ui.confirmDiscardButton.onclick=async()=>{if(!actionsReady())return;edit.pendingDiscard ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:true,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingDiscard);edit.pendingDiscard=null;const cleared=clearStored();edit.token=null;edit.dirty=false;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();renderedFormKey="";ui.scoreFields.replaceChildren(ui.scoreLegend);heartbeat?.stop();ui.discardPanel.hidden=true;status(cleared?"초안을 폐기했습니다.":"초안을 폐기했지만 임시 저장 정리에 실패했습니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingDiscard=null;status(ambiguous?`${recorderReason(error)} 같은 폐기 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
 ui.nextSameButton.onclick=()=>{ui.successPanel.hidden=true;attachCourt(courtId);};
 ui.switchRecorderButton.onclick=()=>{ui.successPanel.hidden=true;attachCourt("");ui.courtSelect.value="";focus(ui.courtSelect);};

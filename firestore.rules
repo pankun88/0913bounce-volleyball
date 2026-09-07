@@ -147,6 +147,18 @@ service cloud.firestore {
         && queue.data.currentMatchKey == matchKey;
     }
 
+    function ownsTerminalSubmission() {
+      let submission = resource.data.get('submission', {});
+      let submissionVersion = resource.data.get('submissionVersion', 0);
+      return submissionVersion is int
+        && submissionVersion > 0
+        && submission is map
+        && submission.get('version', 0) == submissionVersion
+        && submission.get('recorder', {}) is map
+        && submission.get('recorder', {}).get('uid', '') is string
+        && submission.get('recorder', {}).get('uid', '') == request.auth.uid;
+    }
+
     function ownsNewLock(tournamentId, matchKey) {
       let currentAssignment = assignment(tournamentId, matchKey);
       let court = get(/databases/$(database)/documents/tournaments/$(tournamentId)/courts/$(currentAssignment.data.courtId));
@@ -348,12 +360,14 @@ service cloud.firestore {
           && isCurrentMatch(tournamentId, matchKey)
           && resource.data.lock == null
           && resource.data.draftState in ['idle', 'rejected'];
-        // Keep an already-open listener readable while an admin approval/direct
-        // score atomically advances the court queue. Queries remain closed.
+        // Keep the submitting recorder's already-open listener readable while
+        // approval/direct score atomically advances the court queue. Queries
+        // remain closed.
         allow get: if isMain(tournamentId)
           && hasCurrentRecorderGrant(tournamentId)
           && resource.data.lock == null
-          && resource.data.draftState in ['submitted', 'approved'];
+          && resource.data.draftState in ['submitted', 'approved']
+          && ownsTerminalSubmission();
         allow list: if isMain(tournamentId) && isAdmin();
         allow update: if false;
         allow create, delete: if false;

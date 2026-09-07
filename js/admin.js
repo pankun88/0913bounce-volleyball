@@ -76,9 +76,81 @@ const TOURNAMENT_RESET_STATE_KEY = "bounce-volleyball:tournament-reset";
 let recorderGrants = [];
 let recorderGrantsLoading = false;
 let recorderGrantsError = "";
+let prelimHistoryReadiness = { status: "loading", error: null };
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
+const PRELIM_HISTORY_GUIDANCE = "공식 예선 이력이 있는 경기는 조·팀·예선 초기화와 대진 재생성을 할 수 없습니다. 전체 초기화로 결과를 지우지 말고, 기록·검수 탭의 ‘승인 결과 정정’에서 해당 경기를 선택해 감사 사유와 함께 정정 절차를 진행하세요.";
+const PRELIM_HISTORY_DISABLED_TITLE = "공식 예선 이력이 있어 비활성화되었습니다. 기록·검수 탭에서 승인 결과 정정을 진행하세요.";
+const PRELIM_HISTORY_LOADING_GUIDANCE = "예선 이력을 서버에서 확인하는 중입니다. 확인이 끝날 때까지 결과를 지울 수 있는 초기화·대진 재생성을 사용할 수 없습니다.";
+
+function hasOfficialPrelimHistory(match) {
+  return Number(match?.officialRevision || 0) > 0
+    || Boolean(match?.result || match?.winner || match?.winnerTeam)
+    || ["done", "completed"].includes(match?.status)
+    || (Array.isArray(match?.sets)
+      && match.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0));
+}
+
+function prelimMatchesForMutation(operation, groupId = null) {
+  const groupOperations = new Set([
+    "delete_group",
+    "generate_group_round_robin",
+    "generate_group_ring",
+    "clear_group_prelim",
+  ]);
+  if (groupOperations.has(operation)) {
+    return allPrelimMatches.filter((match) => match.groupId === groupId);
+  }
+  const activeGroupIds = new Set(
+    allGroups
+      .filter((group) => group.division === activeDivision)
+      .map((group) => group.id),
+  );
+  if (operation === "delete_all_groups") {
+    return allPrelimMatches.filter((match) => (
+      match.division === activeDivision || activeGroupIds.has(match.groupId)
+    ));
+  }
+  return allPrelimMatches.filter((match) => match.division === activeDivision);
+}
+
+function officialPrelimHistoryForMutation(operation, groupId = null) {
+  return prelimMatchesForMutation(operation, groupId).filter(hasOfficialPrelimHistory);
+}
+
+function prelimHistoryIsReady() {
+  return prelimHistoryReadiness.status === "ready";
+}
+
+function prelimHistoryReadinessGuidance() {
+  if (prelimHistoryReadiness.status === "error") {
+    const code = prelimHistoryReadiness.error?.code
+      ? ` (${prelimHistoryReadiness.error.code})`
+      : "";
+    return `예선 이력을 서버에서 확인하지 못했습니다${code}. 네트워크·Firestore 연결을 복구한 뒤 새로고침해 다시 확인하세요. 확인 전에는 초기화·대진 재생성을 사용할 수 없습니다.`;
+  }
+  return PRELIM_HISTORY_LOADING_GUIDANCE;
+}
+
+function blockPrelimMutationUntilReady() {
+  if (prelimHistoryIsReady()) return false;
+  showToast(prelimHistoryReadinessGuidance(), 7000);
+  return true;
+}
+
+function prelimMutationGuidance(historyMatches = []) {
+  if (!historyMatches.length) return PRELIM_HISTORY_GUIDANCE;
+  return `${divisionLabel()}에 공식 예선 이력이 있는 경기 ${historyMatches.length}건이 확인되어 이 작업을 중단했습니다. ${PRELIM_HISTORY_GUIDANCE}`;
+}
+
+function blockPrelimMutationWithHistory(operation, groupId = null) {
+  if (blockPrelimMutationUntilReady()) return true;
+  const historyMatches = officialPrelimHistoryForMutation(operation, groupId);
+  if (!historyMatches.length) return false;
+  showToast(prelimMutationGuidance(historyMatches), 7000);
+  return true;
+}
 
 function cloneFinalMatches(matches) {
   return structuredClone(matches || []);
@@ -158,6 +230,35 @@ function refreshActiveDivisionData() {
   renderFinalTeamPicker();
   renderWorkflowCourtPlanner();
   renderScoreReviews();
+  updatePrelimMutationGuardUi();
+}
+
+function updatePrelimMutationGuardUi() {
+  const guidance = document.getElementById("prelimMutationGuidance");
+  const ready = prelimHistoryIsReady();
+  const historyMatches = ready ? officialPrelimHistoryForMutation("clear_division_prelim") : [];
+  if (guidance) {
+    guidance.textContent = !ready
+      ? prelimHistoryReadinessGuidance()
+      : historyMatches.length
+      ? prelimMutationGuidance(historyMatches)
+      : PRELIM_HISTORY_GUIDANCE;
+  }
+  [
+    ["resetGroupsBtn", "delete_all_groups", "공식 이력이 없는 경우 현재 부문의 모든 조를 삭제합니다."],
+    ["resetTeamsBtn", "delete_all_teams", "공식 이력이 없는 경우 현재 부문의 모든 팀과 예선 대진을 삭제합니다."],
+    ["resetPrelimBtn", "clear_division_prelim", "공식 이력이 없는 경우 현재 부문의 예선 대진을 초기화합니다."],
+  ].forEach(([buttonId, operation, title]) => {
+    const button = document.getElementById(buttonId);
+    if (!button) return;
+    const operationHistory = ready ? officialPrelimHistoryForMutation(operation) : [];
+    const blocked = !ready || operationHistory.length > 0;
+    button.disabled = blocked;
+    button.setAttribute("aria-disabled", String(blocked));
+    button.title = !ready
+      ? prelimHistoryReadinessGuidance()
+      : operationHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : title;
+  });
 }
 
 function rebindFinalMatches() {
@@ -235,8 +336,11 @@ subscribeTeams((data) => {
   refreshActiveDivisionData();
 });
 
-subscribePrelimMatches((data) => {
+subscribePrelimMatches((data, metadata) => {
   allPrelimMatches = data;
+  prelimHistoryReadiness = metadata?.fromCache === false && metadata?.hasPendingWrites === false
+    ? { status: "ready", error: null }
+    : { status: "loading", error: null };
   invalidateCorrectionPreview("공식 경기 상태가 변경되어 정정 미리보기가 무효화되었습니다. 다시 미리보기를 실행하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
@@ -250,11 +354,23 @@ rebindFinalMatches();
 function initConnectionWatch() {
   window.addEventListener("firestore-error", (e) => {
     const { label, err } = e.detail;
+    if (label === "예선경기 구독" || label === "예선경기") {
+      prelimHistoryReadiness = { status: "error", error: err || new Error("예선 이력 연결 오류") };
+      updatePrelimMutationGuardUi();
+      renderGroupList();
+      renderPrelimSetupGroups();
+    }
     setConnStatus(false);
     const code = err && err.code ? ` (${err.code})` : "";
     showErrorBanner(`${label} 실패${code}: ${err && err.message ? err.message : err}\nFirestore 보안 규칙이 게시되어 있는지 Firebase 콘솔에서 확인해주세요.`);
   });
   window.addEventListener("firestore-timeout", (e) => {
+    if (e.detail.label === "예선경기") {
+      prelimHistoryReadiness = { status: "error", error: new Error("예선경기 실시간 연결 시간이 초과되었습니다.") };
+      updatePrelimMutationGuardUi();
+      renderGroupList();
+      renderPrelimSetupGroups();
+    }
     setConnStatus(false);
     showErrorBanner(
       `"${e.detail.label}" 실시간 연결이 응답하지 않습니다.\n` +
@@ -1509,8 +1625,10 @@ function bindStaticHandlers() {
     if (e.key === "Enter") { e.preventDefault(); addGroupFromForm(); }
   });
   document.getElementById("resetGroupsBtn").addEventListener("click", async () => {
+    if (blockPrelimMutationUntilReady()) return;
     if (!groups.length) return showToast("이미 등록된 조가 없습니다");
-    if (!confirm(`${divisionLabel()}의 모든 조를 삭제할까요? 소속 팀은 모두 미배정 상태가 되고, 해당 조의 예선 대진/결과도 함께 삭제됩니다.`)) return;
+    if (blockPrelimMutationWithHistory("delete_all_groups")) return;
+    if (!confirm(`${divisionLabel()}의 모든 조를 삭제할까요? 소속 팀은 모두 미배정 상태가 되고, 공식 이력이 없는 해당 조의 예선 대진도 함께 삭제됩니다.`)) return;
     try {
       await mutatePrelimStructureAndRefresh("delete_all_groups");
       showToast(`${divisionLabel()} 조를 모두 초기화했습니다`);
@@ -1525,8 +1643,10 @@ function bindStaticHandlers() {
   });
   document.getElementById("teamGroupSelect").addEventListener("change", updateTeamNameInputContext);
   document.getElementById("resetTeamsBtn").addEventListener("click", async () => {
+    if (blockPrelimMutationUntilReady()) return;
     if (!teams.length) return showToast("이미 등록된 팀이 없습니다");
-    if (!confirm(`${divisionLabel()}의 모든 팀을 삭제할까요? 예선·본선 경기 기록도 함께 삭제됩니다.`)) return;
+    if (blockPrelimMutationWithHistory("delete_all_teams")) return;
+    if (!confirm(`${divisionLabel()}의 모든 팀을 삭제할까요? 공식 이력이 없는 예선 경기와 팀 정보도 함께 삭제됩니다.`)) return;
     try {
       await mutatePrelimStructureAndRefresh("delete_all_teams");
       showToast(`${divisionLabel()} 팀을 모두 초기화했습니다`);
@@ -1536,9 +1656,11 @@ function bindStaticHandlers() {
   });
 
   document.getElementById("resetPrelimBtn").addEventListener("click", async () => {
+    if (blockPrelimMutationUntilReady()) return;
     const hasRingPlacement = groups.some((g) => (g.ringOrder || []).some(Boolean));
     if (!prelimMatches.length && !hasRingPlacement) return showToast("초기화할 예선 경기가 없습니다");
-    if (!confirm(`${divisionLabel()} 모든 조의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
+    if (blockPrelimMutationWithHistory("clear_division_prelim")) return;
+    if (!confirm(`${divisionLabel()} 공식 이력이 없는 모든 조의 예선 대진과 도형(링크제) 배치를 초기화할까요?`)) return;
     try {
       await mutatePrelimStructureAndRefresh("clear_division_prelim");
       ringSelection = null;
@@ -1920,8 +2042,17 @@ function renderGroupList() {
     deleteButton.title = "삭제";
     deleteButton.setAttribute("aria-label", `${g.name} 조 삭제`);
     deleteButton.textContent = "✕";
+    const ready = prelimHistoryIsReady();
+    const groupHistory = ready ? officialPrelimHistoryForMutation("delete_group", g.id) : [];
+    const groupBlocked = !ready || groupHistory.length > 0;
+    deleteButton.disabled = groupBlocked;
+    deleteButton.setAttribute("aria-disabled", String(groupBlocked));
+    deleteButton.title = !ready
+      ? prelimHistoryReadinessGuidance()
+      : groupHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : "삭제";
     deleteButton.addEventListener("click", async () => {
-      if (!confirm(`${divisionLabel()} '${g.name}' 조를 삭제할까요? (소속 팀은 무소속이 됩니다)`)) return;
+      if (blockPrelimMutationWithHistory("delete_group", g.id)) return;
+      if (!confirm(`${divisionLabel()} '${g.name}' 조를 삭제할까요? (공식 이력이 없는 예선 대진만 함께 삭제되고 소속 팀은 무소속이 됩니다)`)) return;
       try {
         await mutatePrelimStructureAndRefresh("delete_group", { groupId: g.id });
       } catch (err) {
@@ -2034,7 +2165,13 @@ function createTeamPill(t, groupId) {
   pill.className = "team-pill reorder-pill";
   pill.draggable = true;
   pill.innerHTML = `${escapeHtml(t.name)} <button title="삭제">✕</button>`;
-  pill.querySelector("button").addEventListener("click", async () => {
+  const deleteButton = pill.querySelector("button");
+  const ready = prelimHistoryIsReady();
+  deleteButton.disabled = !ready;
+  deleteButton.setAttribute("aria-disabled", String(!ready));
+  if (!ready) deleteButton.title = prelimHistoryReadinessGuidance();
+  deleteButton.addEventListener("click", async () => {
+    if (blockPrelimMutationUntilReady()) return;
     if (!confirm(`${divisionLabel()} '${t.name}' 팀을 삭제할까요?`)) return;
     try {
       await mutatePrelimStructureAndRefresh("delete_team", { teamId: t.id });
@@ -2173,10 +2310,10 @@ function groupHasScoredMatches(groupId) {
   );
 }
 
-/** 방식 전환/재배치로 기존 결과가 사라질 수 있을 때 확인을 구한다. 결과가 없으면 그냥 통과. */
+/** 방식 전환/재배치로 기존 대진이 대체될 때 확인을 구한다. 공식 이력은 별도 사전 차단한다. */
 function confirmIfResultsWillReset(groupId, groupName, message) {
   if (!groupHasScoredMatches(groupId)) return true;
-  return confirm(`${divisionLabel()} ${message || `'${groupName}'의 기존 경기 결과가 초기화됩니다. 계속할까요?`}`);
+  return confirm(`${divisionLabel()} ${message || `'${groupName}'의 기존 대진이 대체됩니다. 계속할까요?`}`);
 }
 
 /** 한 조의 예선 대진/결과와 링크제 도형 배치를 모두 초기화한다 (조별 '초기화' 버튼용) */
@@ -2184,7 +2321,8 @@ async function handleResetGroupPrelim(group) {
   const hasMatches = groupHasPrelimMatches(group.id);
   const hasRingPlacement = (group.ringOrder || []).some(Boolean);
   if (!hasMatches && !hasRingPlacement) return showToast(`${group.name}에 초기화할 내용이 없습니다`);
-  if (!confirm(`${divisionLabel()} '${group.name}'의 예선 대진과 결과, 도형(링크제) 배치를 모두 초기화할까요?`)) return;
+  if (blockPrelimMutationWithHistory("clear_group_prelim", group.id)) return;
+  if (!confirm(`${divisionLabel()} '${group.name}'의 공식 이력이 없는 예선 대진과 도형(링크제) 배치를 초기화할까요?`)) return;
   try {
     await mutatePrelimStructureAndRefresh("clear_group_prelim", { groupId: group.id, ringOrder: [] });
     ringSelection = null;
@@ -2210,6 +2348,17 @@ async function handleSetMatchMode(group, mode) {
 }
 
 async function applyRingOrderChange(group, nextRingOrder) {
+  if (blockPrelimMutationUntilReady()) {
+    renderPrelimSetupGroups();
+    return;
+  }
+  const operation = nextRingOrder.length >= 2 && nextRingOrder.every(Boolean)
+    ? "generate_group_ring"
+    : groupHasPrelimMatches(group.id) ? "clear_group_prelim" : null;
+  if (operation && blockPrelimMutationWithHistory(operation, group.id)) {
+    renderPrelimSetupGroups();
+    return;
+  }
   if (!confirmIfResultsWillReset(group.id, group.name)) {
     renderPrelimSetupGroups(); // 취소 시에도 선택 상태가 이미 풀렸으므로 화면을 다시 그려 정리한다
     return;
@@ -2235,7 +2384,8 @@ async function applyRingOrderChange(group, nextRingOrder) {
 }
 
 async function handleRingShuffle(group, groupTeams) {
-  if (!confirmIfResultsWillReset(group.id, group.name, `'${group.name}'을 무작위로 다시 배치하면 기존 경기 결과가 초기화됩니다. 계속할까요?`)) return;
+  if (blockPrelimMutationWithHistory("generate_group_ring", group.id)) return;
+  if (!confirmIfResultsWillReset(group.id, group.name, `'${group.name}'을 무작위로 다시 배치하면 공식 이력이 없는 기존 대진만 대체됩니다. 계속할까요?`)) return;
   const ids = groupTeams.map((t) => t.id);
   for (let i = ids.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -2304,8 +2454,17 @@ function buildRoundRobinControls(g, groupTeams) {
   const btn = document.createElement("button");
   btn.className = "btn";
   btn.textContent = groupHasPrelimMatches(g.id) ? "라운드로빈 대진 다시 생성" : "라운드로빈 대진 생성";
+  const ready = prelimHistoryIsReady();
+  const groupHistory = ready ? officialPrelimHistoryForMutation("generate_group_round_robin", g.id) : [];
+  const blocked = !ready || groupHistory.length > 0;
+  btn.disabled = blocked;
+  btn.setAttribute("aria-disabled", String(blocked));
+  btn.title = !ready
+    ? prelimHistoryReadinessGuidance()
+    : groupHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : "공식 이력이 없는 경우 라운드로빈 대진을 생성합니다.";
   btn.addEventListener("click", async () => {
-    if (!confirmIfResultsWillReset(g.id, g.name, `'${g.name}' 예선 대진을 (재)생성할까요? 기존 결과는 초기화됩니다.`)) return;
+    if (blockPrelimMutationWithHistory("generate_group_round_robin", g.id)) return;
+    if (!confirmIfResultsWillReset(g.id, g.name, `'${g.name}' 예선 대진을 (재)생성할까요? 공식 이력이 없는 기존 대진만 대체됩니다.`)) return;
     try {
       await mutatePrelimStructureAndRefresh("generate_group_round_robin", {
         groupId: g.id,
@@ -2329,6 +2488,9 @@ function buildRingControls(g, groupTeams) {
   const poolTeams = groupTeams.filter((t) => !ringOrder.includes(t.id));
   const filled = ringOrder.length > 0 && ringOrder.every((id) => id);
   const placedCount = ringOrder.filter(Boolean).length;
+  const ready = prelimHistoryIsReady();
+  const groupHistory = ready ? officialPrelimHistoryForMutation("generate_group_ring", g.id) : [];
+  const blocked = !ready || groupHistory.length > 0;
 
   // 안내 + 무작위 배치
   const toolbar = document.createElement("div");
@@ -2338,12 +2500,17 @@ function buildRingControls(g, groupTeams) {
   const hint = document.createElement("span");
   hint.className = "empty-hint";
   hint.style.padding = "0";
-  hint.textContent = filled
-    ? "대진이 확정되었습니다. 다시 배치하면 결과가 초기화됩니다."
+  hint.textContent = blocked
+    ? !ready ? prelimHistoryReadinessGuidance() : prelimMutationGuidance(groupHistory)
+    : filled
+    ? "대진이 확정되었습니다. 공식 이력이 없는 경우 다시 배치하면 기존 대진이 초기화됩니다."
     : `팀을 도형의 꼭짓점으로 드래그하거나, 팀을 클릭한 뒤 꼭짓점을 클릭하세요 (${placedCount}/${ringOrder.length} 배치됨)`;
   const shuffleBtn = document.createElement("button");
   shuffleBtn.className = "btn small ghost";
   shuffleBtn.textContent = "무작위 배치";
+  shuffleBtn.disabled = blocked;
+  shuffleBtn.setAttribute("aria-disabled", String(blocked));
+  if (blocked) shuffleBtn.title = PRELIM_HISTORY_DISABLED_TITLE;
   shuffleBtn.addEventListener("click", () => handleRingShuffle(g, groupTeams));
   toolbar.appendChild(hint);
   toolbar.appendChild(shuffleBtn);
@@ -2352,12 +2519,14 @@ function buildRingControls(g, groupTeams) {
   // 배치 대기 팀(풀)
   const pool = document.createElement("div");
   pool.className = "row team-pool";
-  pool.addEventListener("dragover", (e) => e.preventDefault());
-  pool.addEventListener("drop", (e) => {
-    e.preventDefault();
-    const data = safeParseJson(e.dataTransfer.getData("text/plain"));
-    if (data) handleRingPoolDrop(g, ringOrder, data);
-  });
+  if (!blocked) {
+    pool.addEventListener("dragover", (e) => e.preventDefault());
+    pool.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const data = safeParseJson(e.dataTransfer.getData("text/plain"));
+      if (data) handleRingPoolDrop(g, ringOrder, data);
+    });
+  }
   if (!poolTeams.length) {
     const span = document.createElement("span");
     span.className = "empty-hint";
@@ -2370,11 +2539,13 @@ function buildRingControls(g, groupTeams) {
       const isSelected = ringSelection && ringSelection.type === "pool" && ringSelection.groupId === g.id && ringSelection.teamId === t.id;
       chip.className = "team-pill ring-chip" + (isSelected ? " selected" : "");
       chip.textContent = t.name;
-      chip.draggable = true;
-      chip.addEventListener("dragstart", (e) => {
-        e.dataTransfer.setData("text/plain", JSON.stringify({ type: "pool", teamId: t.id }));
-      });
-      chip.addEventListener("click", () => handlePoolChipClick(g, ringOrder, t.id));
+      chip.draggable = !blocked;
+      if (!blocked) {
+        chip.addEventListener("dragstart", (e) => {
+          e.dataTransfer.setData("text/plain", JSON.stringify({ type: "pool", teamId: t.id }));
+        });
+        chip.addEventListener("click", () => handlePoolChipClick(g, ringOrder, t.id));
+      }
       pool.appendChild(chip);
     });
   }
@@ -2388,7 +2559,7 @@ function buildRingControls(g, groupTeams) {
   renderRingDiagram(diagramHost, {
     ringOrder,
     teamNameById: (id) => teamName(id),
-    editable: true,
+    editable: !blocked,
     selectedVertexIndex,
     onVertexDrop: (data, targetIndex) => handleRingVertexDrop(g, ringOrder, data, targetIndex),
     onVertexClick: (index) => handleVertexClick(g, ringOrder, index),
@@ -2442,6 +2613,9 @@ function renderPrelimSetupGroups() {
   groups.forEach((g) => {
     const groupTeams = teams.filter((t) => t.groupId === g.id);
     const mode = g.matchMode || "ring";
+    const ready = prelimHistoryIsReady();
+    const groupHistory = ready ? officialPrelimHistoryForMutation("clear_group_prelim", g.id) : [];
+    const groupBlocked = !ready || groupHistory.length > 0;
 
     const box = document.createElement("div");
     box.className = "settings-box";
@@ -2470,12 +2644,28 @@ function renderPrelimSetupGroups() {
     const resetGroupBtn = document.createElement("button");
     resetGroupBtn.type = "button";
     resetGroupBtn.className = "btn danger small";
-    resetGroupBtn.title = `${g.name}의 예선 대진과 결과, 도형(링크제) 배치를 모두 삭제합니다`;
+    resetGroupBtn.title = !ready
+      ? prelimHistoryReadinessGuidance()
+      : groupHistory.length
+        ? PRELIM_HISTORY_DISABLED_TITLE
+        : `${g.name}의 공식 이력이 없는 예선 대진과 도형(링크제) 배치를 삭제합니다`;
     resetGroupBtn.textContent = "초기화";
+    resetGroupBtn.disabled = groupBlocked;
+    resetGroupBtn.setAttribute("aria-disabled", String(groupBlocked));
     resetGroupBtn.addEventListener("click", () => handleResetGroupPrelim(g));
     headRight.appendChild(resetGroupBtn);
     head.appendChild(headRight);
     box.appendChild(head);
+
+    if (groupBlocked) {
+      const guardHint = document.createElement("div");
+      guardHint.className = "empty-hint";
+      guardHint.style.padding = "0 0 10px";
+      guardHint.textContent = !ready
+        ? prelimHistoryReadinessGuidance()
+        : prelimMutationGuidance(groupHistory);
+      box.appendChild(guardHint);
+    }
 
     if (groupTeams.length < 2) {
       const hint = document.createElement("div");
@@ -3414,6 +3604,10 @@ function showToast(msg, duration = 2200) {
 /** Firestore 등 비동기 작업 실패 시 화면에 원인을 보이게 표시 (콘솔에도 상세 로그) */
 function reportError(action, err) {
   console.error(`[${action} 실패]`, err);
+  if (/preliminary match has official history/i.test(String(err?.message || ""))) {
+    showToast(`${action}을(를) 중단했습니다. ${PRELIM_HISTORY_GUIDANCE}`, 7000);
+    return;
+  }
   const code = err && err.code ? ` (${err.code})` : "";
   showToast(`${action} 실패${code}: ${err && err.message ? err.message : err}`, 5000);
 }

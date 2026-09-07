@@ -229,6 +229,162 @@ check('v3 backup accepts empty business document lists',
   emptyV3Backup.groups.length === 0 && emptyV3Backup.teams.length === 0 &&
   emptyV3Backup.prelimMatches.length === 0 && emptyV3Backup.finalMatches.men.length === 0 &&
   emptyV3Backup.finalMatches.women.length === 0 && emptyV3Backup.auditEvents.length === 0);
+const domainBackup = {
+  ...emptyV3Backup,
+  groups: [
+    { id: 'g-men', data: { name: '남자 A조', division: 'men', ringOrder: ['t-men'] } },
+    { id: 'g-women', data: { name: '여자 A조', division: 'women', ringOrder: [] } },
+  ],
+  teams: [
+    { id: 't-men', data: { name: '남자 팀', division: 'men', groupId: 'g-men' } },
+    { id: 't-women', data: { name: '여자 팀', division: 'women', groupId: 'g-women' } },
+  ],
+  prelimMatches: [{
+    id: 'p-men',
+    data: { groupId: 'g-men', division: 'men', teamA: 't-men', teamB: 't-men-2' },
+  }],
+};
+const domainValidBackup = {
+  ...domainBackup,
+  teams: [
+    ...domainBackup.teams,
+    { id: 't-men-2', data: { name: '남자 팀 2', division: 'men', groupId: 'g-men' } },
+  ],
+  groups: [{
+    ...domainBackup.groups[0],
+    data: { ...domainBackup.groups[0].data, ringOrder: ['t-men', 't-men-2'] },
+  }, domainBackup.groups[1]],
+};
+check('v3 backup accepts consistent group/team/preliminary references',
+  normalizeBackupData(domainValidBackup).prelimMatches[0].data.teamB === 't-men-2');
+let missingDomainReferenceRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    teams: domainValidBackup.teams.map((item) => item.id === 't-men' ? {
+      ...item, data: { ...item.data, groupId: 'missing-group' },
+    } : item),
+  });
+} catch {
+  missingDomainReferenceRejected = true;
+}
+check('v3 backup rejects a team that references a missing group', missingDomainReferenceRejected);
+let missingPrelimTeamRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    prelimMatches: [{
+      id: 'p-men',
+      data: { groupId: 'g-men', division: 'men', teamA: 'missing-team', teamB: 't-men-2' },
+    }],
+  });
+} catch {
+  missingPrelimTeamRejected = true;
+}
+check('v3 backup rejects a preliminary match that references a missing team', missingPrelimTeamRejected);
+let crossGroupTeamRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    prelimMatches: [{
+      id: 'p-men',
+      data: { groupId: 'g-men', division: 'men', teamA: 't-men', teamB: 't-women' },
+    }],
+  });
+} catch {
+  crossGroupTeamRejected = true;
+}
+check('v3 backup rejects a preliminary team from another group', crossGroupTeamRejected);
+let crossDivisionTeamRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    teams: domainValidBackup.teams.map((item) => item.id === 't-men-2' ? {
+      ...item, data: { ...item.data, division: 'women' },
+    } : item),
+  });
+} catch {
+  crossDivisionTeamRejected = true;
+}
+check('v3 backup rejects a team whose division disagrees with its group', crossDivisionTeamRejected);
+let samePrelimTeamRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    prelimMatches: [{
+      id: 'p-men',
+      data: { groupId: 'g-men', division: 'men', teamA: 't-men', teamB: 't-men' },
+    }],
+  });
+} catch {
+  samePrelimTeamRejected = true;
+}
+check('v3 backup rejects a preliminary match that references one team twice', samePrelimTeamRejected);
+const unresolvedFinalBackup = normalizeBackupData({
+  ...domainValidBackup,
+  finalMatches: {
+    men: [{
+      id: 'm_r1_0',
+      data: {
+        round: 1, index: 0, status: 'empty',
+        teamA: null, teamB: null, teamASource: null, teamBSource: null,
+        nextMatchId: 'm_r2_0', nextSlot: 'A',
+      },
+    }, {
+      id: 'm_r2_0',
+      data: {
+        round: 2, index: 0, status: 'waiting',
+        teamA: null, teamB: null, teamASource: null, teamBSource: null,
+        nextMatchId: null, nextSlot: null,
+      },
+    }],
+    women: [{
+      id: 'w_r1_0',
+      data: {
+        round: 1, index: 0, status: 'bye',
+        teamA: { id: 't-women', name: '여자 팀' }, teamB: null,
+        teamASource: { type: 'fixedTeam' }, teamBSource: null,
+        nextMatchId: null, nextSlot: null,
+      },
+    }],
+  },
+});
+check('v3 backup preserves unresolved final slots and confirmed byes',
+  unresolvedFinalBackup.finalMatches.men[0].data.teamA === null
+    && unresolvedFinalBackup.finalMatches.men[1].data.status === 'waiting'
+    && unresolvedFinalBackup.finalMatches.women[0].data.status === 'bye');
+let missingFinalTeamRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    finalMatches: {
+      men: [{
+        id: 'missing-final-team',
+        data: { teamA: { id: 'missing-team' }, teamB: null, status: 'waiting' },
+      }],
+      women: [],
+    },
+  });
+} catch {
+  missingFinalTeamRejected = true;
+}
+check('v3 backup rejects a final entrant that references a missing team', missingFinalTeamRejected);
+let crossDivisionFinalTeamRejected = false;
+try {
+  normalizeBackupData({
+    ...domainValidBackup,
+    finalMatches: {
+      men: [{
+        id: 'cross-division-final-team',
+        data: { teamA: { id: 't-women' }, teamB: null, status: 'waiting' },
+      }],
+      women: [],
+    },
+  });
+} catch {
+  crossDivisionFinalTeamRejected = true;
+}
+check('v3 backup rejects a final entrant from another division', crossDivisionFinalTeamRejected);
 const legacyFinalAssignmentBackup = normalizeBackupData({
   ...emptyV3Backup,
   courtAssignments: [{
@@ -261,7 +417,7 @@ const serverExportBackup = backupFromServerExport({
   tournamentId: 'main',
   rootData: protectedRoot,
   chunks: [{ documents: [
-    { path: 'tournaments/main/groups/g1', data: { name: 'A조' } },
+    { path: 'tournaments/main/groups/g1', data: { name: 'A조', division: 'women' } },
     { path: 'tournaments/main/divisions/women/finalMatches/f1', data: { round: 1 } },
   ] }],
 });

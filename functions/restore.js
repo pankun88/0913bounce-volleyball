@@ -137,7 +137,106 @@ function validatePayload(data) {
   return { manifestId, rootData: normalizedRoot, chunks: normalized, paths: [...paths] };
 }
 function graphError(message) { throw new HttpsError('invalid-argument', `Invalid restore graph: ${message}`); }
+function validateDomainGraph(documents) {
+  const docs = new Map(documents.map((item) => [item.path, item.data]));
+  const collectionDocs = (collection) => [...docs]
+    .filter(([path]) => path.startsWith(`${pathPrefix}${collection}/`))
+    .map(([path, data]) => [path.split('/').at(-1), data]);
+  const groups = new Map(collectionDocs('groups'));
+  const teams = new Map(collectionDocs('teams'));
+  const divisions = new Set(['men', 'women']);
+  const divisionOf = (value, label) => {
+    if (!divisions.has(value)) graphError(`${label} has a missing or invalid division`);
+    return value;
+  };
+
+  for (const [groupId, group] of groups) {
+    const groupDivision = divisionOf(group.division, `Group ${groupId}`);
+    if (group.ringOrder !== undefined) {
+      if (!Array.isArray(group.ringOrder)) graphError(`Group ${groupId} ringOrder is invalid`);
+      const seen = new Set();
+      for (const teamId of group.ringOrder) {
+        if (teamId === null) continue;
+        if (typeof teamId !== 'string' || !teamId || seen.has(teamId)) graphError(`Group ${groupId} ringOrder references an invalid team`);
+        seen.add(teamId);
+        const team = teams.get(teamId);
+        if (!team || team.groupId !== groupId) graphError(`Group ${groupId} references a missing or foreign team ${teamId}`);
+        const teamDivision = divisionOf(team.division, `Team ${teamId}`);
+        if (groupDivision !== teamDivision) {
+          graphError(`Group ${groupId} and team ${teamId} have different divisions`);
+        }
+      }
+    }
+  }
+
+  for (const [teamId, team] of teams) {
+    const teamDivision = divisionOf(team.division, `Team ${teamId}`);
+    if (team.groupId === undefined || team.groupId === null) continue;
+    if (typeof team.groupId !== 'string' || !team.groupId) graphError(`Team ${teamId} has an invalid groupId`);
+    const group = groups.get(team.groupId);
+    if (!group) graphError(`Team ${teamId} references missing group ${team.groupId}`);
+    const groupDivision = divisionOf(group.division, `Group ${team.groupId}`);
+    if (groupDivision !== teamDivision) {
+      graphError(`Team ${teamId} and group ${team.groupId} have different divisions`);
+    }
+  }
+
+  for (const [matchId, match] of collectionDocs('prelimMatches')) {
+    if (typeof match.groupId !== 'string' || !match.groupId || !groups.has(match.groupId)) {
+      graphError(`Preliminary match ${matchId} references missing group ${match.groupId || '(empty)'}`);
+    }
+    const group = groups.get(match.groupId);
+    const groupDivision = divisionOf(group.division, `Group ${match.groupId}`);
+    const matchDivision = divisionOf(match.division, `Preliminary match ${matchId}`);
+    if (groupDivision !== matchDivision) {
+      graphError(`Preliminary match ${matchId} and group ${match.groupId} have different divisions`);
+    }
+    const referencedTeams = [];
+    if (match.teamA === match.teamB) graphError(`Preliminary match ${matchId} references the same team twice`);
+    for (const [side, teamId] of [['A', match.teamA], ['B', match.teamB]]) {
+      if (typeof teamId !== 'string' || !teamId) graphError(`Preliminary match ${matchId} has an invalid team${side}`);
+      const team = teams.get(teamId);
+      if (!team) graphError(`Preliminary match ${matchId} references missing team ${teamId}`);
+      if (team.groupId !== match.groupId) {
+        graphError(`Preliminary match ${matchId} references team ${teamId} outside group ${match.groupId}`);
+      }
+      const teamDivision = divisionOf(team.division, `Team ${teamId}`);
+      if (groupDivision !== teamDivision) {
+        graphError(`Preliminary match ${matchId} and team ${teamId} have different divisions`);
+      }
+      if (matchDivision !== teamDivision) {
+        graphError(`Preliminary match ${matchId} and team ${teamId} have different divisions`);
+      }
+      referencedTeams.push(team);
+    }
+    const teamDivisions = referencedTeams.map((team) => team.division);
+    if (new Set(teamDivisions).size > 1) {
+      graphError(`Preliminary match ${matchId} references teams from different divisions`);
+    }
+  }
+
+  const validateFinalEntrant = (entrant, division, label) => {
+    if (entrant === undefined || entrant === null) return;
+    if (!plainObject(entrant) || typeof entrant.id !== 'string' || !entrant.id) {
+      graphError(`${label} has an invalid team reference`);
+    }
+    const team = teams.get(entrant.id);
+    if (!team) graphError(`${label} references missing team ${entrant.id}`);
+    if (divisionOf(team.division, `Team ${entrant.id}`) !== division) {
+      graphError(`${label} references team ${entrant.id} from another division`);
+    }
+  };
+  for (const division of ['men', 'women']) {
+    for (const [matchId, match] of collectionDocs(`divisions/${division}/finalMatches`)) {
+      validateFinalEntrant(match.teamA, division, `Final match ${matchId} teamA`);
+      validateFinalEntrant(match.teamB, division, `Final match ${matchId} teamB`);
+      validateFinalEntrant(match.winnerTeam, division, `Final match ${matchId} winnerTeam`);
+      validateFinalEntrant(match.byeCandidate?.team, division, `Final match ${matchId} byeCandidate`);
+    }
+  }
+}
 function validateGraph(documents) {
+  validateDomainGraph(documents);
   const docs = new Map(documents.map((item) => [item.path, item.data]));
   const get = (collection, id) => docs.get(`${pathPrefix}${collection}/${id}`);
   const assignments = documents.filter((item) => item.path.startsWith(`${pathPrefix}courtAssignments/`));
@@ -205,6 +304,60 @@ async function assertLease(manifestId) {
   const tournament = await root().get();
   const maintenance = tournament.data()?.maintenance || {};
   if (maintenance.enabled !== true || maintenance.reset || maintenance.restoreManifestId !== manifestId) throw new HttpsError('failed-precondition', 'Current restore maintenance lease required.');
+}
+async function readRestoreTarget(metaData, chunkSnapshots, { includeUnexpected = false } = {}) {
+  const expectedChunks = metaData.chunks;
+  if (!Array.isArray(expectedChunks) || expectedChunks.length !== chunkSnapshots.length) {
+    throw new HttpsError('failed-precondition', 'Restore chunk metadata is incomplete.');
+  }
+  const expectedChunkByIndex = new Map();
+  expectedChunks.forEach((chunk) => {
+    if (!plainObject(chunk) || !Number.isInteger(chunk.index) || chunk.index < 0
+        || !Number.isInteger(chunk.count) || chunk.count < 0
+        || typeof chunk.checksum !== 'string' || expectedChunkByIndex.has(chunk.index)) {
+      throw new HttpsError('failed-precondition', 'Restore chunk metadata is malformed.');
+    }
+    expectedChunkByIndex.set(chunk.index, chunk);
+  });
+  const expected = new Map();
+  for (const chunkSnapshot of chunkSnapshots) {
+    const chunk = chunkSnapshot.data();
+    const metadata = expectedChunkByIndex.get(chunk?.index);
+    if (!plainObject(chunk) || !metadata || !chunk.appliedAt || metadata.checksum !== chunk.checksum
+        || !Array.isArray(chunk.documents) || metadata.count !== chunk.documents.length) {
+      throw new HttpsError('failed-precondition', 'Restore chunk checksum mismatch.');
+    }
+    for (const item of chunk.documents) {
+      if (!plainObject(item) || typeof item.path !== 'string' || !allowedPath.test(item.path)
+          || typeof item.checksum !== 'string' || expected.has(item.path)) {
+        throw new HttpsError('failed-precondition', 'Restore target path metadata is malformed.');
+      }
+      expected.set(item.path, item.checksum);
+    }
+  }
+  if (expectedChunkByIndex.size !== chunkSnapshots.length) {
+    throw new HttpsError('failed-precondition', 'Restore chunk metadata is incomplete.');
+  }
+  const actual = new Map();
+  for (const collectionPath of COLLECTIONS) {
+    const snapshot = await root().collection(collectionPath).get();
+    snapshot.docs.forEach((snap) => {
+      if (includeUnexpected || expected.has(snap.ref.path)) actual.set(snap.ref.path, snap.data());
+    });
+  }
+  if ((includeUnexpected && actual.size !== expected.size) || actual.size < expected.size
+      || [...expected].some(([path, expectedChecksum]) =>
+        !actual.has(path) || checksum(portableFirestoreValue(actual.get(path))) !== expectedChecksum
+      )) {
+    throw new HttpsError('failed-precondition', 'Restore target path or checksum mismatch.');
+  }
+  try {
+    validateGraph([...actual].map(([path, data]) => ({ path, data })));
+  } catch (error) {
+    if (error instanceof HttpsError) throw new HttpsError('failed-precondition', error.message);
+    throw error;
+  }
+  return { expected, actual };
 }
 
 export async function beginRestore(request) {
@@ -331,8 +484,9 @@ export async function pruneRestore(request) {
   if (['verified', 'promoted'].includes(meta.data().status)) return { manifestId: manifest.id, pruned: true };
   await assertLease(manifest.id);
   const chunks = await manifest.collection('chunks').get();
-  if (meta.data().chunks.length !== chunks.docs.length || chunks.docs.some((snap) => !snap.data().appliedAt)) throw new HttpsError('failed-precondition', 'All chunks must be applied.');
-  if (meta.data().prunedAt) return { manifestId: manifest.id, pruned: true };
+  const metaData = meta.data();
+  if (metaData.prunedAt) return { manifestId: manifest.id, pruned: true };
+  await readRestoreTarget(metaData, chunks.docs);
   const desired = new Set(chunks.docs.flatMap((snap) => (
     snap.data().documents || []
   ).map((item) => item.path)));
@@ -373,30 +527,7 @@ export async function verifyRestore(request) {
   await assertLease(manifest.id);
   if (!meta.data().prunedAt) throw new HttpsError('failed-precondition', 'Restore must be pruned first.');
   const chunks = await manifest.collection('chunks').get();
-  if (
-    meta.data().chunks.length !== chunks.docs.length
-    || chunks.docs.some((snap) => {
-      const expected = meta.data().chunks.find((chunk) => chunk.index === snap.data().index);
-      return !expected || !snap.data().appliedAt || expected.checksum !== snap.data().checksum;
-    })
-    || meta.data().chunks.some((expected) => !chunks.docs.some((snap) => snap.data().index === expected.index))
-  ) throw new HttpsError('failed-precondition', 'Restore chunk checksum mismatch.');
-  const documents = chunks.docs.flatMap((snap) => snap.data().documents || []);
-  const expected = new Map(documents.map((item) => [item.path, item.checksum]));
-  const actual = new Map();
-  for (const collectionPath of COLLECTIONS) {
-    const snapshot = await root().collection(collectionPath).get();
-    snapshot.docs.forEach((snap) => actual.set(snap.ref.path, snap.data()));
-  }
-  if (actual.size !== expected.size || [...expected].some(([path, expectedChecksum]) =>
-    !actual.has(path) || checksum(portableFirestoreValue(actual.get(path))) !== expectedChecksum
-  )) throw new HttpsError('failed-precondition', 'Restore path or checksum mismatch.');
-  try {
-    validateGraph([...actual].map(([path, data]) => ({ path, data })));
-  } catch (error) {
-    if (error instanceof HttpsError) throw new HttpsError('failed-precondition', error.message);
-    throw error;
-  }
+  const { actual } = await readRestoreTarget(meta.data(), chunks.docs, { includeUnexpected: true });
   const rootSnapshot = (await root().get()).data() || {};
   const actualRoot = Object.fromEntries([...ROOT_FIELDS]
     .filter((field) => Object.hasOwn(meta.data().rootData, field))

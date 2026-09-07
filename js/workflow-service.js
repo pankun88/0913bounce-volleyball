@@ -1,4 +1,4 @@
-import { doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { doc, getDocFromServer, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
 import { auth, db, functions } from "./firebase-init.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
@@ -52,9 +52,19 @@ export function recorderReason(error) {
   const reason = error?.details?.reason || error?.details?.code || error?.message?.match(/\b(unresolved_teams|stale_queue|ownership_lost|lease_expired|submitted|maintenance|recorder_access_required|recorder_name_changed|operation_mismatch)\b/)?.[1];
   return reasonMessages[reason] || error?.message || "처리 중 오류가 발생했습니다.";
 }
-export function subscribeCourt(courtId, callback, onError) { return onSnapshot(base("courts", courtId), (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null), onError); }
-export function subscribeAssignment(matchKey, callback, onError) { return onSnapshot(base("courtAssignments", matchKey), (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null), onError); }
-export function subscribeWorkflow(matchKey, callback, onError) { return onSnapshot(base("scoreWorkflows", matchKey), (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null), onError); }
+export function subscribeCourt(courtId, callback, onError) {
+  return onSnapshot(base("courts", courtId), { includeMetadataChanges: true }, (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null, s.metadata), onError);
+}
+export function subscribeAssignment(matchKey, callback, onError) {
+  return onSnapshot(base("courtAssignments", matchKey), { includeMetadataChanges: true }, (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null, s.metadata), onError);
+}
+export function subscribeWorkflow(matchKey, callback, onError) {
+  return onSnapshot(base("scoreWorkflows", matchKey), { includeMetadataChanges: true }, (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null, s.metadata), onError);
+}
+export async function fetchRecorderWorkflow(matchKey) {
+  const snapshot = await getDocFromServer(base("scoreWorkflows", matchKey));
+  return snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null;
+}
 export function canResumeCurrentMatch(workflow, recorderName) {
   return Boolean(workflow?.draftState === "editing" && workflow?.lock?.uid === auth.currentUser?.uid
     && workflow.lock.recorderName === recorderName?.trim());

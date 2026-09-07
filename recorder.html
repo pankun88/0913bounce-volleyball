@@ -11,6 +11,9 @@
     <header class="app-header"><div><p class="eyebrow">BOUNCE VOLLEYBALL</p><h1>기록관 입력</h1><p>경기 확인을 위해 계정 식별정보와 제출 이력을 관리자 감사 기록에 보관합니다. 공용 코드는 저장하지 않습니다.</p></div><button id="logoutButton" class="quiet-button" type="button" hidden>로그아웃</button></header>
     <p id="connectionStatus" class="connection-status" role="status" aria-live="polite"></p>
     <p id="actionStatus" class="action-status" role="status" aria-live="polite" hidden></p>
+    <p id="storageStatus" class="error" role="alert" hidden></p>
+    <aside id="dataStatus" class="notice rejection" role="alert" hidden></aside>
+    <button id="retryDataButton" class="secondary-button" type="button" hidden>대회 데이터 다시 불러오기</button>
     <section id="authPanel" class="panel" aria-labelledby="authTitle">
       <h2 id="authTitle" tabindex="-1">1. 기록관 접근</h2><p id="authMessage" role="status" aria-live="polite">Google 로그인 후 대회 공용 코드를 입력하세요.</p>
       <ol class="onboarding-steps"><li>개인 Google 계정으로 로그인</li><li>운영진에게 받은 대회 공용 코드 입력</li><li>내 이름과 담당 코트 선택</li><li>현재 경기 점수 입력·확인·제출</li></ol>
@@ -20,6 +23,7 @@
     <section id="courtPanel" class="panel" hidden aria-labelledby="courtTitle"><h2 id="courtTitle" tabindex="-1">2. 담당 코트 선택</h2><label for="courtSelect">내 이름과 담당 코트</label><select id="courtSelect"><option value="">이름과 코트를 선택하세요</option></select><p id="courtMessage" role="status"></p></section>
     <section id="workflowPanel" class="panel" hidden aria-labelledby="workflowTitle">
       <h2 id="workflowTitle" tabindex="-1">3. 점수 입력</h2><div id="matchSummary" class="match-summary"></div><aside id="rejectionNotice" class="notice rejection" hidden></aside><aside id="lockNotice" class="notice" hidden></aside>
+      <aside id="saveRecoveryNotice" class="notice rejection" hidden><h3 id="saveRecoveryTitle" tabindex="-1">저장 상태를 확인하세요</h3><p id="saveRecoveryMessage"></p><div class="actions"><button id="retrySaveButton" class="secondary-button" type="button" hidden>같은 초안 다시 저장</button><button id="keepLocalButton" class="secondary-button" type="button" hidden>로컬 초안 유지 후 다시 저장</button><button id="useServerButton" class="danger-button" type="button" hidden>서버 초안 사용</button></div></aside>
       <button id="claimButton" class="primary-button" type="button" hidden>경기 입력 시작</button>
       <form id="scoreForm" hidden novalidate><fieldset id="scoreFields"><legend id="scoreLegend">세트 점수</legend></fieldset><p id="scoreError" class="error" role="alert"></p><div class="actions"><button id="saveButton" class="secondary-button" type="submit">임시 저장</button><button id="reviewButton" class="primary-button" type="button">작성 완료 확인</button><button id="endButton" class="quiet-button" type="button">입력 종료(초안 유지)</button><button id="discardButton" class="danger-button" type="button">초안 폐기</button></div></form>
       <section id="discardPanel" class="notice" hidden aria-labelledby="discardTitle"><h3 id="discardTitle" tabindex="-1">초안을 폐기할까요?</h3><p id="discardMessage"></p><div class="actions"><button id="keepDraftButton" class="secondary-button" type="button">계속 입력</button><button id="confirmDiscardButton" class="danger-button" type="button">초안 폐기</button></div></section>

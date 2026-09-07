@@ -11,6 +11,14 @@ import {
   reconcilePlannerAssignments,
   selectQueueView,
 } from './score-workflow.js';
+import {
+  parseStoredRecorderDraft,
+  readStoredRecorderDraft,
+  recorderDataState,
+  reconcileRecorderSnapshot,
+  recorderDraftsEqual,
+  resolveRecorderConflict,
+} from './recorder-state.js';
 
 const assignments = () => ({
   M1: { publicStatus: 'under_review', courtOrder: 1, nextCourtMatchKey: 'M2' },
@@ -29,6 +37,71 @@ const queue = (changes = {}) => ({
   queueRevision: 7, currentMatchKey: 'M2', nextMatchKey: 'M3', normalCursorMatchKey: 'M2',
   priorityEntries: [], nextPrioritySequence: 0, ...changes,
 });
+
+// Recorder save recovery: a lost response is confirmed only by a newer matching
+// authoritative snapshot, while a different server draft never replaces local work.
+{
+  const attempted = { sets: [{ a: 10, b: 8 }] };
+  const confirmed = reconcileRecorderSnapshot({
+    pendingSave: { draft: attempted, expectedRevision: 2 },
+    remoteDraft: { sets: [{ a: '10', b: '8' }] },
+    remoteRevision: 3,
+  });
+  assert.equal(confirmed.status, 'confirmed');
+  assert.equal(confirmed.revision, 3);
+  assert.equal(recorderDraftsEqual(confirmed.draft, attempted), true);
+
+  const conflict = reconcileRecorderSnapshot({
+    pendingSave: { draft: attempted, expectedRevision: 2 },
+    remoteDraft: { sets: [{ a: 9, b: 8 }] },
+    remoteRevision: 3,
+  });
+  assert.equal(conflict.status, 'conflict');
+  assert.deepEqual(conflict.localDraft, attempted);
+  assert.deepEqual(conflict.remoteDraft, { sets: [{ a: 9, b: 8 }] });
+  assert.deepEqual(resolveRecorderConflict('local', conflict), {
+    status: 'retry', draft: attempted, expectedRevision: 3,
+  });
+  assert.deepEqual(resolveRecorderConflict('remote', conflict), {
+    status: 'use_remote', draft: { sets: [{ a: 9, b: 8 }] }, revision: 3,
+  });
+}
+
+// The server snapshot may arrive while the local form is already dirty,
+// before the save request is created. A stale-revision response must still
+// reconcile against that same newer snapshot rather than retrying revision 2.
+{
+  const local = { sets: [{ a: 10, b: 8 }] };
+  const serverSeenBeforeSave = { sets: [{ a: 9, b: 8 }] };
+  const recovery = reconcileRecorderSnapshot({
+    pendingSave: { draft: local, expectedRevision: 2 },
+    remoteDraft: serverSeenBeforeSave,
+    remoteRevision: 4,
+  });
+  assert.equal(recovery.status, 'conflict');
+  assert.equal(resolveRecorderConflict('local', recovery).expectedRevision, 4);
+}
+
+// Blocked and malformed local storage must fail closed without throwing.
+{
+  const malformed = parseStoredRecorderDraft('{not-json');
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.reason, 'malformed');
+  const blocked = readStoredRecorderDraft({
+    getItem() { throw new Error('storage disabled'); },
+  }, 'recorder-score:test');
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reason, 'blocked');
+}
+
+// A failed listener remains unsafe until a non-cache authoritative snapshot
+// recovers it; the recovery clears the stale error.
+{
+  const failed = recorderDataState({ status: 'ready', error: null }, 'error', { code: 'permission-denied' });
+  assert.equal(failed.status, 'error');
+  const recovered = recorderDataState(failed, 'ready');
+  assert.deepEqual(recovered, { status: 'ready', error: null });
+}
 
 // 코트 초안을 먼저 편집한 뒤 다른 조·여자부 대진을 생성해도 새 경기가 합쳐져야 한다.
 {

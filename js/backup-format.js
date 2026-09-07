@@ -33,8 +33,8 @@ function safeBackupValue(value) {
     .map(([key, item]) => [key, safeBackupValue(item)]));
 }
 
-function invalidBackup() {
-  throw new Error("올바른 백업 파일이 아닙니다.");
+function invalidBackup(reason = "") {
+  throw new Error(reason ? `올바른 백업 파일이 아닙니다: ${reason}` : "올바른 백업 파일이 아닙니다.");
 }
 
 export function restorableRootData(info) {
@@ -130,6 +130,14 @@ function legacyTransition(matchKey) {
 function legacyOperationalPair(match, matchType, division) {
   const matchKey = matchType === "final" ? `final:${division}:${match.id}` : match.id;
   const source = { ...match.data };
+  if (matchType === "prelim") {
+    for (const side of ["teamA", "teamB"]) {
+      const entrant = source[side];
+      if (entrant && typeof entrant === "object" && !Array.isArray(entrant) && typeof entrant.id === "string") {
+        source[side] = entrant.id;
+      }
+    }
+  }
   const completed = source.status === "done";
   const officialRevision = completed ? 1 : 0;
   const transitionId = legacyTransition(matchKey);
@@ -290,6 +298,105 @@ function validateQueueBackup(queues, assignments, workflows) {
   });
 }
 
+function validateDomainGraph(data) {
+  const groups = new Map(data.groups.map((item) => [item.id, item.data]));
+  const teams = new Map(data.teams.map((item) => [item.id, item.data]));
+  const divisions = new Set(["men", "women"]);
+  const domainError = (message) => invalidBackup(`Invalid restore graph: ${message}`);
+  const divisionOf = (value, label) => {
+    if (!divisions.has(value)) domainError(`${label} has a missing or invalid division`);
+    return value;
+  };
+
+  groups.forEach((group, groupId) => {
+    const groupDivision = divisionOf(group.division, `group ${groupId}`);
+    if (group.ringOrder !== undefined) {
+      if (!Array.isArray(group.ringOrder)) domainError(`group ${groupId} ringOrder is invalid`);
+      const seen = new Set();
+      group.ringOrder.forEach((teamId) => {
+        if (teamId === null) return;
+        if (typeof teamId !== "string" || !teamId || seen.has(teamId)) {
+          domainError(`group ${groupId} ringOrder references an invalid team`);
+        }
+        seen.add(teamId);
+        const team = teams.get(teamId);
+        if (!team || team.groupId !== groupId) domainError(`group ${groupId} references a missing or foreign team ${teamId}`);
+        const teamDivision = divisionOf(team.division, `team ${teamId}`);
+        if (groupDivision !== teamDivision) {
+          domainError(`group ${groupId} and team ${teamId} have different divisions`);
+        }
+      });
+    }
+  });
+
+  teams.forEach((team, teamId) => {
+    const teamDivision = divisionOf(team.division, `team ${teamId}`);
+    if (team.groupId === undefined || team.groupId === null) return;
+    if (typeof team.groupId !== "string" || !team.groupId) domainError(`team ${teamId} has an invalid groupId`);
+    const group = groups.get(team.groupId);
+    if (!group) domainError(`team ${teamId} references missing group ${team.groupId}`);
+    const groupDivision = divisionOf(group.division, `group ${team.groupId}`);
+    if (groupDivision !== teamDivision) {
+      domainError(`team ${teamId} and group ${team.groupId} have different divisions`);
+    }
+  });
+
+  data.prelimMatches.forEach((item) => {
+    const match = item.data;
+    if (typeof match.groupId !== "string" || !match.groupId || !groups.has(match.groupId)) {
+      domainError(`preliminary match ${item.id} references missing group ${match.groupId || "(empty)"}`);
+    }
+    const group = groups.get(match.groupId);
+    const groupDivision = divisionOf(group.division, `group ${match.groupId}`);
+    const matchDivision = divisionOf(match.division, `preliminary match ${item.id}`);
+    if (groupDivision !== matchDivision) {
+      domainError(`preliminary match ${item.id} and group ${match.groupId} have different divisions`);
+    }
+    const teamIds = [match.teamA, match.teamB];
+    if (teamIds[0] === teamIds[1]) domainError(`preliminary match ${item.id} references the same team twice`);
+    const referencedTeams = teamIds.map((teamId) => {
+      if (typeof teamId !== "string" || !teamId) domainError(`preliminary match ${item.id} has an invalid team reference`);
+      const team = teams.get(teamId);
+      if (!team) domainError(`preliminary match ${item.id} references missing team ${teamId}`);
+      if (team.groupId !== match.groupId) {
+        domainError(`preliminary match ${item.id} references team ${teamId} outside group ${match.groupId}`);
+      }
+      const teamDivision = divisionOf(team.division, `team ${teamId}`);
+      if (groupDivision !== teamDivision) {
+        domainError(`preliminary match ${item.id} and team ${teamId} have different divisions`);
+      }
+      if (matchDivision !== teamDivision) {
+        domainError(`preliminary match ${item.id} and team ${teamId} have different divisions`);
+      }
+      return team;
+    });
+    const teamDivisions = referencedTeams.map((team) => team.division);
+    if (new Set(teamDivisions).size > 1) domainError(`preliminary match ${item.id} references teams from different divisions`);
+  });
+
+  const validateFinalEntrant = (entrant, division, label) => {
+    if (entrant === undefined || entrant === null) return;
+    if (!entrant || typeof entrant !== "object" || Array.isArray(entrant)
+        || typeof entrant.id !== "string" || !entrant.id) {
+      domainError(`${label} has an invalid team reference`);
+    }
+    const team = teams.get(entrant.id);
+    if (!team) domainError(`${label} references missing team ${entrant.id}`);
+    if (divisionOf(team.division, `team ${entrant.id}`) !== division) {
+      domainError(`${label} references team ${entrant.id} from another division`);
+    }
+  };
+  for (const division of ["men", "women"]) {
+    data.finalMatches[division].forEach((item) => {
+      const match = item.data;
+      validateFinalEntrant(match.teamA, division, `final match ${item.id} teamA`);
+      validateFinalEntrant(match.teamB, division, `final match ${item.id} teamB`);
+      validateFinalEntrant(match.winnerTeam, division, `final match ${item.id} winnerTeam`);
+      validateFinalEntrant(match.byeCandidate?.team, division, `final match ${item.id} byeCandidate`);
+    });
+  }
+}
+
 function normalizeV3(data) {
   const allowedFields = [
     "app", "type", "version", "tournamentId", "info",
@@ -319,6 +426,7 @@ function normalizeV3(data) {
     if (assignment.attemptCount == null) assignment.attemptCount = 0;
     if (!Number.isInteger(assignment.attemptCount) || assignment.attemptCount < 0) invalidBackup();
   });
+  validateDomainGraph(data);
   validateQueueBackup(data.courtQueues, data.courtAssignments, data.scoreWorkflows);
   data.info = restorableRootData(data.info);
   return data;
