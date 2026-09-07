@@ -13,7 +13,13 @@ export function reconcilePlannerAssignments(currentAssignments, matchOptions, pe
   ]));
   const merged = currentAssignments.flatMap((assignment) => {
     const option = matchOptions.find((item) => item.matchKey === assignment.matchKey);
-    return option ? [{ ...assignment, ...option, matchKey: option.matchKey }] : [];
+    const saved = persisted.get(assignment.matchKey);
+    return option ? [{
+      ...assignment,
+      ...option,
+      ...(saved && Object.hasOwn(saved, 'publicStatus') ? { publicStatus: saved.publicStatus } : {}),
+      matchKey: option.matchKey,
+    }] : [];
   });
   const mergedKeys = new Set(merged.map((assignment) => assignment.matchKey));
 
@@ -30,6 +36,219 @@ export function reconcilePlannerAssignments(currentAssignments, matchOptions, pe
     mergedKeys.add(option.matchKey);
   });
   return merged;
+}
+
+const PLANNER_PHASES = new Set(['all', 'prelim', 'final']);
+
+function normalizePlannerPhase(phase) {
+  return PLANNER_PHASES.has(phase) ? phase : 'all';
+}
+
+function plannerMatchKey(item) {
+  return item?.matchKey || item?.id || null;
+}
+
+function plannerEntriesByKey(items) {
+  if (items instanceof Map) {
+    return new Map(items);
+  }
+  if (Array.isArray(items)) {
+    return new Map(items
+      .map((item) => [plannerMatchKey(item), item])
+      .filter(([key]) => key));
+  }
+  if (items && typeof items === 'object') {
+    return new Map(Object.entries(items));
+  }
+  return new Map();
+}
+
+export function plannerPhaseMatches(option, phase = 'all') {
+  const normalizedPhase = normalizePlannerPhase(phase);
+  return normalizedPhase === 'all' || option?.matchType === normalizedPhase;
+}
+
+/**
+ * 현재 대진 상태에서 완료 경기로 접어둘 수 있는지 판정한다.
+ * officialRevision만 남은 과거 결과나 잠금·재입력 상태는 완료로 취급하지 않는다.
+ */
+export function isPlannerMatchCompleted(option, assignment, workflow = {}) {
+  if (!assignment || workflow?.lock) return false;
+  if (assignment.publicStatus !== 'completed') return false;
+  return workflow.draftState === 'approved';
+}
+
+/**
+ * 표시 필터와 무관하게 옵션 배열의 순서를 유지한 채 코트별로 묶는다.
+ * 반환된 Map과 배열은 모두 새 컨테이너이며 입력을 정렬하거나 수정하지 않는다.
+ */
+export function groupPlannerAssignments(options = [], assignments = [], phase = 'all') {
+  const assignmentByKey = plannerEntriesByKey(assignments);
+  const groups = new Map();
+  options.forEach((option) => {
+    if (!plannerPhaseMatches(option, phase)) return;
+    const assignment = assignmentByKey.get(plannerMatchKey(option));
+    const courtId = assignment?.courtId || null;
+    if (!groups.has(courtId)) groups.set(courtId, []);
+    groups.get(courtId).push(option);
+  });
+  return groups;
+}
+
+function plannerCanonicalCourtEntries(options, assignments) {
+  const optionByKey = plannerEntriesByKey(options);
+  const assignmentEntries = Array.isArray(assignments)
+    ? assignments
+    : assignments instanceof Map
+    ? [...assignments.entries()].map(([key, assignment]) => (
+      plannerMatchKey(assignment) ? assignment : { ...assignment, matchKey: key }
+    ))
+    : assignments && typeof assignments === 'object'
+    ? Object.entries(assignments).map(([key, assignment]) => (
+      plannerMatchKey(assignment) ? assignment : { ...assignment, matchKey: key }
+    ))
+    : [];
+  const entries = [];
+  const seen = new Set();
+  assignmentEntries.forEach((assignment, index) => {
+    const key = plannerMatchKey(assignment);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    entries.push({
+      key,
+      assignment,
+      option: optionByKey.get(key) || null,
+      sourceIndex: index,
+    });
+  });
+  (Array.isArray(options) ? options : []).forEach((option, index) => {
+    const key = plannerMatchKey(option);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    entries.push({
+      key,
+      assignment: null,
+      option,
+      sourceIndex: assignmentEntries.length + index,
+    });
+  });
+  return entries;
+}
+
+function plannerCourtOrder(entry) {
+  const order = Number(entry?.assignment?.courtOrder);
+  return Number.isFinite(order) ? order : Number.POSITIVE_INFINITY;
+}
+
+function plannerAssignmentOrder(assignment) {
+  const order = Number(assignment?.courtOrder);
+  return Number.isFinite(order) ? order : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * 전체(필터 전) 코트 순서에서 바로 붙은 이웃만 반환한다.
+ * 중간 경기가 완료·숨김 상태면 그 너머의 경기로 건너뛰지 않는다.
+ */
+export function getPlannerVisibleAdjacent(
+  options = [],
+  assignments = [],
+  workflows = new Map(),
+  matchKey,
+  phase = 'all',
+) {
+  const assignmentByKey = plannerEntriesByKey(assignments);
+  const workflowByKey = plannerEntriesByKey(workflows);
+  const entries = plannerCanonicalCourtEntries(options, assignments);
+  const current = entries.find((entry) => entry.key === matchKey);
+  if (!current?.option || !current.assignment || !plannerPhaseMatches(current.option, phase)) {
+    return { previousMatchKey: null, nextMatchKey: null };
+  }
+  const courtId = current.assignment.courtId || null;
+  const siblings = entries
+    .filter((entry) => (entry.assignment?.courtId || null) === courtId)
+    .sort((left, right) => plannerCourtOrder(left) - plannerCourtOrder(right)
+      || left.sourceIndex - right.sourceIndex);
+  const currentIndex = siblings.findIndex((entry) => entry.key === matchKey);
+  if (currentIndex < 0 || isPlannerMatchCompleted(
+    current.option,
+    current.assignment,
+    workflowByKey.get(matchKey) || {},
+  )) {
+    return { previousMatchKey: null, nextMatchKey: null };
+  }
+  const visibleActive = (entry) => Boolean(
+    entry?.option
+      && plannerPhaseMatches(entry.option, phase)
+      && !isPlannerMatchCompleted(
+        entry.option,
+        entry.assignment || assignmentByKey.get(entry.key),
+        workflowByKey.get(entry.key) || {},
+      ),
+  );
+  const previous = siblings[currentIndex - 1];
+  const next = siblings[currentIndex + 1];
+  return {
+    previousMatchKey: visibleActive(previous) ? previous.key : null,
+    nextMatchKey: visibleActive(next) ? next.key : null,
+  };
+}
+
+/**
+ * 경기의 코트만 바꾸거나 beforeMatchKey 앞에 삽입한다.
+ * beforeMatchKey가 없으면 항상 전체 대상 코트의 진짜 끝에 붙여 필터와 무관한
+ * 상대 순서를 보존한다. 입력 배열과 항목은 변경하지 않는다.
+ */
+export function movePlannerAssignment(assignments = [], matchKey, targetCourtId = null, beforeMatchKey = null) {
+  const next = (Array.isArray(assignments) ? assignments : []).map((item) => ({ ...item }));
+  const assignment = next.find((item) => plannerMatchKey(item) === matchKey);
+  if (!assignment) return next;
+  const sourceCourtId = assignment.courtId || null;
+  const destinationCourtId = targetCourtId || null;
+  if (beforeMatchKey === matchKey) return next;
+  const destination = next
+    .filter((item) => item !== assignment && (item.courtId || null) === destinationCourtId)
+    .sort((left, right) => plannerAssignmentOrder(left) - plannerAssignmentOrder(right));
+  const insertionIndex = beforeMatchKey
+    ? destination.findIndex((item) => plannerMatchKey(item) === beforeMatchKey)
+    : -1;
+  destination.splice(insertionIndex < 0 ? destination.length : insertionIndex, 0, assignment);
+  assignment.courtId = destinationCourtId;
+  destination.forEach((item, index) => { item.courtOrder = index + 1; });
+  if (sourceCourtId !== destinationCourtId) {
+    next
+      .filter((item) => (item.courtId || null) === sourceCourtId)
+      .sort((left, right) => plannerAssignmentOrder(left) - plannerAssignmentOrder(right))
+      .forEach((item, index) => { item.courtOrder = index + 1; });
+  }
+  return next;
+}
+
+/**
+ * 표시 가능한 바로 옆 경기와만 순서를 바꾼다. 숨겨진 경기나 완료 경기를
+ * 사이에 두고 건너뛰는 결과는 만들지 않는다.
+ */
+export function movePlannerMatchByOffset(
+  options = [],
+  assignments = [],
+  workflows = new Map(),
+  matchKey,
+  offset,
+  phase = 'all',
+) {
+  if (offset !== -1 && offset !== 1) {
+    return (Array.isArray(assignments) ? assignments : []).map((item) => ({ ...item }));
+  }
+  const adjacent = getPlannerVisibleAdjacent(options, assignments, workflows, matchKey, phase);
+  const targetKey = offset < 0 ? adjacent.previousMatchKey : adjacent.nextMatchKey;
+  if (!targetKey) {
+    return (Array.isArray(assignments) ? assignments : []).map((item) => ({ ...item }));
+  }
+  const next = (Array.isArray(assignments) ? assignments : []).map((item) => ({ ...item }));
+  const current = next.find((item) => plannerMatchKey(item) === matchKey);
+  const target = next.find((item) => plannerMatchKey(item) === targetKey);
+  if (!current || !target) return next;
+  [current.courtOrder, target.courtOrder] = [target.courtOrder, current.courtOrder];
+  return next;
 }
 
 function cloneQueue(queue, changes = {}) {

@@ -101,7 +101,13 @@
     </section>
 
     <div class="card">
-      <h2>통합 경기 배정·순서 <button type="button" class="help-trigger" aria-label="통합 경기 배정 설명" data-help="남자부·여자부 예선·본선 전체 경기 카드를 한 화면에서 코트에 배정하고 실제 진행 순서를 정합니다.">설명</button></h2>
+      <h2>통합 경기 배정·순서 <button type="button" class="help-trigger" aria-label="통합 경기 배정 설명" data-help="남자부·여자부 예선·본선 전체 경기 카드를 한 화면에 코트에 배정하고 실제 진행 순서를 정합니다.">설명</button></h2>
+      <div id="workflowPhaseFilter" class="workflow-phase-filter" role="group" aria-label="통합 경기 부문 필터">
+        <button type="button" class="workflow-phase-filter-btn" data-workflow-phase="all" aria-pressed="true">전체</button>
+        <button type="button" class="workflow-phase-filter-btn" data-workflow-phase="prelim" aria-pressed="false">예선</button>
+        <button type="button" class="workflow-phase-filter-btn" data-workflow-phase="final" aria-pressed="false">본선</button>
+      </div>
+      <p id="workflowDragHint" class="workflow-drag-hint" role="status" aria-live="polite" hidden></p>
       <div id="allCourtBoard" class="court-board"></div>
       <div class="workflow-save-row">
         <span id="workflowPlannerHint" class="unsaved-change" hidden></span>
@@ -200,15 +206,101 @@
       <h2>제출 결과 검수 <button type="button" class="help-trigger" aria-label="제출 결과 검수 설명" data-help="기록관이 제출한 결과를 승인·반려합니다. 검수 대기 항목은 현재 코트 진행 순서와 별도로 표시됩니다.">설명</button></h2>
       <div id="scoreReviewList"></div>
     </div>
-    <div class="card">
-      <h2>승인 결과 정정 <button type="button" class="help-trigger" aria-label="승인 결과 정정 설명" data-help="적용 전에 재경기와 대기열 변경을 미리 확인합니다. 현재 진행 중인 경기와 충돌하면 적용할 수 없습니다.">설명</button></h2>
-      <div class="row" style="gap:8px; flex-wrap:wrap;">
-        <select id="correctionMatchKeys" multiple size="4" style="flex:1; min-width:280px;" aria-label="정정할 경기 선택"></select>
-        <button class="btn" id="previewCorrectionBtn">정정 미리보기</button>
-        <button class="btn danger" id="applyCorrectionBtn" disabled>명시적으로 적용</button>
+    <details class="advanced-settings" id="correctionAdvancedSettings">
+      <summary>
+        <span class="advanced-settings-title">
+          <b>추가 관리 기능</b>
+          <small>승인 취소 · 기록관에게 점수 재입력 요청</small>
+        </span>
+        <span class="advanced-settings-toggle">
+          <span class="when-closed">펼치기</span>
+          <span class="when-open">접기</span>
+        </span>
+      </summary>
+      <div class="advanced-settings-content">
+    <section class="card correction-section" id="correctionSection" aria-labelledby="correctionTitle">
+      <div class="correction-heading">
+        <div>
+          <h2 id="correctionTitle">승인 취소 · 점수 재입력 <button type="button" class="help-trigger" aria-label="승인 취소 및 점수 재입력 설명" data-help="기존 공식 결과를 취소하고 기록관에게 점수 재입력을 요청합니다. 실제 재경기는 아닙니다.">설명</button></h2>
+          <p class="correction-intro"><strong>단순 오입력은 해당 경기의 ‘점수 수정’을 사용하세요.</strong> 아래 기능은 승인을 취소하고 기록관에게 점수 재입력을 요청할 때만 사용합니다. 실제 재경기를 뜻하지 않습니다.</p>
+        </div>
       </div>
-      <div id="correctionPreview" class="empty-hint" style="margin-top:10px;"></div>
-    </div>
+
+      <ol class="correction-steps" aria-label="승인 취소 및 점수 재입력 단계">
+        <li class="correction-step is-current">
+          <span class="correction-step-number" aria-hidden="true">1</span>
+          <span class="correction-step-label">경기 선택</span>
+        </li>
+        <li class="correction-step">
+          <span class="correction-step-number" aria-hidden="true">2</span>
+          <span class="correction-step-label">변경 내용 확인</span>
+        </li>
+        <li class="correction-step">
+          <span class="correction-step-number" aria-hidden="true">3</span>
+          <span class="correction-step-label">사유 확인 후 요청</span>
+        </li>
+      </ol>
+
+      <section class="correction-stage" aria-labelledby="correctionSelectionTitle">
+        <div class="correction-stage-heading">
+          <div>
+            <h3 id="correctionSelectionTitle">1. 경기 선택</h3>
+            <p class="correction-guidance">승인된 경기 중 점수를 다시 입력할 경기를 선택하세요.</p>
+          </div>
+          <span id="correctionSelectionCount" class="correction-selection-count" role="status" aria-live="polite">0경기 선택</span>
+        </div>
+        <p id="correctionStatus" class="correction-status correction-guidance" role="status" aria-live="polite">승인된 경기를 불러오는 중입니다.</p>
+        <div id="correctionMatchList" class="correction-match-list" role="group" aria-labelledby="correctionSelectionTitle"></div>
+      </section>
+
+      <section class="correction-stage" aria-labelledby="correctionPreviewTitle">
+        <div class="correction-stage-heading">
+          <div>
+            <h3 id="correctionPreviewTitle">2. 변경 내용 확인</h3>
+            <p class="correction-guidance">대기열에서 빠질 경기와 다시 들어갈 위치를 확인한 뒤 다음 단계로 진행하세요.</p>
+          </div>
+          <button type="button" class="btn primary" id="previewCorrectionBtn" disabled>변경 내용 확인</button>
+        </div>
+        <div id="correctionPreview" class="correction-preview-region" role="region" aria-live="polite" aria-labelledby="correctionPreviewTitle">
+          <div class="correction-preview-warning" role="note">
+            <strong>공식 점수 취소 안내</strong>
+            <span>요청을 적용하면 선택한 경기의 기존 공식 점수가 취소되고, 기록관의 재입력이 필요합니다.</span>
+          </div>
+          <div class="correction-preview-grid">
+            <article class="correction-preview-card correction-preview-placeholder" aria-label="변경 전 대기열">
+              <h4>변경 전 대기열</h4>
+              <p class="correction-guidance">경기를 선택하고 변경 내용 확인을 누르면 표시됩니다.</p>
+            </article>
+            <article class="correction-preview-card correction-preview-placeholder" aria-label="변경 후 대기열">
+              <h4>변경 후 대기열</h4>
+              <p class="correction-guidance">서버 계획에 따른 대기열 순서를 확인합니다.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="correctionApplyPanel" class="correction-stage correction-apply-panel" aria-labelledby="correctionApplyTitle" hidden>
+        <div class="correction-stage-heading">
+          <div>
+            <h3 id="correctionApplyTitle">3. 사유 확인 후 요청</h3>
+            <p id="correctionApplyGuidance" class="correction-guidance">정정 사유를 입력하고 공식 점수 취소 및 재입력을 확인하세요.</p>
+          </div>
+        </div>
+        <div class="correction-reason-field">
+          <label for="correctionReason">정정 사유 <span aria-hidden="true">(필수)</span></label>
+          <textarea id="correctionReason" rows="4" maxlength="500" required placeholder="공식 결과를 취소해야 하는 사유를 입력하세요." aria-describedby="correctionReasonHelp correctionReasonError"></textarea>
+          <span id="correctionReasonHelp" class="correction-field-help">운영 기록에 남길 수 있도록 구체적으로 작성하세요.</span>
+          <span id="correctionReasonError" class="correction-reason-error" role="alert" aria-live="assertive" hidden></span>
+        </div>
+        <label class="correction-acknowledgement" for="correctionAcknowledge">
+          <input type="checkbox" id="correctionAcknowledge" required />
+          <span>기존 공식 점수가 취소되고 재입력이 필요함을 확인했습니다</span>
+        </label>
+        <button type="button" class="btn danger correction-apply-button" id="applyCorrectionBtn" disabled>승인 취소하고 재입력 요청</button>
+      </section>
+    </section>
+      </div>
+    </details>
   </section>
 
   <!-- 예선 -->

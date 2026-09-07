@@ -17,6 +17,12 @@ import {
 import {
   courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
 } from './court-display.js';
+import {
+  correctionConfirmationState,
+  correctionSelectionInfo,
+  correctionSelectionKeys,
+  isCorrectionCandidateEligible,
+} from './correction-view.js';
 
 let pass = 0, fail = 0;
 function check(label, cond) {
@@ -121,6 +127,107 @@ check(
 check(
   'prelim reorder normalizes independently assigned courts',
   reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-3').courtOrder === 1,
+);
+
+// ---- approved correction selection state ----
+const correctionFixtures = [
+  {
+    id: 'approved-1',
+    assignment: { id: 'approved-1', courtId: 'court-a', publicStatus: 'completed', officialRevision: 2 },
+    workflow: { draftState: 'approved', officialRevision: 2 },
+    officialMatch: { officialRevision: 2, officialCurrent: true },
+    entitiesReady: true,
+  },
+  {
+    id: 'approved-2',
+    assignment: { id: 'approved-2', courtId: 'court-a', publicStatus: 'completed', officialRevision: 1 },
+    workflow: { draftState: 'approved', officialRevision: 1 },
+    officialMatch: { officialRevision: 1, officialCurrent: true },
+    entitiesReady: true,
+  },
+  {
+    id: 'approved-other-court',
+    assignment: { id: 'approved-other-court', courtId: 'court-b', publicStatus: 'completed', officialRevision: 1 },
+    workflow: { draftState: 'approved', officialRevision: 1 },
+    officialMatch: { officialRevision: 1, officialCurrent: true },
+    entitiesReady: true,
+  },
+  {
+    id: 'retracted',
+    assignment: { id: 'retracted', courtId: 'court-a', publicStatus: 'replay_required', officialRevision: 3 },
+    workflow: { draftState: 'rejected', officialRevision: 3 },
+    officialMatch: { officialRevision: 3, officialCurrent: false },
+    entitiesReady: true,
+  },
+];
+check(
+  'correction eligibility excludes retracted official results awaiting re-entry',
+  !isCorrectionCandidateEligible(correctionFixtures[3])
+  && isCorrectionCandidateEligible(correctionFixtures[0]),
+);
+check(
+  'correction eligibility excludes candidates with missing public entities',
+  !isCorrectionCandidateEligible({ ...correctionFixtures[0], id: 'missing', entitiesReady: false }),
+);
+const retainedCorrectionSelection = correctionSelectionKeys(
+  new Set(['approved-1', 'approved-2', 'removed']),
+  correctionFixtures,
+);
+check(
+  'correction selection retains eligible keys and removes stale entries',
+  retainedCorrectionSelection.size === 2
+  && retainedCorrectionSelection.has('approved-1')
+  && !retainedCorrectionSelection.has('removed'),
+);
+const sameCourtCorrection = correctionSelectionInfo(
+  new Set(['approved-1', 'approved-2']),
+  correctionFixtures,
+);
+const mixedCourtCorrection = correctionSelectionInfo(
+  new Set(['approved-1', 'approved-other-court']),
+  correctionFixtures,
+);
+check('correction selection allows multiple matches on one court', sameCourtCorrection.sameCourt && sameCourtCorrection.courtId === 'court-a');
+check('correction selection identifies cross-court targets for prevention', !mixedCourtCorrection.sameCourt && mixedCourtCorrection.courtId === null);
+const previewFixture = {
+  generation: 4,
+  matchKeys: ['approved-1', 'approved-2'],
+  planToken: { courtId: 'court-a', expectedQueueRevision: 3, fingerprint: 'fixture' },
+};
+check(
+  'correction stale preview is invalidated when generation changes',
+  !correctionConfirmationState({
+    selectedKeys: new Set(['approved-1', 'approved-2']),
+    preview: previewFixture,
+    generation: 5,
+    reason: '입력 오류',
+    acknowledged: true,
+  }).canApply,
+);
+check(
+  'correction apply guard requires reason and acknowledgement',
+  !correctionConfirmationState({
+    selectedKeys: new Set(['approved-1', 'approved-2']),
+    preview: previewFixture,
+    generation: 4,
+    reason: '',
+    acknowledged: false,
+  }).canApply
+  && !correctionConfirmationState({
+    selectedKeys: new Set(['approved-1', 'approved-2']),
+    preview: previewFixture,
+    generation: 4,
+    reason: '입력 오류',
+    acknowledged: true,
+    activeLocks: ['approved-1'],
+  }).canApply
+  && correctionConfirmationState({
+    selectedKeys: new Set(['approved-1', 'approved-2']),
+    preview: previewFixture,
+    generation: 4,
+    reason: '입력 오류',
+    acknowledged: true,
+  }).canApply,
 );
 
 // ---- backup format boundary ----

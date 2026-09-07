@@ -3,9 +3,15 @@ import {
   activateDependencyEntries,
   classifyCorrectionTarget,
   consumeCurrentAndAdvance,
+  getPlannerVisibleAdjacent,
+  groupPlannerAssignments,
   insertPriorityEntry,
+  isPlannerMatchCompleted,
+  movePlannerAssignment,
+  movePlannerMatchByOffset,
   planCorrectionReplay,
   planRejectedRework,
+  plannerPhaseMatches,
   projectCancel,
   projectForceRelease,
   reconcilePlannerAssignments,
@@ -292,6 +298,105 @@ const queue = (changes = {}) => ({
   assert.equal(merged[2].division, 'women', '새 여자부 경기 활성 초안 생성');
   assert.equal(merged[3].courtId, 'court-b', '공식 경기의 서버 배정 복원');
   assert.equal(merged.some((assignment) => assignment.matchKey === 'deleted-live-match'), false, '서버에서 사라진 경기 초안 제거');
+}
+
+// 통합 보드의 필터·완료 분류는 입력 배열과 전체 코트 순서를 변경하지 않는다.
+{
+  const options = [
+    { matchKey: 'p1', matchType: 'prelim' },
+    { matchKey: 'f1', matchType: 'final' },
+    { matchKey: 'p2', matchType: 'prelim' },
+  ];
+  const plannerAssignments = [
+    { matchKey: 'p1', courtId: 'court-a', courtOrder: 1, publicStatus: 'scheduled' },
+    { matchKey: 'f1', courtId: 'court-a', courtOrder: 2, publicStatus: 'completed', officialRevision: 4 },
+    { matchKey: 'p2', courtId: 'court-a', courtOrder: 3, publicStatus: 'scheduled' },
+  ];
+  const beforeOptions = structuredClone(options);
+  const beforeAssignments = structuredClone(plannerAssignments);
+  assert.equal(plannerPhaseMatches(options[0], 'prelim'), true);
+  assert.equal(plannerPhaseMatches(options[1], 'prelim'), false);
+  assert.deepEqual([...groupPlannerAssignments(options, plannerAssignments, 'prelim').get('court-a')]
+    .map((option) => option.matchKey), ['p1', 'p2']);
+  assert.deepEqual(options, beforeOptions);
+  assert.deepEqual(plannerAssignments, beforeAssignments);
+  assert.equal(isPlannerMatchCompleted(options[1], plannerAssignments[1], { draftState: 'approved' }), true);
+  assert.equal(isPlannerMatchCompleted(options[1], { ...plannerAssignments[1], publicStatus: 'replay_required' }, { draftState: 'approved' }), false);
+  assert.equal(isPlannerMatchCompleted(options[1], plannerAssignments[1], { draftState: 'approved', lock: { token: 'live' } }), false);
+  assert.equal(isPlannerMatchCompleted(options[1], { ...plannerAssignments[1], officialRevision: 9, publicStatus: 'scheduled' }, { draftState: 'idle' }), false);
+  assert.equal(isPlannerMatchCompleted(options[1], plannerAssignments[1], { draftState: 'rejected', status: 'approved' }), false);
+  const local = [{ ...plannerAssignments[1], courtId: 'local-court', courtOrder: 9, publicStatus: 'scheduled' }];
+  const refreshed = reconcilePlannerAssignments(local, [options[1]], [plannerAssignments[1]]);
+  assert.equal(refreshed[0].courtId, 'local-court');
+  assert.equal(refreshed[0].courtOrder, 9);
+  assert.equal(refreshed[0].publicStatus, 'completed');
+  assert.equal(local[0].publicStatus, 'scheduled');
+  assert.equal(isPlannerMatchCompleted(options[1], refreshed[0], { draftState: 'approved' }), true);
+}
+
+// 화살표는 필터 배열이 아니라 전체 순서의 바로 옆 활성 경기만 대상으로 한다.
+{
+  const options = [
+    { matchKey: 'prelim-1', matchType: 'prelim' },
+    { matchKey: 'final-1', matchType: 'final' },
+    { matchKey: 'final-2', matchType: 'final' },
+  ];
+  const plannerAssignments = [
+    { matchKey: 'prelim-1', courtId: 'court-a', courtOrder: 1, publicStatus: 'scheduled' },
+    { matchKey: 'final-1', courtId: 'court-a', courtOrder: 2, publicStatus: 'scheduled' },
+    { matchKey: 'final-2', courtId: 'court-a', courtOrder: 3, publicStatus: 'scheduled' },
+  ];
+  const finalsOnly = getPlannerVisibleAdjacent(options, plannerAssignments, new Map(), 'final-1', 'final');
+  assert.deepEqual(finalsOnly, { previousMatchKey: null, nextMatchKey: 'final-2' });
+  const blockedByHistoric = getPlannerVisibleAdjacent(
+    options,
+    plannerAssignments.map((assignment) => assignment.matchKey === 'final-2'
+      ? { ...assignment, publicStatus: 'completed' }
+      : assignment),
+    new Map([['final-2', { draftState: 'approved' }]]),
+    'final-1',
+    'all',
+  );
+  assert.deepEqual(blockedByHistoric, { previousMatchKey: 'prelim-1', nextMatchKey: null });
+  const moved = movePlannerMatchByOffset(options, plannerAssignments, new Map(), 'final-2', -1, 'final');
+  assert.deepEqual([...moved].sort((a, b) => a.courtOrder - b.courtOrder).map((assignment) => [assignment.matchKey, assignment.courtOrder]), [
+    ['prelim-1', 1], ['final-2', 2], ['final-1', 3],
+  ]);
+  assert.deepEqual(plannerAssignments.map((assignment) => assignment.matchKey), ['prelim-1', 'final-1', 'final-2']);
+  assert.deepEqual(movePlannerMatchByOffset(options, plannerAssignments, new Map(), 'prelim-1', 1, 'final'), plannerAssignments);
+  const interleaved = plannerAssignments.map((assignment, index) => ({ ...assignment, courtOrder: [2, 1, 3][index] }));
+  assert.deepEqual(getPlannerVisibleAdjacent(options, interleaved, new Map(), 'final-1', 'final'), {
+    previousMatchKey: null, nextMatchKey: null,
+  });
+  const gaps = plannerAssignments.map((assignment, index) => ({ ...assignment, courtOrder: [7, 20, 40][index] }));
+  const swapped = movePlannerMatchByOffset(options, gaps, new Map(), 'final-2', -1, 'final');
+  assert.deepEqual(swapped.map((assignment) => assignment.courtOrder), [7, 40, 20]);
+}
+
+// 코트 선택은 숨겨진 경기를 제외한 배열로 바꾸지 않고 목적지 전체 끝에 붙인다.
+{
+  const plannerAssignments = [
+    { matchKey: 'hidden-prelim', courtId: 'court-b', courtOrder: 1, matchType: 'prelim' },
+    { matchKey: 'visible-final', courtId: 'court-a', courtOrder: 1, matchType: 'final' },
+    { matchKey: 'other-final', courtId: 'court-b', courtOrder: 2, matchType: 'final' },
+  ];
+  const moved = movePlannerAssignment(plannerAssignments, 'visible-final', 'court-b');
+  assert.deepEqual(moved.map((assignment) => [assignment.matchKey, assignment.courtId, assignment.courtOrder]), [
+    ['hidden-prelim', 'court-b', 1],
+    ['visible-final', 'court-b', 3],
+    ['other-final', 'court-b', 2],
+  ]);
+  assert.deepEqual(plannerAssignments.map((assignment) => [assignment.matchKey, assignment.courtId, assignment.courtOrder]), [
+    ['hidden-prelim', 'court-b', 1],
+    ['visible-final', 'court-a', 1],
+    ['other-final', 'court-b', 2],
+  ]);
+  const originalMoved = structuredClone(moved);
+  const appended = movePlannerAssignment(moved, 'other-final', 'court-b');
+  assert.deepEqual([...appended].sort((a, b) => a.courtOrder - b.courtOrder).map((assignment) => assignment.matchKey), [
+    'hidden-prelim', 'visible-final', 'other-final',
+  ]);
+  assert.deepEqual(moved, originalMoved);
 }
 
 // pass-4: review history is excluded and submit advances without approval.
