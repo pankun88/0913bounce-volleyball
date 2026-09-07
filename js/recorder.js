@@ -15,14 +15,14 @@ import {
   buildRecorderConfirmationModel, buildRecorderSubmitContext, reconcileRecorderSelections,
   buildRecorderCourtSchedule, reconcileRecorderSubmit, recorderRouteState, sortRecorderCourts,
   cloneRecorderDraft, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
-  recorderDataState, resolveRecorderConflict, writeStoredRecorderDraft,
+  recorderDataState, reconcileRecorderOwnership, resolveRecorderConflict, writeStoredRecorderDraft,
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
 let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", pendingCourtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "", viewState = "selection";
 let courtAssignments = [], scheduleOfficial = new Map(), scheduleState = "idle";
-let stop = [], courtStops = [], matchStops = [], scheduleStops = [], scheduleMatchStops = [], officialStop = () => {}, heartbeat, channel, reconcilingQueue = false;
+let stop = [], courtStops = [], matchStops = [], scheduleStops = [], scheduleMatchStops = [], officialStop = () => {}, heartbeat, heartbeatEpoch = 0, channel, reconcilingQueue = false;
 let readyContextVersion = 0, courtContextVersion = 0, matchContextVersion = 0, scheduleContextVersion = 0, scheduleDetailVersion = 0;
 const tabInstanceId = crypto.randomUUID();
 let renderedFormKey = "";
@@ -43,6 +43,8 @@ const storageFailureMessages = {
   malformed: "이 기기의 임시 점수가 손상되어 불러오지 못했습니다. 현재 화면의 점수를 확인한 뒤 저장하세요.",
   invalid: "이 기기의 임시 점수를 저장할 수 없습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
 };
+const ownershipLostMessage = "입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.";
+let ownershipWarning = null;
 const isFinal = () => ["final", "tournament", "finals"].includes(assignment?.matchType) || ["final", "finals"].includes(assignment?.phase);
 const scoreKey = () => auth.currentUser && matchKey ? `recorder-score:${TOURNAMENT_ID}:${matchKey}:${auth.currentUser.uid}` : "";
 const storageKeyForEdit = () => activeStorageKey || scoreKey();
@@ -51,6 +53,17 @@ const action = (text) => { ui.actionStatus.textContent = text; ui.actionStatus.h
 const reasonCode = (error) => error?.details?.reason || error?.details?.code || "";
 const ambiguousNetworkResult = (error) => /(?:unavailable|deadline-exceeded|internal|unknown)$/.test(String(error?.code || ""));
 const focus = (element) => requestAnimationFrame(() => element?.focus());
+const navigateToWorkflowEntry = (context, token) => requestAnimationFrame(() => {
+  if (!token || !contextIsCurrent(context) || edit.token !== token || viewState !== "operations"
+      || !ui.workflowPanel || ui.workflowPanel.hidden || !ui.scoreForm || ui.scoreForm.hidden
+      || isStaleTerminalCurrent()) return;
+  ui.workflowTitle?.focus?.({ preventScroll: true });
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+  ui.workflowPanel.scrollIntoView?.({
+    behavior: reducedMotion ? "auto" : "smooth",
+    block: "start",
+  });
+});
 const displayCourt = (court) => formatCourtName(court, "이름 없는 코트");
 const name = (side) => courtTeamNames(official, teams)?.[side] || (side === "a" ? "A팀" : "B팀");
 const resolved = () => assignment?.dependencyReady !== false && Boolean(official?.teamA && official?.teamB);
@@ -207,8 +220,9 @@ function renderCourtSchedule() {
           render();
           return;
         }
-        if (!edit.token) await ui.claimButton.onclick();
-        if (edit.token) focus(ui.scoreFields.querySelector("input"));
+        const alreadyEditing = Boolean(edit.token) && !isStaleTerminalCurrent();
+        if (!alreadyEditing) await ui.claimButton.onclick();
+        if (alreadyEditing && edit.token && !isStaleTerminalCurrent()) navigateToWorkflowEntry(captureContext(), edit.token);
       });
       card.append(button);
     }
@@ -320,16 +334,16 @@ function setBusy(value) {
 function fenceAmbiguousOperation() {
   if (edit.pendingSubmit) {
     ui.backToEditButton.disabled = true;
-    ui.submitButton.disabled = !actionsReady();
+    ui.submitButton.disabled = !actionsReady() || ownershipLostFor(edit.pendingSubmit);
   }
   if (edit.pendingEnd) {
     ui.scoreFields.disabled = true;
     [ui.saveButton, ui.reviewButton, ui.discardButton].forEach((button) => { button.disabled = true; });
-    ui.endButton.disabled = !actionsReady();
+    ui.endButton.disabled = !actionsReady() || ownershipLostFor(edit.pendingEnd);
   }
   if (edit.pendingDiscard) {
     ui.keepDraftButton.disabled = true;
-    ui.confirmDiscardButton.disabled = !actionsReady();
+    ui.confirmDiscardButton.disabled = !actionsReady() || ownershipLostFor(edit.pendingDiscard);
   }
   if (edit.pendingSave || edit.saveConflict) {
     ui.saveButton.disabled = true;
@@ -357,7 +371,7 @@ function stopAll() {
   courtStops.forEach((fn) => fn()); courtStops = [];
   matchStops.forEach((fn) => fn()); matchStops = [];
   officialStop(); officialStop = () => {};
-  heartbeat?.stop(); heartbeat = null;
+  stopHeartbeat();
 }
 function normalizeFinal(score) {
   return { sets: normalizePlayedSets(score.sets, isFinal()) };
@@ -373,8 +387,7 @@ function resetMatchEditor({ preservePendingSubmit = false } = {}) {
   edit.pendingSave = null;
   edit.saveConflict = null;
   if (!preservePendingSubmit) edit.pendingSubmit = null;
-  heartbeat?.stop();
-  heartbeat = null;
+  stopHeartbeat();
   renderedFormKey = "";
   if (!reviewedPayload) clearConfirmation();
   if (ui.scoreFields && ui.scoreLegend) ui.scoreFields.replaceChildren(ui.scoreLegend);
@@ -513,6 +526,95 @@ function contextIsCurrent(context) {
     && context.courtId === courtId
     && context.uid === (auth.currentUser?.uid || authState?.user?.uid || null);
 }
+function pendingOperationFor(kind) {
+  return kind === "submit" ? edit.pendingSubmit
+    : kind === "end" ? edit.pendingEnd
+      : kind === "discard" ? edit.pendingDiscard : null;
+}
+function ownershipWarningMatches(operation) {
+  return Boolean(ownershipWarning && operation
+    && ownershipWarning.matchKey === operation.matchKey
+    && ownershipWarning.token === operation.token);
+}
+function ownershipLostFor(operation) {
+  return ownershipWarning?.source === "loss" && ownershipWarningMatches(operation);
+}
+function clearVerifiedOperationWarning(operation) {
+  if (!operation) return;
+  if (ownershipWarning && !ownershipWarningMatches(operation)) return;
+  if (ownershipWarning?.source === "loss") return;
+  if (ownershipWarning && ui.connectionStatus?.textContent === ownershipWarning.message) status("");
+  else if (ui.connectionStatus?.textContent === ownershipLostMessage) status("");
+  ownershipWarning = null;
+}
+function preserveOwnershipWarning(operation) {
+  return ownershipWarning?.source === "loss"
+    && ownershipWarningMatches(operation)
+    && ui.connectionStatus?.textContent === ownershipWarning.message;
+}
+function setOwnershipLostWarning(key, token) {
+  if (edit.dirty) {
+    const stored = storeDraft();
+    const message = stored
+      ? ownershipLostMessage
+      : "입력 권한을 잃었습니다. 로컬 초안을 저장할 수 없습니다. 화면을 닫지 마세요.";
+    ownershipWarning = { matchKey: key, token, source: "loss", message };
+    status(message);
+    return;
+  }
+  ownershipWarning = null;
+}
+function reconcileWorkflowOwnership(value, metadata, key = matchKey) {
+  const result = reconcileRecorderOwnership({
+    workflow: value,
+    metadata,
+    matchKey: key,
+    token: edit.token,
+    uid: auth.currentUser?.uid || authState?.user?.uid || "",
+    pendingSubmit: edit.pendingSubmit,
+    pendingEnd: edit.pendingEnd,
+    pendingDiscard: edit.pendingDiscard,
+  });
+  if (result.status === "ignore" || result.status === "none" || result.status === "owned") return result;
+  if (result.status === "expected_release" || result.status === "awaiting_operation") {
+    stopHeartbeat();
+    if (result.status === "expected_release") clearVerifiedOperationWarning(pendingOperationFor(result.operation));
+    return result;
+  }
+  const lostToken = edit.token;
+  stopHeartbeat();
+  edit.token = null;
+  renderedFormKey = "";
+  if (edit.dirty) setOwnershipLostWarning(key, lostToken);
+  return result;
+}
+function reconcileFailedOperationOwnership(kind, operation, ambiguous) {
+  if (!operation || dataHealth.workflow?.status !== "ready") return;
+  const result = reconcileRecorderOwnership({
+    workflow,
+    metadata: { fromCache: false },
+    matchKey: operation.matchKey,
+    token: edit.token,
+    uid: auth.currentUser?.uid || authState?.user?.uid || "",
+    pendingSubmit: kind === "submit" ? operation : null,
+    pendingEnd: kind === "end" ? operation : null,
+    pendingDiscard: kind === "discard" ? operation : null,
+  });
+  if (result.status === "expected_release") {
+    stopHeartbeat();
+    if (!ambiguous) {
+      edit.token = null;
+      renderedFormKey = "";
+    }
+    return;
+  }
+  if (result.status !== "lost" && !(result.status === "awaiting_operation" && !ambiguous)) return;
+  const lostToken = edit.token;
+  stopHeartbeat();
+  edit.token = null;
+  renderedFormKey = "";
+  if (edit.dirty) setOwnershipLostWarning(operation.matchKey, lostToken);
+}
 function applyWorkflowSnapshot(value, metadata = null) {
   const remote = value?.draft ? draftCopy(value.draft) : null;
   const remoteRevision = Number.isInteger(value?.draftRevision) ? value.draftRevision : null;
@@ -574,11 +676,7 @@ async function reconcileFreshWorkflow(pendingSave) {
   if (!contextIsCurrent(pendingSave.context) || edit.pendingSave !== pendingSave) return "ignore";
   workflow = fresh;
   setSnapshotState("workflow", { fromCache: false });
-  if (edit.token && (fresh?.lock?.token !== edit.token || fresh?.lock?.sessionId === undefined)) {
-    edit.token = null;
-    heartbeat?.stop();
-    if (edit.dirty) status("입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.");
-  }
+  reconcileWorkflowOwnership(fresh, { fromCache: false }, pendingSave.context.matchKey);
   const { reconciliation } = applyWorkflowSnapshot(fresh, { fromCache: false });
   render();
   return reconciliation.status;
@@ -665,7 +763,7 @@ function attachMatch(key) {
     if (localMatchVersion !== matchContextVersion || key !== matchKey || viewState !== "operations") return;
     setSnapshotState("workflow", metadata);
     workflow = value;
-    if (edit.token && (value?.lock?.token !== edit.token || value?.lock?.sessionId === undefined)) { edit.token = null; heartbeat?.stop(); if (edit.dirty) status("입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다."); }
+    reconcileWorkflowOwnership(value, metadata, key);
     const { remote, remoteRevision } = applyWorkflowSnapshot(value, metadata);
     if (!edit.dirty && !edit.pendingSave && remote && remoteRevision !== null && remoteRevision !== edit.savedRevision) {
       edit.serverDraft = remote; edit.localDraft = remote; edit.savedRevision = remoteRevision;
@@ -876,8 +974,34 @@ function startReady() {
     if (matchKey) attachMatch(matchKey);
   }
 }
+function stopHeartbeat() {
+  heartbeatEpoch += 1;
+  heartbeat?.stop();
+  heartbeat = null;
+}
 function beginHeartbeat() {
-  heartbeat?.stop(); heartbeat = startLeaseHeartbeat({ matchKey, token:edit.token, queueRevision:queue?.queueRevision, onRenew:() => {}, onError:(error)=>{ status(recorderReason(error)); if (["ownership_lost", "lease_expired"].includes(reasonCode(error))) { edit.token=null; renderedFormKey=""; render(); } } });
+  stopHeartbeat();
+  const context = captureContext();
+  const token = edit.token;
+  const epoch = heartbeatEpoch;
+  heartbeat = startLeaseHeartbeat({
+    matchKey: context.matchKey,
+    token,
+    queueRevision: queue?.queueRevision,
+    onRenew: () => {},
+    onError: (error) => {
+      if (epoch !== heartbeatEpoch || !contextIsCurrent(context) || edit.token !== token) return;
+      if ([edit.pendingSubmit, edit.pendingEnd, edit.pendingDiscard]
+        .some((operation) => operation?.matchKey === context.matchKey && operation?.token === token)) return;
+      if (["ownership_lost", "lease_expired"].includes(reasonCode(error))) {
+        edit.token = null;
+        renderedFormKey = "";
+        if (edit.dirty) setOwnershipLostWarning(context.matchKey, token);
+        else status(recorderReason(error));
+        render();
+      } else status(recorderReason(error));
+    },
+  });
 }
 function channelMessage(message) {
   if (message.instance === tabInstanceId) return;
@@ -1172,7 +1296,7 @@ ui.claimButton.onclick=async()=>{
       } else status("서버의 최신 초안을 불러왔습니다.");
     }
     channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId});
-    beginHeartbeat(); renderedFormKey=""; render(); focus(ui.scoreFields.querySelector("input"));
+    beginHeartbeat(); renderedFormKey=""; render(); navigateToWorkflowEntry(context, edit.token);
   } catch(error) {
     if (contextIsCurrent(context)) status(recorderReason(error));
   } finally {
@@ -1278,6 +1402,7 @@ ui.submitButton.onclick=async()=>{
       final: isFinal(),
       operationId: operationId(),
       storageKey: storageKeyForEdit(),
+      submissionVersion: workflow?.submissionVersion,
     });
     if (!pending) return;
     edit.pendingSubmit = pending;
@@ -1286,6 +1411,7 @@ ui.submitButton.onclick=async()=>{
   try {
     await submitRecorderDraft(pending);
     if (edit.pendingSubmit !== pending) return;
+    clearVerifiedOperationWarning(pending);
     const completion = reconcileRecorderSubmit({
       pendingSubmit: pending,
       currentMatchKey: matchKey,
@@ -1305,14 +1431,14 @@ ui.submitButton.onclick=async()=>{
       renderedFormKey = "";
       edit.reviewedPayload = null;
       clearConfirmation();
-      heartbeat?.stop();
-      heartbeat = null;
+      stopHeartbeat();
     }
     ui.successPanel.hidden = false;
     action(cleared ? "제출 완료" : "제출 완료 · 임시 저장 정리에 실패했습니다.");
     focus(ui.successTitle);
   } catch(error) {
     const ambiguous = ambiguousNetworkResult(error);
+    reconcileFailedOperationOwnership("submit", pending, ambiguous);
     if (!ambiguous && edit.pendingSubmit === pending) {
       edit.pendingSubmit = null;
       if (pending.matchKey !== matchKey) {
@@ -1325,14 +1451,102 @@ ui.submitButton.onclick=async()=>{
       ? "제출 여부를 확인하지 못했습니다. ‘점수 제출’을 다시 눌러 확인하세요."
       : `${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`;
     if (ambiguous && ui.confirmOutcome) ui.confirmOutcome.textContent = `제출 상태: ${submitStatus}`;
-    status(submitStatus);
+    if (!preserveOwnershipWarning(pending)) status(submitStatus);
   } finally {
     setBusy(false);
     fenceAmbiguousOperation();
     render();
   }
 };
-ui.endButton.onclick=async()=>{if(!actionsReady())return;edit.pendingEnd ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:false,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingEnd);edit.pendingEnd=null;edit.token=null;edit.reviewedPayload=null;clearConfirmation();heartbeat?.stop();status("입력을 종료했습니다. 초안은 보관됩니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingEnd=null;status(ambiguous?`${recorderReason(error)} 같은 종료 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
+ui.endButton.onclick=async()=>{
+  if (!actionsReady()) return;
+  edit.pendingEnd ||= {
+    matchKey,
+    courtId,
+    token: edit.token,
+    queueRevision: queue?.queueRevision,
+    discardDraft: false,
+    operationId: operationId(),
+    draft: draftCopy(edit.serverDraft),
+  };
+  const pending = edit.pendingEnd;
+  setBusy(true);
+  try {
+    await cancelRecorderDraft(pending);
+    if (edit.pendingEnd !== pending) return;
+    clearVerifiedOperationWarning(pending);
+    const keepOwnershipWarning = preserveOwnershipWarning(pending);
+    edit.pendingEnd = null;
+    edit.token = null;
+    edit.reviewedPayload = null;
+    clearConfirmation();
+    stopHeartbeat();
+    if (!keepOwnershipWarning) status("입력을 종료했습니다. 초안은 보관됩니다.");
+    focus(ui.workflowTitle);
+  } catch (error) {
+    const ambiguous = ambiguousNetworkResult(error);
+    reconcileFailedOperationOwnership("end", pending, ambiguous);
+    if (!ambiguous && edit.pendingEnd === pending) edit.pendingEnd = null;
+    if (!preserveOwnershipWarning(pending)) {
+      status(ambiguous
+        ? `${recorderReason(error)} 같은 종료 요청으로 결과를 다시 확인하세요.`
+        : recorderReason(error));
+    }
+  } finally {
+    setBusy(false);
+    fenceAmbiguousOperation();
+    render();
+  }
+};
 ui.discardButton.onclick=()=>{ui.discardMessage.textContent=`${name("a")} 대 ${name("b")} 경기의 저장 초안을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`;ui.discardPanel.hidden=false;focus(ui.keepDraftButton);};
 ui.keepDraftButton.onclick=()=>{ui.discardPanel.hidden=true;focus(ui.scoreFields.querySelector("input"));};
-ui.confirmDiscardButton.onclick=async()=>{if(!actionsReady())return;edit.pendingDiscard ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:true,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingDiscard);edit.pendingDiscard=null;const cleared=clearStored();edit.token=null;edit.dirty=false;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();renderedFormKey="";clearConfirmation();ui.scoreFields.replaceChildren(ui.scoreLegend);heartbeat?.stop();ui.discardPanel.hidden=true;status(cleared?"초안을 폐기했습니다.":"초안을 폐기했지만 임시 저장 정리에 실패했습니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingDiscard=null;status(ambiguous?`${recorderReason(error)} 같은 폐기 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
+ui.confirmDiscardButton.onclick=async()=>{
+  if (!actionsReady()) return;
+  edit.pendingDiscard ||= {
+    matchKey,
+    courtId,
+    token: edit.token,
+    queueRevision: queue?.queueRevision,
+    discardDraft: true,
+    operationId: operationId(),
+    draft: draftCopy(edit.serverDraft),
+  };
+  const pending = edit.pendingDiscard;
+  setBusy(true);
+  try {
+    await cancelRecorderDraft(pending);
+    if (edit.pendingDiscard !== pending) return;
+    clearVerifiedOperationWarning(pending);
+    const keepOwnershipWarning = preserveOwnershipWarning(pending);
+    edit.pendingDiscard = null;
+    const cleared = clearStored();
+    edit.token = null;
+    edit.dirty = false;
+    edit.reviewedPayload = null;
+    edit.localDraft = null;
+    edit.serverDraft = null;
+    edit.touched.clear();
+    renderedFormKey = "";
+    clearConfirmation();
+    ui.scoreFields.replaceChildren(ui.scoreLegend);
+    stopHeartbeat();
+    ui.discardPanel.hidden = true;
+    if (!keepOwnershipWarning) {
+      status(cleared ? "초안을 폐기했습니다." : "초안을 폐기했지만 임시 저장 정리에 실패했습니다.");
+    }
+    focus(ui.workflowTitle);
+  } catch (error) {
+    const ambiguous = ambiguousNetworkResult(error);
+    reconcileFailedOperationOwnership("discard", pending, ambiguous);
+    if (!ambiguous && edit.pendingDiscard === pending) edit.pendingDiscard = null;
+    if (!preserveOwnershipWarning(pending)) {
+      status(ambiguous
+        ? `${recorderReason(error)} 같은 폐기 요청으로 결과를 다시 확인하세요.`
+        : recorderReason(error));
+    }
+  } finally {
+    setBusy(false);
+    fenceAmbiguousOperation();
+    render();
+  }
+};

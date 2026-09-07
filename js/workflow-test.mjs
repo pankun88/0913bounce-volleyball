@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import {
   activateDependencyEntries,
   classifyCorrectionTarget,
@@ -27,6 +29,7 @@ import {
   readStoredRecorderDraft,
   recorderDataState,
   recorderRouteState,
+  reconcileRecorderOwnership,
   reconcileRecorderSnapshot,
   recorderDraftsEqual,
   resolveRecorderConflict,
@@ -160,6 +163,193 @@ const queue = (changes = {}) => ({
   assert.equal(completed.resetCurrent, false);
   assert.equal(completed.clearStorageKey, 'recorder-score:tournament:M1:uid');
   assert.equal(completed.pendingSubmit, null);
+}
+
+// A submit transaction clears the lock before its callable resolves. Matching
+// submitted evidence is an expected release; another active lock is takeover.
+{
+  const submit = {
+    matchKey: 'M1',
+    token: 'token-1',
+    operationId: 'operation-1',
+    submissionVersion: 2,
+    score: { sets: [{ a: 10, b: 8 }, { a: 10, b: 9 }] },
+  };
+  const released = reconcileRecorderOwnership({
+    workflow: {
+      draftState: 'submitted',
+      lock: null,
+      draft: submit.score,
+      submittedSnapshot: submit.score,
+      submission: { recorder: { uid: 'uid-1' } },
+      submissionVersion: 3,
+    },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-1',
+    uid: 'uid-1',
+    pendingSubmit: submit,
+  });
+  assert.deepEqual(released, {
+    status: 'expected_release',
+    operation: 'submit',
+    operationId: 'operation-1',
+  });
+  assert.equal(reconcileRecorderOwnership({
+    workflow: {
+      draftState: 'editing',
+      lock: { token: 'takeover-token', sessionId: 'session-2' },
+    },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-1',
+    uid: 'uid-1',
+    pendingSubmit: submit,
+  }).status, 'lost');
+  assert.equal(reconcileRecorderOwnership({
+    workflow: {
+      draftState: 'submitted',
+      lock: null,
+      submittedSnapshot: { sets: [{ a: 9, b: 8 }, { a: 10, b: 9 }] },
+      submission: { recorder: { uid: 'uid-1' } },
+      submissionVersion: 3,
+    },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-1',
+    uid: 'uid-1',
+    pendingSubmit: submit,
+  }).status, 'lost');
+  assert.equal(reconcileRecorderOwnership({
+    workflow: {
+      draftState: 'submitted',
+      lock: null,
+      submittedSnapshot: submit.score,
+      submission: { recorder: { uid: 'uid-1' } },
+      submissionVersion: 2,
+    },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-1',
+    uid: 'uid-1',
+    pendingSubmit: submit,
+  }).status, 'lost');
+  assert.equal(reconcileRecorderOwnership({
+    workflow: { draftState: 'submitted', lock: null },
+    metadata: { fromCache: true },
+    matchKey: 'M1',
+    token: 'token-1',
+    uid: 'uid-1',
+    pendingSubmit: submit,
+  }).status, 'ignore');
+}
+
+// End/discard releases are recognized only from their terminal server fields;
+// an empty discard stays pending until its callable result supplies proof.
+{
+  const end = {
+    matchKey: 'M1',
+    token: 'token-end',
+    operationId: 'operation-end',
+    draft: { sets: [{ a: 10, b: 8 }] },
+  };
+  assert.equal(reconcileRecorderOwnership({
+    workflow: {
+      draftState: 'idle',
+      lock: null,
+      draft: end.draft,
+      draftRetention: 'retained_after_cancel',
+      draftRetainedBy: { uid: 'uid-1' },
+    },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-end',
+    uid: 'uid-1',
+    pendingEnd: end,
+  }).status, 'expected_release');
+  const discard = {
+    matchKey: 'M1',
+    token: 'token-discard',
+    operationId: 'operation-discard',
+    draft: { sets: [{ a: 10, b: 8 }] },
+  };
+  assert.equal(reconcileRecorderOwnership({
+    workflow: { draftState: 'idle', lock: null },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-discard',
+    uid: 'uid-1',
+    pendingDiscard: discard,
+  }).status, 'expected_release');
+  assert.equal(reconcileRecorderOwnership({
+    workflow: { draftState: 'idle', lock: null },
+    metadata: { fromCache: false },
+    matchKey: 'M1',
+    token: 'token-discard',
+    uid: 'uid-1',
+    pendingDiscard: { ...discard, draft: { sets: [] } },
+  }).status, 'awaiting_operation');
+}
+
+// Lease renewals can resolve after stop() or after the match/token changes.
+// Those obsolete callbacks must not revoke a newly claimed lease.
+{
+  const source = readFileSync(new URL('./recorder.js', import.meta.url), 'utf8');
+  const heartbeatStart = source.indexOf('function beginHeartbeat()');
+  const heartbeatEnd = source.indexOf('\nfunction channelMessage', heartbeatStart);
+  assert.ok(heartbeatStart >= 0 && heartbeatEnd > heartbeatStart, 'heartbeat callback remains directly testable');
+  const heartbeatSource = source.slice(heartbeatStart, heartbeatEnd);
+  const context = { version: 1, matchKey: 'M1', courtId: 'court-a', uid: 'uid-1' };
+  const callbacks = [];
+  const statusCalls = [];
+  const renderCalls = [];
+  const edit = { token: 'token-1', dirty: true, pendingSubmit: null, pendingEnd: null, pendingDiscard: null };
+  const runtime = {
+    heartbeatEpoch: 0,
+    heartbeat: null,
+    renderedFormKey: '',
+    queue: { queueRevision: 3 },
+    edit,
+    captureContext: () => context,
+    contextIsCurrent: (value) => value === context,
+    startLeaseHeartbeat: ({ onError }) => {
+      callbacks.push(onError);
+      return { stop() {}, start() {}, reconcile() {} };
+    },
+    stopHeartbeat() {
+      runtime.heartbeatEpoch += 1;
+      runtime.heartbeat?.stop?.();
+      runtime.heartbeat = null;
+    },
+    reasonCode: () => 'ownership_lost',
+    recorderReason: () => 'ownership lost',
+    status: (value) => statusCalls.push(value),
+    setOwnershipLostWarning: (matchKey, token) => statusCalls.push(`lost:${matchKey}:${token}`),
+    render: () => renderCalls.push(true),
+  };
+  const { beginHeartbeat } = runInNewContext(`(() => {
+    ${heartbeatSource}
+    return { beginHeartbeat };
+  })()`, runtime);
+  beginHeartbeat();
+  const firstCallback = callbacks[0];
+  runtime.stopHeartbeat();
+  firstCallback({ code: 'aborted' });
+  assert.deepEqual(statusCalls, []);
+  assert.deepEqual(renderCalls, []);
+
+  beginHeartbeat();
+  const secondCallback = callbacks[1];
+  edit.token = 'token-2';
+  secondCallback({ code: 'aborted' });
+  assert.deepEqual(statusCalls, []);
+  assert.deepEqual(renderCalls, []);
+
+  edit.token = 'token-3';
+  beginHeartbeat();
+  callbacks[2]({ code: 'aborted' });
+  assert.deepEqual(statusCalls, ['lost:M1:token-3']);
+  assert.deepEqual(renderCalls, [true]);
 }
 
 // Confirmation data preserves a draw, a deciding third set, and long names as
@@ -457,6 +647,127 @@ const queue = (changes = {}) => ({
     { currentMatchKey: 'M2', nextMatchKey: 'M3' },
   );
   assert.throws(() => selectQueueView(queue({ priorityEntries: [{ matchKey: 'R1', enqueueSequence: 0, eligibility: 'ready' }, { matchKey: 'R1', enqueueSequence: 1, eligibility: 'ready' }] }), a, w), /Duplicate priority/);
+}
+
+// Explicit score-entry navigation waits for the rendered workflow panel,
+// preserves focus visibility, and never acts on an obsolete claim context.
+{
+  const source = readFileSync(new URL('./recorder.js', import.meta.url), 'utf8');
+  const helperStart = source.indexOf('const navigateToWorkflowEntry =');
+  const helperEnd = source.indexOf('\nconst displayCourt', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'recorder navigation helper remains directly testable');
+  const helperSource = source.slice(helperStart, helperEnd);
+  const createMock = ({ reducedMotion = false } = {}) => {
+    let frame = null;
+    let currentContext = 'match-1';
+    let staleTerminal = false;
+    const title = { focusCalls: [], focus(options) { this.focusCalls.push({ ...options }); } };
+    const panel = {
+      hidden: false,
+      scrollCalls: [],
+      scrollIntoView(options) { this.scrollCalls.push({ ...options }); },
+    };
+    const scoreForm = { hidden: false };
+    const edit = { token: 'token-1' };
+    const ui = { workflowPanel: panel, workflowTitle: title, scoreForm };
+    const mediaQueries = [];
+    const { navigateToWorkflowEntry, setViewState } = runInNewContext(`(() => {
+      let viewState = "operations";
+      ${helperSource}
+      return {
+        navigateToWorkflowEntry,
+        setViewState: (value) => { viewState = value; },
+      };
+    })()`, {
+      contextIsCurrent: (context) => context === currentContext,
+      edit,
+      ui,
+      requestAnimationFrame: (callback) => { frame = callback; },
+      window: {
+        matchMedia: (query) => {
+          mediaQueries.push(query);
+          return { matches: reducedMotion };
+        },
+      },
+      isStaleTerminalCurrent: () => staleTerminal,
+    });
+    return {
+      panel,
+      scoreForm,
+      title,
+      mediaQueries,
+      schedule: (context = 'match-1', token = edit.token) => navigateToWorkflowEntry(context, token),
+      runFrame: () => frame?.(),
+      setContext: (value) => { currentContext = value; },
+      setToken: (value) => { edit.token = value; },
+      setStale: (value) => { staleTerminal = value; },
+      setViewState,
+    };
+  };
+
+  const entry = createMock();
+  entry.schedule();
+  assert.equal(entry.title.focusCalls.length, 0);
+  assert.equal(entry.panel.scrollCalls.length, 0);
+  entry.runFrame();
+  assert.deepEqual(entry.title.focusCalls, [{ preventScroll: true }]);
+  assert.deepEqual(entry.panel.scrollCalls, [{ behavior: 'smooth', block: 'start' }]);
+  assert.deepEqual(entry.mediaQueries, ['(prefers-reduced-motion: reduce)']);
+
+  const alreadyEditing = createMock({ reducedMotion: true });
+  alreadyEditing.setToken('editing-token');
+  alreadyEditing.schedule();
+  alreadyEditing.runFrame();
+  assert.equal(alreadyEditing.title.focusCalls.length, 1);
+  assert.deepEqual(alreadyEditing.panel.scrollCalls, [{ behavior: 'auto', block: 'start' }]);
+
+  const failedClaim = createMock();
+  failedClaim.schedule('match-1', null);
+  failedClaim.runFrame();
+  assert.equal(failedClaim.title.focusCalls.length, 0);
+  assert.equal(failedClaim.panel.scrollCalls.length, 0);
+
+  const staleContext = createMock();
+  staleContext.schedule();
+  staleContext.setContext('match-2');
+  staleContext.runFrame();
+  assert.equal(staleContext.title.focusCalls.length, 0);
+  assert.equal(staleContext.panel.scrollCalls.length, 0);
+
+  const staleToken = createMock();
+  staleToken.schedule();
+  staleToken.setToken('token-2');
+  staleToken.runFrame();
+  assert.equal(staleToken.title.focusCalls.length, 0);
+  assert.equal(staleToken.panel.scrollCalls.length, 0);
+
+  const hiddenPanel = createMock();
+  hiddenPanel.schedule();
+  hiddenPanel.panel.hidden = true;
+  hiddenPanel.runFrame();
+  assert.equal(hiddenPanel.title.focusCalls.length, 0);
+  assert.equal(hiddenPanel.panel.scrollCalls.length, 0);
+
+  const hiddenScoreForm = createMock();
+  hiddenScoreForm.schedule();
+  hiddenScoreForm.scoreForm.hidden = true;
+  hiddenScoreForm.runFrame();
+  assert.equal(hiddenScoreForm.title.focusCalls.length, 0);
+  assert.equal(hiddenScoreForm.panel.scrollCalls.length, 0);
+
+  const staleQueue = createMock();
+  staleQueue.schedule();
+  staleQueue.setStale(true);
+  staleQueue.runFrame();
+  assert.equal(staleQueue.title.focusCalls.length, 0);
+  assert.equal(staleQueue.panel.scrollCalls.length, 0);
+
+  const nonOperationsView = createMock();
+  nonOperationsView.schedule();
+  nonOperationsView.setViewState('selection');
+  nonOperationsView.runFrame();
+  assert.equal(nonOperationsView.title.focusCalls.length, 0);
+  assert.equal(nonOperationsView.panel.scrollCalls.length, 0);
 }
 
 console.log('score-workflow fixtures passed');

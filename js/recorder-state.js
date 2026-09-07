@@ -94,6 +94,7 @@ export function buildRecorderSubmitContext({
   final = false,
   operationId,
   storageKey = "",
+  submissionVersion = null,
 } = {}) {
   const draft = cloneRecorderDraft(score);
   if (typeof matchKey !== "string" || !matchKey
@@ -112,6 +113,7 @@ export function buildRecorderSubmitContext({
     final: Boolean(final),
     operationId,
     storageKey: typeof storageKey === "string" ? storageKey : "",
+    submissionVersion: Number.isInteger(submissionVersion) ? submissionVersion : null,
   };
 }
 
@@ -209,6 +211,125 @@ export function reconcileRecorderSnapshot({ pendingSave, remoteDraft, remoteRevi
     remoteDraft: remote,
     remoteRevision,
     expectedRevision: pendingSave.expectedRevision,
+  };
+}
+
+function matchesRecorderOperation(operation, matchKey, token) {
+  return Boolean(operation
+    && operation.matchKey === matchKey
+    && operation.token === token);
+}
+
+function terminalRecorderDraftState(workflow) {
+  return ["idle", "rejected"].includes(workflow?.draftState);
+}
+
+function operationEvidence(workflow, kind, operation, uid) {
+  if (kind === "submit") {
+    const submittedDraft = workflow?.submittedSnapshot || workflow?.draft;
+    const submittedBy = workflow?.submission?.recorder?.uid;
+    const priorVersion = operation.submissionVersion;
+    const nextVersion = workflow?.submissionVersion;
+    const evidenceAvailable = workflow?.draftState !== undefined
+      || workflow?.submittedSnapshot !== undefined
+      || workflow?.submission !== undefined;
+    return {
+      evidenceAvailable,
+      matches: workflow?.draftState === "submitted"
+        && recorderDraftsEqual(submittedDraft, operation.score)
+        && typeof uid === "string"
+        && uid.length > 0
+        && submittedBy === uid
+        && (!Number.isInteger(priorVersion)
+          || (Number.isInteger(nextVersion) && nextVersion > priorVersion)),
+    };
+  }
+  if (kind === "end") {
+    const retainedBy = workflow?.draftRetainedBy?.uid;
+    const evidenceAvailable = workflow?.draftState !== undefined
+      || workflow?.draftRetention !== undefined
+      || workflow?.draftRetainedBy !== undefined;
+    return {
+      evidenceAvailable,
+      matches: terminalRecorderDraftState(workflow)
+        && workflow?.draftRetention === "retained_after_cancel"
+        && typeof uid === "string"
+        && uid.length > 0
+        && retainedBy === uid
+        && (!operation.draft || recorderDraftsEqual(workflow.draft, operation.draft)),
+    };
+  }
+  const hasDraft = operation.draft?.sets?.length > 0;
+  const evidenceAvailable = workflow?.draftState !== undefined
+    || workflow?.draft !== undefined
+    || workflow?.draftRetention !== undefined
+    || workflow?.draftRetainedBy !== undefined;
+  return {
+    // Deleting an already-empty draft leaves no operation-specific server
+    // evidence. Wait for the callable result instead of guessing ownership.
+    evidenceAvailable: hasDraft ? evidenceAvailable : false,
+    matches: hasDraft
+      && terminalRecorderDraftState(workflow)
+      && workflow?.draft === undefined
+      && workflow?.draftRetention === undefined
+      && workflow?.draftRetainedBy === undefined,
+  };
+}
+
+/**
+ * Reconcile an authoritative workflow snapshot with the recorder's active
+ * lease. A pending submit/end/discard is allowed to release its own lock only
+ * when the resulting workflow contains matching server evidence. Missing
+ * evidence remains pending until the callable resolves; a different active
+ * lock always means takeover. Cached snapshots are never allowed to revoke a
+ * fresh lease.
+ */
+export function reconcileRecorderOwnership({
+  workflow,
+  metadata = null,
+  matchKey = "",
+  token = "",
+  uid = "",
+  pendingSubmit = null,
+  pendingEnd = null,
+  pendingDiscard = null,
+} = {}) {
+  if (!token) return { status: "none" };
+  if (metadata?.fromCache === true) return { status: "ignore" };
+  if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
+    return { status: "lost" };
+  }
+  const lock = workflow.lock;
+  if (lock?.token === token && lock?.sessionId !== undefined) {
+    return { status: "owned" };
+  }
+  const operations = [
+    ["submit", pendingSubmit],
+    ["end", pendingEnd],
+    ["discard", pendingDiscard],
+  ].filter(([, operation]) => matchesRecorderOperation(operation, matchKey, token));
+  if (lock) return { status: "lost" };
+  if (!operations.length) return { status: "lost" };
+  const [kind, operation] = operations[0];
+  const evidence = operationEvidence(workflow, kind, operation, uid);
+  if (evidence.matches) {
+    return {
+      status: "expected_release",
+      operation: kind,
+      operationId: operation.operationId || null,
+    };
+  }
+  if (evidence.evidenceAvailable) {
+    return {
+      status: "lost",
+      operation: kind,
+      operationId: operation.operationId || null,
+    };
+  }
+  return {
+    status: "awaiting_operation",
+    operation: kind,
+    operationId: operation.operationId || null,
   };
 }
 
