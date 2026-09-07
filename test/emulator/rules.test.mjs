@@ -1,6 +1,20 @@
 import assert from 'node:assert/strict';
 import { assertFails, assertSucceeds } from '@firebase/rules-unit-testing';
-import { deleteDoc, deleteField, doc, getDoc, serverTimestamp, setDoc, Timestamp, updateDoc } from 'firebase/firestore';
+import {
+  collection,
+  deleteDoc,
+  deleteField,
+  doc,
+  getDoc,
+  getDocs,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  Timestamp,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
 import { createFixture, IDS, path } from './fixtures.mjs';
 
 const VALID_LOCK_TOKEN = 'recorder-lock-token-0001';
@@ -22,6 +36,36 @@ export async function runRulesSuite() {
     await assertSucceeds(getDoc(doc(db, path('courts', 'court-1'))));
     await assertSucceeds(getDoc(doc(db, path('courtAssignments', 'M1'))));
     await assertSucceeds(getDoc(doc(db, path('courtQueues', 'court-1'))));
+    const assignmentCollection = collection(db, 'tournaments/main/courtAssignments');
+    const selectedCourtAssignments = await assertSucceeds(getDocs(query(
+      assignmentCollection,
+      where('courtId', '==', 'court-1'),
+      orderBy('courtOrder'),
+    )));
+    assert.deepEqual(
+      selectedCourtAssignments.docs.map((snapshot) => snapshot.id),
+      ['M1', 'M2'],
+      'recorder court assignment query is scoped and ordered',
+    );
+    await assertFails(getDocs(query(assignmentCollection, orderBy('courtOrder'))));
+    await assertFails(getDocs(query(
+      assignmentCollection,
+      where('courtId', '==', null),
+      orderBy('courtOrder'),
+    )));
+    for (const deniedDb of [f.anonymous(), f.staleRecorder(), f.ungrantedRecorder()]) {
+      await assertFails(getDocs(query(
+        collection(deniedDb, 'tournaments/main/courtAssignments'),
+        where('courtId', '==', 'court-1'),
+        orderBy('courtOrder'),
+      )));
+    }
+    await assertFails(getDocs(collection(db, 'tournaments/main/scoreWorkflows')));
+    const adminAssignments = await assertSucceeds(getDocs(collection(
+      f.admin(),
+      'tournaments/main/courtAssignments',
+    )));
+    assert.equal(adminAssignments.size, 2, 'admin assignment list remains available');
     await f.seed(async (admin) => {
       await updateDoc(doc(admin, 'tournaments/main'), { maintenance: deleteField() });
       await setDoc(doc(admin, path('recorderGrants', 'password-recorder')), {

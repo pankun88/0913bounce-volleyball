@@ -1,4 +1,12 @@
-import { doc, getDocFromServer, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import {
+  collection,
+  doc,
+  getDocFromServer,
+  onSnapshot,
+  orderBy,
+  query,
+  where,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
 import { auth, db, functions } from "./firebase-init.js";
 import { TOURNAMENT_ID } from "./firebase-config.js";
@@ -57,6 +65,19 @@ export function subscribeCourt(courtId, callback, onError) {
 }
 export function subscribeAssignment(matchKey, callback, onError) {
   return onSnapshot(base("courtAssignments", matchKey), { includeMetadataChanges: true }, (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null, s.metadata), onError);
+}
+export function subscribeCourtAssignments(courtId, callback, onError) {
+  if (typeof courtId !== "string" || courtId.trim() === "") {
+    throw new TypeError("courtId must be a non-empty string");
+  }
+  const assignments = collection(db, "tournaments", TOURNAMENT_ID, "courtAssignments");
+  const scopedQuery = query(assignments, where("courtId", "==", courtId), orderBy("courtOrder"));
+  return onSnapshot(
+    scopedQuery,
+    { includeMetadataChanges: true },
+    (snapshot) => callback(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })), snapshot.metadata),
+    onError,
+  );
 }
 export function subscribeWorkflow(matchKey, callback, onError) {
   return onSnapshot(base("scoreWorkflows", matchKey), { includeMetadataChanges: true }, (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null, s.metadata), onError);

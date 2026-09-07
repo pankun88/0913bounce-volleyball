@@ -327,7 +327,14 @@ service cloud.firestore {
       match /courtAssignments/{matchKey} {
         allow get: if isMain(tournamentId)
           && (isAdmin() || hasCurrentRecorderGrant(tournamentId));
-        allow list: if isMain(tournamentId) && isAdmin();
+        // Recorder enumeration is limited to an explicitly filtered court.
+        // The resource predicate makes an equality filter on a non-empty
+        // courtId mandatory, so unfiltered and unassigned documents fail.
+        allow list: if isMain(tournamentId)
+          && (isAdmin()
+            || (hasCurrentRecorderGrant(tournamentId)
+              && resource.data.courtId is string
+              && resource.data.courtId.size() > 0));
         allow update: if false;
         allow create, delete: if false;
       }

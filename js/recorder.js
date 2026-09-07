@@ -5,20 +5,25 @@ import { TOURNAMENT_ID } from "./firebase-config.js";
 import {
   canResumeCurrentMatch, claimRecorderDraft, recorderReason, resumeRecorderDraft, saveRecorderDraft,
   submitRecorderDraft, cancelRecorderDraft, operationId, recorderSessionId, rotateRecorderSessionId,
-  reconcileRecorderCourtQueue, startLeaseHeartbeat, subscribeAssignment, subscribeCourt, subscribeWorkflow,
+  reconcileRecorderCourtQueue, startLeaseHeartbeat, subscribeAssignment, subscribeCourt, subscribeCourtAssignments,
+  subscribeWorkflow,
   fetchRecorderWorkflow,
 } from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, normalizePlayedSets, validateSetScore } from "./match-logic.js";
 import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-display.js";
 import {
+  buildRecorderConfirmationModel, buildRecorderSubmitContext, reconcileRecorderSelections,
+  buildRecorderCourtSchedule, reconcileRecorderSubmit, recorderRouteState, sortRecorderCourts,
   cloneRecorderDraft, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
   recorderDataState, resolveRecorderConflict, writeStoredRecorderDraft,
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
-const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","courtMessage","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","backToEditButton","submitButton","successPanel","successTitle","nextSameButton","switchRecorderButton"].map((id) => [id, $(id)]));
-let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "";
-let stop = [], courtStops = [], matchStops = [], officialStop = () => {}, heartbeat, channel, reconcilingQueue = false;
+const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
+let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", pendingCourtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "", viewState = "selection";
+let courtAssignments = [], scheduleOfficial = new Map(), scheduleState = "idle";
+let stop = [], courtStops = [], matchStops = [], scheduleStops = [], scheduleMatchStops = [], officialStop = () => {}, heartbeat, channel, reconcilingQueue = false;
+let readyContextVersion = 0, courtContextVersion = 0, matchContextVersion = 0, scheduleContextVersion = 0, scheduleDetailVersion = 0;
 const tabInstanceId = crypto.randomUUID();
 let renderedFormKey = "";
 let activeStorageKey = "";
@@ -27,10 +32,10 @@ const edit = {
   request: "idle", savedRevision: null, inputVersion: 0, pendingSave: null, saveConflict: null,
   pendingSubmit: null, pendingEnd: null, pendingDiscard: null,
 };
-const dataHealth = Object.fromEntries(["courts","teams","groups","queue","court","assignment","workflow","official"]
+const dataHealth = Object.fromEntries(["courts","teams","groups","queue","court","schedule","assignment","workflow","official"]
   .map((key) => [key, { status: "idle", error: null }]));
 const dataLabels = {
-  courts: "코트 목록", teams: "팀 목록", groups: "조 목록", queue: "코트 대기열",
+  courts: "코트 목록", teams: "팀 목록", groups: "조 목록", queue: "코트 대기열", schedule: "코트 경기 목록",
   court: "코트 정보", assignment: "경기 배정", workflow: "점수 워크플로", official: "공식 경기",
 };
 const storageFailureMessages = {
@@ -50,6 +55,7 @@ const displayCourt = (court) => formatCourtName(court, "이름 없는 코트");
 const name = (side) => courtTeamNames(official, teams)?.[side] || (side === "a" ? "A팀" : "B팀");
 const resolved = () => assignment?.dependencyReady !== false && Boolean(official?.teamA && official?.teamB);
 const draftCopy = (value) => cloneRecorderDraft(value);
+const selectorLocked = () => busy || Boolean(edit.token || edit.pendingSubmit || edit.pendingSave || edit.pendingEnd || edit.pendingDiscard);
 const getLocalStorage = () => {
   try { return globalThis.localStorage; } catch { return null; }
 };
@@ -76,11 +82,166 @@ function storeDraft() {
   return result.ok;
 }
 function clearStored() {
-  if (!storageKeyForEdit()) return true;
-  const result = removeStoredRecorderDraft(getLocalStorage(), storageKeyForEdit());
+  return clearStoredKey(storageKeyForEdit());
+}
+function clearStoredKey(key) {
+  if (!key) return true;
+  const result = removeStoredRecorderDraft(getLocalStorage(), key);
   if (!result.ok) setStorageStatus(result.reason);
-  else clearStorageStatus();
+  else if (key === storageKeyForEdit()) clearStorageStatus();
   return result.ok;
+}
+function renderCourtSelectors({ resetRecorder = false } = {}) {
+  if (!ui.courtSelect || !ui.recorderSelect) return;
+  const selectedCourtId = pendingCourtId || courtId || ui.courtSelect.value || "";
+  const selectedRecorder = resetRecorder ? "" : (recorder || ui.recorderSelect.value || "");
+  const selection = reconcileRecorderSelections(courts, selectedCourtId, selectedRecorder);
+  if (viewState === "selection") pendingCourtId = selection.courtId;
+  const courtOptions = [
+    new Option("코트를 선택하세요", ""),
+    ...sortRecorderCourts(courts).map((court) => new Option(displayCourt(court), court.id)),
+  ];
+  ui.courtSelect.replaceChildren(...courtOptions);
+  ui.courtSelect.value = selection.courtId;
+  ui.recorderSelect.replaceChildren(
+    new Option(selection.court ? "이름을 선택하세요" : "먼저 코트를 선택하세요", ""),
+    ...selection.availableNames.map((value) => new Option(value, value)),
+  );
+  ui.recorderSelect.value = selection.recorder;
+  recorder = selection.recorder;
+  const configuredRecorder = selection.court?.recorderName?.trim() || "";
+  if (ui.courtMessage) {
+    if (!selection.court) ui.courtMessage.textContent = "";
+    else if (!configuredRecorder) ui.courtMessage.textContent = "관리자에게 기록관 배정을 요청하세요.";
+    else if (!recorder) ui.courtMessage.textContent = `${displayCourt(selection.court)}의 담당 기록관 이름을 선택하세요.`;
+    else ui.courtMessage.textContent = `${recorder} · ${displayCourt(selection.court)}`;
+  }
+  const locked = selectorLocked();
+  ui.courtSelect.disabled = locked || viewState === "operations";
+  ui.recorderSelect.disabled = locked || viewState === "operations" || !selection.court || !selection.availableNames.length;
+  if (ui.enterCourtButton) {
+    ui.enterCourtButton.disabled = locked || !selection.court || !selection.recorder;
+  }
+}
+function selectedCourt() {
+  return courts.find((item) => item?.id === courtId) || courts.find((item) => item?.id === pendingCourtId) || null;
+}
+function renderOperationsHeader() {
+  const court = selectedCourt();
+  if (ui.selectedCourtLabel) ui.selectedCourtLabel.textContent = court ? displayCourt(court) : "";
+  if (ui.selectedRecorderLabel) ui.selectedRecorderLabel.textContent = recorder || "";
+  if (ui.courtScheduleHeading) ui.courtScheduleHeading.textContent = court ? `${displayCourt(court)} 경기 일정` : "코트 경기 일정";
+}
+function scheduleStatusLabel(statusValue) {
+  return {
+    current: "현재 경기",
+    next: "다음 경기",
+    waiting: "대기",
+    under_review: "검토 중",
+    completed: "완료",
+    replay: "재경기",
+  }[statusValue] || "대기";
+}
+function renderCourtSchedule() {
+  renderOperationsHeader();
+  if (!ui.courtScheduleList) return;
+  if (scheduleState === "loading") {
+    ui.courtScheduleList.replaceChildren();
+    if (ui.courtScheduleStatus) {
+      ui.courtScheduleStatus.hidden = false;
+      ui.courtScheduleStatus.textContent = "이 코트의 경기 목록을 불러오는 중입니다.";
+    }
+    return;
+  }
+  if (scheduleState === "error") {
+    ui.courtScheduleList.replaceChildren();
+    if (ui.courtScheduleStatus) {
+      ui.courtScheduleStatus.hidden = false;
+      ui.courtScheduleStatus.textContent = "이 코트의 경기 목록을 불러오지 못했습니다. ‘대회 데이터 다시 불러오기’를 눌러 재시도하세요.";
+    }
+    return;
+  }
+  const schedule = buildRecorderCourtSchedule({
+    assignments: courtAssignments,
+    queue,
+    officialMatches: scheduleOfficial,
+    teamsById: teams,
+    groupsById: groups,
+  });
+  if (ui.courtScheduleStatus) {
+    ui.courtScheduleStatus.hidden = Boolean(schedule.length);
+    ui.courtScheduleStatus.textContent = schedule.length ? "" : "이 코트에 배정된 경기가 없습니다.";
+  }
+  ui.courtScheduleList.replaceChildren(...schedule.map((item, index) => {
+    const card = document.createElement("li");
+    card.className = `court-schedule-item schedule-status-${item.status}`;
+    card.dataset.matchKey = item.matchKey;
+    const heading = document.createElement("h3");
+    heading.textContent = `${index + 1}. ${item.label || item.matchKey}`;
+    const matchup = document.createElement("p");
+    matchup.className = "court-schedule-matchup";
+    matchup.textContent = item.matchup;
+    const badge = document.createElement("span");
+    badge.className = "court-schedule-badge";
+    badge.textContent = item.statusLabel || scheduleStatusLabel(item.status);
+    card.append(heading, matchup, badge);
+    if (item.score) {
+      const score = document.createElement("p");
+      score.className = "court-schedule-score";
+      score.textContent = `공식 점수 ${item.score.sets.map((set) => `${set.a}:${set.b}`).join(" · ")}`;
+      card.append(score);
+    }
+    if (item.isCurrent) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "primary-button court-schedule-action";
+      const canClaim = isStaleTerminalCurrent() || canResumeCurrentMatch(workflow, recorder)
+        || (!workflow?.lock && ["idle", "rejected"].includes(workflow?.draftState));
+      button.textContent = isStaleTerminalCurrent() ? "다음 경기 확인" : edit.token ? "입력 중인 점수로 이동" : "점수 입력";
+      button.disabled = viewState !== "operations" || !actionsReady() || busy || Boolean(edit.pendingSubmit)
+        || item.matchKey !== matchKey || !item.eligibleCurrent || !resolved() || !(edit.token || canClaim);
+      button.addEventListener("click", async () => {
+        if (button.disabled || viewState !== "operations" || !item.isCurrent) return;
+        if (queue?.currentMatchKey !== item.matchKey) {
+          action("현재 경기 순서가 변경되었습니다. 최신 경기 목록을 확인하세요.");
+          render();
+          return;
+        }
+        if (!edit.token) await ui.claimButton.onclick();
+        if (edit.token) focus(ui.scoreFields.querySelector("input"));
+      });
+      card.append(button);
+    }
+    return card;
+  }));
+}
+function clearConfirmation() {
+  const fields = [ui.confirmCourt, ui.confirmRecorder, ui.confirmMatchLabel, ui.confirmTeamA, ui.confirmTeamB, ui.confirmOutcome];
+  fields.forEach((field) => { if (field) field.textContent = ""; });
+  if (ui.confirmSets) ui.confirmSets.replaceChildren();
+}
+function renderConfirmation(model) {
+  if (!ui.confirmScore) return;
+  if (ui.confirmCourt) ui.confirmCourt.textContent = model.court;
+  if (ui.confirmRecorder) ui.confirmRecorder.textContent = model.recorder;
+  if (ui.confirmMatchLabel) ui.confirmMatchLabel.textContent = model.matchLabel;
+  if (ui.confirmTeamA) ui.confirmTeamA.textContent = model.teamA;
+  if (ui.confirmTeamB) ui.confirmTeamB.textContent = model.teamB;
+  if (ui.confirmOutcome) ui.confirmOutcome.textContent = model.outcome;
+  if (ui.confirmSets) {
+    ui.confirmSets.replaceChildren(...model.sets.map((set) => {
+      const row = document.createElement("tr");
+      const a = document.createElement("td");
+      const label = document.createElement("th");
+      const b = document.createElement("td");
+      label.scope = "row";
+      a.textContent = String(set.a);
+      label.textContent = set.label;
+      b.textContent = String(set.b);
+      row.append(a, label, b);
+      return row;
+    }));
+  }
 }
 function setDataState(key, state, error = null) {
   if (!dataHealth[key]) return;
@@ -89,7 +250,7 @@ function setDataState(key, state, error = null) {
 }
 function relevantDataKeys() {
   const keys = ["courts", "teams", "groups"];
-  if (courtId) keys.push("queue", "court");
+  if (courtId && viewState === "operations") keys.push("queue", "court", "schedule");
   if (matchKey) keys.push("assignment", "workflow", "official");
   return keys;
 }
@@ -127,15 +288,28 @@ function renderDataState() {
   ui.retryDataButton.disabled = busy || !authActionsReady();
 }
 function applyActionGate() {
+  syncScreenVisibility();
   const blocked = !actionsReady();
   const actionButtons = [ui.claimButton, ui.saveButton, ui.reviewButton, ui.endButton, ui.discardButton,
     ui.confirmDiscardButton, ui.keepDraftButton, ui.backToEditButton, ui.submitButton];
   actionButtons.forEach((button) => {
     if (button) button.disabled = busy || blocked;
   });
-  ui.scoreFields.disabled = busy || blocked;
-  ui.scoreFields.setAttribute("aria-busy", String(busy));
-  ui.courtSelect.disabled = busy || Boolean(edit.token);
+  if (ui.scoreFields) {
+    ui.scoreFields.disabled = busy || blocked;
+    ui.scoreFields.setAttribute("aria-busy", String(busy));
+  }
+  const selectorsDisabled = selectorLocked();
+  if (ui.courtSelect) ui.courtSelect.disabled = selectorsDisabled || viewState === "operations";
+  if (ui.recorderSelect) ui.recorderSelect.disabled = selectorsDisabled || viewState === "operations"
+    || !ui.courtSelect?.value || ui.recorderSelect.options.length <= 1;
+  if (ui.enterCourtButton) ui.enterCourtButton.disabled = selectorsDisabled
+    || viewState === "operations" || !ui.courtSelect?.value || !ui.recorderSelect?.value;
+  if (ui.changeCourtButton) ui.changeCourtButton.disabled = busy || viewState !== "operations";
+  renderCourtSchedule();
+  if (courtAssignments.some((item) => item.matchKey === matchKey && item.matchKey === queue?.currentMatchKey)) {
+    ui.claimButton.hidden = true;
+  }
   renderDataState();
 }
 function setBusy(value) {
@@ -162,9 +336,74 @@ function fenceAmbiguousOperation() {
     ui.reviewButton.disabled = true;
   }
 }
-function stopAll() { stop.forEach((fn) => fn()); stop = []; courtStops.forEach((fn) => fn()); courtStops = []; matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {}; heartbeat?.stop(); heartbeat = null; }
+function stopScheduleStreams() {
+  scheduleContextVersion += 1;
+  scheduleDetailVersion += 1;
+  scheduleStops.forEach((fn) => fn());
+  scheduleStops = [];
+  scheduleMatchStops.forEach((fn) => fn());
+  scheduleMatchStops = [];
+  courtAssignments = [];
+  scheduleOfficial = new Map();
+  scheduleState = "idle";
+  setDataState("schedule", "idle");
+}
+function stopAll() {
+  readyContextVersion += 1;
+  courtContextVersion += 1;
+  matchContextVersion += 1;
+  stopScheduleStreams();
+  stop.forEach((fn) => fn()); stop = [];
+  courtStops.forEach((fn) => fn()); courtStops = [];
+  matchStops.forEach((fn) => fn()); matchStops = [];
+  officialStop(); officialStop = () => {};
+  heartbeat?.stop(); heartbeat = null;
+}
 function normalizeFinal(score) {
   return { sets: normalizePlayedSets(score.sets, isFinal()) };
+}
+function resetMatchEditor({ preservePendingSubmit = false } = {}) {
+  const reviewedPayload = preservePendingSubmit ? edit.reviewedPayload : null;
+  edit.token = null;
+  edit.serverDraft = null;
+  edit.localDraft = null;
+  edit.dirty = false;
+  edit.touched.clear();
+  edit.reviewedPayload = reviewedPayload;
+  edit.pendingSave = null;
+  edit.saveConflict = null;
+  if (!preservePendingSubmit) edit.pendingSubmit = null;
+  heartbeat?.stop();
+  heartbeat = null;
+  renderedFormKey = "";
+  if (!reviewedPayload) clearConfirmation();
+  if (ui.scoreFields && ui.scoreLegend) ui.scoreFields.replaceChildren(ui.scoreLegend);
+}
+function clearCurrentMatch() {
+  matchContextVersion += 1;
+  matchStops.forEach((fn) => fn());
+  matchStops = [];
+  officialStop();
+  officialStop = () => {};
+  setDataState("assignment", "idle");
+  setDataState("workflow", "idle");
+  setDataState("official", "idle");
+  matchKey = "";
+  assignment = workflow = official = null;
+  renderedFormKey = "";
+  clearConfirmation();
+  if (ui.matchSummary) ui.matchSummary.textContent = "현재 대기 중인 경기가 없습니다.";
+  if (ui.lockNotice) ui.lockNotice.hidden = true;
+  if (ui.claimButton) ui.claimButton.hidden = true;
+  if (ui.scoreForm) ui.scoreForm.hidden = true;
+}
+function confirmationOutcome(score) {
+  const evaluation = isFinal() ? evaluateFinalMatch(score.sets) : evaluatePrelimMatch(score.sets);
+  const winner = evaluation.result || evaluation.winner;
+  if (winner === "A") return `${name("a")} 승리`;
+  if (winner === "B") return `${name("b")} 승리`;
+  if (winner === "draw") return "무승부";
+  return "경기 결과 확인";
 }
 function formScore() {
   return { sets: [...ui.scoreFields.querySelectorAll(".score-row")].map((row) => {
@@ -208,7 +447,7 @@ function renderForm() {
   ui.scoreLegend.textContent = `${name("a")} vs ${name("b")} 점수`; ui.scoreFields.replaceChildren(ui.scoreLegend);
   targets.forEach((target, i) => {
     const row = document.createElement("div"); row.className = "score-row"; const label = document.createElement("label"); label.textContent = `${i + 1}세트 · ${target}점`;
-    const input = (side) => { const node = document.createElement("input"); node.type = "number"; node.inputMode = "numeric"; node.min = "0"; node.max = "15"; node.value = previous.sets[i]?.[side] ?? ""; node.setAttribute("aria-label", `${i + 1}세트 ${name(side)} 점수`); node.addEventListener("input", () => { edit.inputVersion += 1; edit.dirty = true; edit.touched.add(`${i}-${side}`); edit.localDraft = { sets: formScore().sets.map((set) => ({ a: set.a, b: set.b })) }; edit.reviewedPayload = null; const stored = storeDraft(); action(stored ? "미저장" : "미저장 · 이 화면의 점수를 별도로 기록하세요."); updateThird(); }); return node; };
+    const input = (side) => { const node = document.createElement("input"); node.type = "number"; node.inputMode = "numeric"; node.min = "0"; node.max = "15"; node.value = previous.sets[i]?.[side] ?? ""; node.setAttribute("aria-label", `${i + 1}세트 ${name(side)} 점수`); node.addEventListener("input", () => { edit.inputVersion += 1; edit.dirty = true; edit.touched.add(`${i}-${side}`); edit.localDraft = { sets: formScore().sets.map((set) => ({ a: set.a, b: set.b })) }; edit.reviewedPayload = null; clearConfirmation(); const stored = storeDraft(); action(stored ? "미저장" : "미저장 · 이 화면의 점수를 별도로 기록하세요."); updateThird(); }); return node; };
     const a = input("a"), b = input("b"), left = document.createElement("div"), right = document.createElement("div"), colon = document.createElement("span"); left.className = right.className = "score-entry"; colon.textContent = ":"; left.append(Object.assign(document.createElement("span"), { textContent: name("a") }), a); right.append(Object.assign(document.createElement("span"), { textContent: name("b") }), b); row.append(label,left,colon,right); ui.scoreFields.append(row);
   });
   const updateThird = () => { if (!isFinal()) return; const inputs = ui.scoreFields.querySelectorAll(".score-row:nth-of-type(3) input"); const first = formScore().sets.slice(0,2).map((set) => ({ a: Number(set.a), b: Number(set.b) })); const enabled = first.every((set) => Number.isFinite(set.a) && Number.isFinite(set.b)) && finalNeedsThirdSet([...first,{a:0,b:0}]); inputs.forEach((input) => { input.disabled = !enabled; if (!enabled) input.value = ""; }); };
@@ -344,34 +583,68 @@ async function reconcileFreshWorkflow(pendingSave) {
   render();
   return reconciliation.status;
 }
+function syncScreenVisibility() {
+  const confirmationActive = Boolean(edit.reviewedPayload || edit.pendingSubmit);
+  const authenticatedScreen = ui.authPanel.hidden;
+  ui.courtPanel.hidden = !authenticatedScreen || viewState !== "selection";
+  if (ui.confirmPanel) ui.confirmPanel.hidden = !authenticatedScreen || !confirmationActive;
+  if (ui.courtOperationsPanel) ui.courtOperationsPanel.hidden = !authenticatedScreen || viewState !== "operations" || confirmationActive;
+  if (ui.workflowPanel) ui.workflowPanel.hidden = viewState !== "operations" || confirmationActive || !courtId;
+}
 function render() {
-  ui.confirmPanel.hidden = !edit.reviewedPayload;
+  syncScreenVisibility();
+  renderOperationsHeader();
+  renderCourtSchedule();
   renderDataState();
   renderSaveRecovery();
-  if (!matchKey) { ui.claimButton.hidden = true; ui.scoreForm.hidden = true; return; }
-  renderSummary(); const reason = workflow?.rejectionReason || workflow?.reviewReason || workflow?.rejectedReason;
-  const correctingRejectedScore = workflow?.draftState === "rejected" || workflow?.resumeDraftState === "rejected";
-  ui.rejectionNotice.hidden = !correctingRejectedScore; ui.rejectionNotice.textContent = reason ? `반려 사유: ${reason} · 관리자 요청을 반영해 수정한 뒤 다시 제출하세요.` : "반려됨: 점수를 수정해 다시 제출하세요.";
-  const waiting = !resolved(); ui.lockNotice.hidden = !(waiting || (workflow?.lock && !edit.token)); ui.lockNotice.textContent = waiting ? "대진이 확정되기를 기다리고 있습니다. 팀과 이전 경기 결과가 확정되면 입력할 수 있습니다." : "다른 탭 또는 기록관이 입력 중입니다.";
-  if (isStaleTerminalCurrent()) {
-    ui.claimButton.hidden = false;
-    ui.claimButton.disabled = reconcilingQueue || !actionsReady();
-    ui.claimButton.textContent = reconcilingQueue ? "다음 경기 확인 중…" : "다음 경기로 이동";
-    ui.scoreForm.hidden = true;
-    ui.lockNotice.hidden = false;
-    ui.lockNotice.textContent = "이 경기는 관리자가 확정했습니다. 다음 경기로 이동하세요.";
+  if (viewState !== "operations" || !matchKey) {
+    if (ui.claimButton) ui.claimButton.hidden = true;
+    if (ui.scoreForm) ui.scoreForm.hidden = true;
     applyActionGate();
     return;
   }
-  const resumable = canResumeCurrentMatch(workflow, recorder); ui.claimButton.hidden = Boolean(edit.token) || waiting || !(resumable || ["idle","rejected"].includes(workflow?.draftState));
-  ui.claimButton.disabled = waiting || !actionsReady();
-  ui.claimButton.textContent = correctingRejectedScore ? "반려 점수 수정" : resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
+  renderSummary(); const reason = workflow?.rejectionReason || workflow?.reviewReason || workflow?.rejectedReason;
+  const correctingRejectedScore = workflow?.draftState === "rejected" || workflow?.resumeDraftState === "rejected";
+  if (ui.rejectionNotice) {
+    ui.rejectionNotice.hidden = !correctingRejectedScore;
+    ui.rejectionNotice.textContent = reason ? `반려 사유: ${reason} · 관리자 요청을 반영해 수정한 뒤 다시 제출하세요.` : "반려됨: 점수를 수정해 다시 제출하세요.";
+  }
+  const waiting = !resolved();
+  if (ui.lockNotice) {
+    ui.lockNotice.hidden = !(waiting || (workflow?.lock && !edit.token));
+    ui.lockNotice.textContent = waiting ? "대진이 확정되기를 기다리고 있습니다. 팀과 이전 경기 결과가 확정되면 입력할 수 있습니다." : "다른 탭 또는 기록관이 입력 중입니다.";
+  }
+  const selectorReady = Boolean(courtId && recorder && (ui.courtSelect?.value || pendingCourtId) === courtId);
+  if (isStaleTerminalCurrent()) {
+    if (ui.claimButton) {
+      ui.claimButton.hidden = !selectorReady;
+      ui.claimButton.disabled = reconcilingQueue || Boolean(edit.pendingSubmit) || !actionsReady();
+      ui.claimButton.textContent = reconcilingQueue ? "다음 경기 확인 중…" : "다음 경기로 이동";
+    }
+    if (ui.scoreForm) ui.scoreForm.hidden = true;
+    if (ui.lockNotice) {
+      ui.lockNotice.hidden = false;
+      ui.lockNotice.textContent = "이 경기는 관리자가 확정했습니다. 다음 경기로 이동하세요.";
+    }
+    applyActionGate();
+    return;
+  }
+  const resumable = canResumeCurrentMatch(workflow, recorder);
+  if (ui.claimButton) {
+    ui.claimButton.hidden = Boolean(edit.token) || waiting || !(resumable || ["idle","rejected"].includes(workflow?.draftState));
+    ui.claimButton.hidden ||= !selectorReady;
+    ui.claimButton.disabled = waiting || Boolean(edit.pendingSubmit) || !selectorReady || !actionsReady();
+    ui.claimButton.textContent = correctingRejectedScore ? "반려 점수 수정" : resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
+  }
   renderForm();
   applyActionGate();
   fenceAmbiguousOperation();
 }
 function attachMatch(key) {
+  const localMatchVersion = ++matchContextVersion;
   if (key !== matchKey) {
+    const submittedMatch = edit.pendingSubmit?.matchKey === matchKey;
+    if (submittedMatch) resetMatchEditor({ preservePendingSubmit: true });
     bumpContext();
     activeStorageKey = "";
   }
@@ -380,12 +653,16 @@ function attachMatch(key) {
   setDataState("workflow", "loading");
   setDataState("official", "idle");
   matchStops.push(subscribeAssignment(key, (value, metadata) => {
+    if (localMatchVersion !== matchContextVersion || key !== matchKey || viewState !== "operations") return;
     setSnapshotState("assignment", metadata);
     assignment = value;
-    attachOfficial();
+    attachOfficial(localMatchVersion);
     render();
-  }, (error) => handleMatchSubscriptionError(error, "assignment")));
+  }, (error) => {
+    if (localMatchVersion === matchContextVersion && key === matchKey) handleMatchSubscriptionError(error, "assignment");
+  }));
   matchStops.push(subscribeWorkflow(key, (value, metadata) => {
+    if (localMatchVersion !== matchContextVersion || key !== matchKey || viewState !== "operations") return;
     setSnapshotState("workflow", metadata);
     workflow = value;
     if (edit.token && (value?.lock?.token !== edit.token || value?.lock?.sessionId === undefined)) { edit.token = null; heartbeat?.stop(); if (edit.dirty) status("입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다."); }
@@ -394,7 +671,9 @@ function attachMatch(key) {
       edit.serverDraft = remote; edit.localDraft = remote; edit.savedRevision = remoteRevision;
     }
     render();
-  }, (error) => handleMatchSubscriptionError(error, "workflow")));
+  }, (error) => {
+    if (localMatchVersion === matchContextVersion && key === matchKey) handleMatchSubscriptionError(error, "workflow");
+  }));
 }
 function handleMatchSubscriptionError(error, key = "workflow") {
   setDataState(key, "error", error);
@@ -406,7 +685,7 @@ function handleMatchSubscriptionError(error, key = "workflow") {
   status(recorderReason(error));
   render();
 }
-function attachOfficial() {
+function attachOfficial(expectedMatchVersion = matchContextVersion) {
   if (!assignment?.matchId) {
     official = null;
     setDataState("official", "ready");
@@ -416,94 +695,180 @@ function attachOfficial() {
   setDataState("official", "loading");
   const ref = assignment.matchType === "final" ? doc(db,"tournaments",TOURNAMENT_ID,"divisions",assignment.divisionId,"finalMatches",assignment.matchId) : doc(db,"tournaments",TOURNAMENT_ID,"prelimMatches",assignment.matchId);
   officialStop = onSnapshot(ref, { includeMetadataChanges: true }, (snap) => {
+    if (expectedMatchVersion !== matchContextVersion || viewState !== "operations") return;
     setSnapshotState("official", snap.metadata);
     official = snap.exists() ? { id:snap.id,...snap.data() } : null;
     render();
   }, (error) => {
+    if (expectedMatchVersion !== matchContextVersion || viewState !== "operations") return;
     setDataState("official", "error", error);
     status(`공식 경기 데이터를 불러오지 못했습니다. ${recorderReason(error)}`);
     render();
   });
 }
-function subscribeCourtStreams() {
+function scheduleOfficialRef(item) {
+  const matchId = item?.matchId || item?.id || item?.matchKey;
+  if (!matchId) return null;
+  if (["final", "finals", "tournament"].includes(item.matchType) || ["final", "finals"].includes(item.phase)) {
+    const divisionId = item.divisionId || item.division;
+    if (!divisionId) return null;
+    return doc(db, "tournaments", TOURNAMENT_ID, "divisions", divisionId, "finalMatches", matchId);
+  }
+  return doc(db, "tournaments", TOURNAMENT_ID, "prelimMatches", matchId);
+}
+function subscribeScheduleOfficialDocs(items, expectedCourtVersion, expectedScheduleVersion) {
+  const expectedDetailVersion = ++scheduleDetailVersion;
+  scheduleMatchStops.forEach((fn) => fn());
+  scheduleMatchStops = [];
+  scheduleOfficial = new Map();
+  items.forEach((item) => {
+    const key = item?.matchKey || item?.id;
+    if (!key) return;
+    const ref = scheduleOfficialRef(item);
+    if (!ref) {
+      scheduleOfficial.set(key, null);
+      return;
+    }
+    scheduleMatchStops.push(onSnapshot(ref, { includeMetadataChanges: true }, (snap) => {
+      if (expectedCourtVersion !== courtContextVersion || expectedScheduleVersion !== scheduleContextVersion
+          || expectedDetailVersion !== scheduleDetailVersion || viewState !== "operations") return;
+      scheduleOfficial.set(key, snap.exists() ? { id: snap.id, ...snap.data() } : null);
+      renderCourtSchedule();
+    }, (error) => {
+      if (expectedCourtVersion !== courtContextVersion || expectedScheduleVersion !== scheduleContextVersion
+          || expectedDetailVersion !== scheduleDetailVersion) return;
+      scheduleState = "error";
+      setDataState("schedule", "error", error);
+      status(`코트 경기 목록을 불러오지 못했습니다. ${recorderReason(error)}`);
+      renderCourtSchedule();
+      renderDataState();
+    }));
+  });
+}
+function subscribeCourtSchedule(expectedCourtVersion) {
+  const expectedScheduleVersion = ++scheduleContextVersion;
+  setDataState("schedule", "loading");
+  scheduleState = "loading";
+  scheduleStops.push(subscribeCourtAssignments(courtId, (items, metadata) => {
+    if (expectedCourtVersion !== courtContextVersion || expectedScheduleVersion !== scheduleContextVersion
+        || viewState !== "operations") return;
+    courtAssignments = Array.isArray(items)
+      ? items.filter((item) => item?.courtId === courtId).map((item) => ({ ...item }))
+      : [];
+    setSnapshotState("schedule", metadata);
+    scheduleState = metadata?.fromCache ? "loading" : "ready";
+    subscribeScheduleOfficialDocs(courtAssignments, expectedCourtVersion, expectedScheduleVersion);
+    renderCourtSchedule();
+    renderDataState();
+  }, (error) => {
+    if (expectedCourtVersion !== courtContextVersion || expectedScheduleVersion !== scheduleContextVersion) return;
+    courtAssignments = [];
+    scheduleOfficial = new Map();
+    scheduleState = "error";
+    setDataState("schedule", "error", error);
+    status(`코트 경기 목록을 불러오지 못했습니다. ${recorderReason(error)}`);
+    renderCourtSchedule();
+    renderDataState();
+  }));
+}
+function subscribeCourtStreams(expectedCourtVersion = courtContextVersion) {
   setDataState("queue", "loading");
   setDataState("court", "loading");
   courtStops.push(onSnapshot(doc(db,"tournaments",TOURNAMENT_ID,"courtQueues",courtId), { includeMetadataChanges: true }, (snap) => {
+    if (expectedCourtVersion !== courtContextVersion || viewState !== "operations") return;
     setSnapshotState("queue", snap.metadata);
     queue = snap.exists() ? {id:snap.id,...snap.data()} : null;
     if (queue?.currentMatchKey && queue.currentMatchKey !== matchKey) {
       attachMatch(queue.currentMatchKey);
     } else if (!queue?.currentMatchKey && !edit.token && !edit.pendingSubmit) {
-      matchStops.forEach((fn) => fn());
-      matchStops = [];
-      officialStop();
-      officialStop = () => {};
-      setDataState("assignment", "idle");
-      setDataState("workflow", "idle");
-      setDataState("official", "idle");
-      matchKey = "";
-      assignment = workflow = official = null;
-      renderedFormKey = "";
-      ui.matchSummary.textContent = "현재 대기 중인 경기가 없습니다.";
-      ui.lockNotice.hidden = true;
-      ui.claimButton.hidden = true;
-      ui.scoreForm.hidden = true;
+      clearCurrentMatch();
     }
     render();
   }, (error) => {
+    if (expectedCourtVersion !== courtContextVersion) return;
+    queue = null;
     setDataState("queue", "error", error);
     status(`코트 대기열을 불러오지 못했습니다. ${recorderReason(error)}`);
     render();
   }));
   courtStops.push(subscribeCourt(courtId, (court, metadata) => {
+    if (expectedCourtVersion !== courtContextVersion || viewState !== "operations") return;
     setSnapshotState("court", metadata);
-    recorder = court?.recorderName?.trim() || "";
-    ui.courtMessage.textContent = recorder ? `${recorder} · ${displayCourt(court)}` : "기록관 배정이 없습니다.";
+    renderCourtSelectors();
     render();
   }, (error) => {
+    if (expectedCourtVersion !== courtContextVersion) return;
     setDataState("court", "error", error);
     status(`코트 정보를 불러오지 못했습니다. ${recorderReason(error)}`);
     render();
   }));
+  subscribeCourtSchedule(expectedCourtVersion);
 }
 function attachCourt(value) {
+  const nextCourtVersion = ++courtContextVersion;
+  viewState = recorderRouteState(viewState, value ? "enter" : "change", { canEnter: Boolean(value), blocked: false });
   courtStops.forEach((fn) => fn()); courtStops = [];
+  stopScheduleStreams();
   matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {};
+  matchContextVersion += 1;
   bumpContext();
   activeStorageKey = "";
-  courtId = value; matchKey = ""; assignment = workflow = official = null;
+  courtId = value || "";
+  if (value) pendingCourtId = value;
+  queue = null;
+  matchKey = ""; assignment = workflow = official = null;
   setDataState("queue", "idle");
   setDataState("court", "idle");
+  setDataState("schedule", "idle");
   setDataState("assignment", "idle");
   setDataState("workflow", "idle");
   setDataState("official", "idle");
-  ui.workflowPanel.hidden = !value;
-  if (!value) { renderDataState(); return; }
-  subscribeCourtStreams();
+  if (ui.workflowPanel) ui.workflowPanel.hidden = !value;
+  if (ui.successPanel) ui.successPanel.hidden = true;
+  renderCourtSelectors();
+  if (!value) {
+    clearCurrentMatch();
+    render();
+    return;
+  }
+  subscribeCourtStreams(nextCourtVersion);
   render();
 }
 function subscribeReadyCollections() {
+  const expectedReadyVersion = ++readyContextVersion;
   stop.forEach((fn) => fn()); stop = [];
   ["courts", "teams", "groups"].forEach((key) => setDataState(key, "loading"));
   stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"courts"), { includeMetadataChanges: true }, (snap) => {
+    if (expectedReadyVersion !== readyContextVersion || authState?.kind !== "ready") return;
     setSnapshotState("courts", snap.metadata);
     courts=snap.docs.map((item)=>({id:item.id,...item.data()}));
-    ui.courtSelect.replaceChildren(new Option("이름을 선택하세요",""),...courts.filter((court)=>court.recorderName).map((court)=>new Option(`${court.recorderName} (${displayCourt(court)})`,court.id)));
+    renderCourtSelectors();
     render();
-  }, (error) => { setDataState("courts", "error", error); status(`코트 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render(); }));
+  }, (error) => {
+    if (expectedReadyVersion !== readyContextVersion) return;
+    setDataState("courts", "error", error); status(`코트 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
+  }));
   stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"teams"), { includeMetadataChanges: true }, (snap) => {
+    if (expectedReadyVersion !== readyContextVersion || authState?.kind !== "ready") return;
     setSnapshotState("teams", snap.metadata);
     teams=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render();
-  }, (error) => { setDataState("teams", "error", error); status(`팀 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render(); }));
+  }, (error) => {
+    if (expectedReadyVersion !== readyContextVersion) return;
+    setDataState("teams", "error", error); status(`팀 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
+  }));
   stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"groups"), { includeMetadataChanges: true }, (snap) => {
+    if (expectedReadyVersion !== readyContextVersion || authState?.kind !== "ready") return;
     setSnapshotState("groups", snap.metadata);
     groups=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render();
-  }, (error) => { setDataState("groups", "error", error); status(`조 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render(); }));
+  }, (error) => {
+    if (expectedReadyVersion !== readyContextVersion) return;
+    setDataState("groups", "error", error); status(`조 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
+  }));
 }
 function startReady() {
   stopAll();
   subscribeReadyCollections();
-  if (courtId) {
+  if (courtId && viewState === "operations") {
     setDataState("assignment", "idle");
     setDataState("workflow", "idle");
     setDataState("official", "idle");
@@ -549,6 +914,23 @@ watchRecorderAuthState((state) => {
   if (state.kind === "ready" && !busy) setBusy(false);
   if (state.kind === "ready" && readyUid !== state.user.uid) {
     bumpContext();
+    if (readyUid && readyUid !== state.user.uid) {
+      resetMatchEditor();
+      edit.pendingSubmit = null;
+      edit.pendingEnd = null;
+      edit.pendingDiscard = null;
+      edit.dirty = false;
+      activeStorageKey = "";
+      viewState = "selection";
+      courtId = "";
+      pendingCourtId = "";
+      queue = null;
+      matchKey = "";
+      assignment = workflow = official = null;
+      courts = [];
+      teams = new Map();
+      groups = new Map();
+    }
     readyUid = state.user.uid;
     startReady();
   }
@@ -556,10 +938,27 @@ watchRecorderAuthState((state) => {
     bumpContext();
     stopAll();
     Object.keys(dataHealth).forEach((key) => setDataState(key, "idle"));
-    if (!state.user) clearStored();
+    if (!state.user) {
+      clearStored();
+      resetMatchEditor();
+      edit.pendingEnd = null;
+      edit.pendingDiscard = null;
+      edit.dirty = false;
+      activeStorageKey = "";
+    }
     edit.token=null;
+    viewState = "selection";
+    courtId = "";
+    pendingCourtId = "";
+    queue = null;
+    matchKey = "";
+    assignment = workflow = official = null;
+    courts = [];
+    teams = new Map();
+    groups = new Map();
     readyUid = null;
   }
+  render();
   if (authKindChanged && !edit.token) focus(state.kind === "ready" ? ui.courtPanel.querySelector("h2") : ui.authTitle);
 });
 window.addEventListener("online", () => { status("온라인"); heartbeat?.start(); heartbeat?.reconcile(); applyActionGate(); render(); });
@@ -584,7 +983,56 @@ ui.logoutButton.onclick=async()=>{
   clearStored();
   await logoutRecorder();
 };
-ui.courtSelect.onchange=()=>{recorder=courts.find((court)=>court.id===ui.courtSelect.value)?.recorderName?.trim()||"";attachCourt(ui.courtSelect.value);};
+ui.courtSelect.onchange=()=>{
+  if (selectorLocked()) {
+    renderCourtSelectors();
+    return;
+  }
+  pendingCourtId = ui.courtSelect.value || "";
+  recorder = "";
+  renderCourtSelectors({ resetRecorder: true });
+  render();
+  focus(ui.recorderSelect);
+};
+ui.recorderSelect.onchange=()=>{
+  if (selectorLocked()) {
+    renderCourtSelectors();
+    return;
+  }
+  const selection = reconcileRecorderSelections(courts, ui.courtSelect.value, ui.recorderSelect.value);
+  recorder = selection.recorder;
+  ui.recorderSelect.value = recorder;
+  renderCourtSelectors();
+  render();
+};
+if (ui.enterCourtButton) ui.enterCourtButton.onclick=()=>{
+  if (selectorLocked()) {
+    renderCourtSelectors();
+    return;
+  }
+  const selection = reconcileRecorderSelections(courts, ui.courtSelect?.value || pendingCourtId, ui.recorderSelect?.value || recorder);
+  if (!selection.courtId || !selection.recorder) {
+    action("코트와 담당 기록관 이름을 모두 선택한 뒤 들어가세요.");
+    return;
+  }
+  pendingCourtId = selection.courtId;
+  recorder = selection.recorder;
+  viewState = recorderRouteState(viewState, "enter", { canEnter: true });
+  attachCourt(selection.courtId);
+  focus(ui.courtScheduleHeading || ui.workflowTitle);
+};
+if (ui.changeCourtButton) ui.changeCourtButton.onclick=()=>{
+  const blocked = busy || Boolean(edit.token || edit.pendingSubmit || edit.pendingSave || edit.pendingEnd || edit.pendingDiscard || edit.dirty);
+  if (blocked) {
+    action("현재 경기 입력을 먼저 제출하거나 입력 종료/초안 폐기까지 마친 뒤 코트를 변경하세요. 저장하지 않은 점수는 버리지 않습니다.");
+    return;
+  }
+  pendingCourtId = courtId;
+  viewState = recorderRouteState(viewState, "change", { blocked: false });
+  attachCourt("");
+  action("코트와 담당 기록관 이름을 다시 선택하세요.");
+  focus(ui.courtSelect);
+};
 async function persistDraft(score, context = captureContext()) {
   if (!score || !contextIsCurrent(context) || !actionsReady() || !edit.token) return false;
   const attemptedDraft = draftCopy(score);
@@ -670,7 +1118,7 @@ async function persistDraft(score, context = captureContext()) {
   }
 }
 ui.claimButton.onclick=async()=>{
-  if(!matchKey||busy||!actionsReady())return;
+  if(!matchKey||busy||edit.pendingSubmit||!courtId||!recorder||!actionsReady())return;
   if (isStaleTerminalCurrent()) {
     reconcilingQueue = true;
     render();
@@ -782,12 +1230,15 @@ ui.useServerButton.onclick=()=>{
 ui.retryDataButton.onclick=()=>{
   if (busy || !readyUid) return;
   subscribeReadyCollections();
-  if (courtId) {
+  if (courtId && viewState === "operations") {
+    courtContextVersion += 1;
+    stopScheduleStreams();
     courtStops.forEach((fn) => fn());
     courtStops = [];
-    subscribeCourtStreams();
+    queue = null;
+    subscribeCourtStreams(courtContextVersion);
   }
-  if (matchKey) attachMatch(matchKey);
+  if (matchKey && viewState === "operations") attachMatch(matchKey);
   render();
 };
 ui.reviewButton.onclick=()=>{
@@ -798,15 +1249,90 @@ ui.reviewButton.onclick=()=>{
   edit.reviewedPayload=Object.freeze(JSON.parse(JSON.stringify(check.score)));
   const court = courts.find((item) => item.id === courtId);
   const view = courtMatchSummary(assignment, official, { teamsById: teams, groupsById: groups });
-  ui.confirmScore.textContent=`${recorder} · ${displayCourt(court)} · ${view.label || matchKey} · ${name("a")} ${edit.reviewedPayload.sets.map((set)=>`${set.a}:${set.b}`).join(", ")} ${name("b")}`;
+  const confirmation = buildRecorderConfirmationModel({
+    court: displayCourt(court),
+    recorder,
+    matchLabel: view.label || matchKey,
+    teamA: name("a"),
+    teamB: name("b"),
+    score: edit.reviewedPayload,
+    outcome: confirmationOutcome(edit.reviewedPayload),
+  });
+  renderConfirmation(confirmation);
   render();
   focus(ui.confirmTitle);
 };
-ui.backToEditButton.onclick=()=>{edit.reviewedPayload=null;render();focus(ui.scoreFields.querySelector("input"));};
-ui.submitButton.onclick=async()=>{if((!edit.reviewedPayload&&!edit.pendingSubmit)||!actionsReady())return;edit.pendingSubmit ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,score:edit.reviewedPayload,final:isFinal(),operationId:operationId()};setBusy(true);try{await submitRecorderDraft(edit.pendingSubmit);edit.pendingSubmit=null;const cleared=clearStored();edit.dirty=false;edit.token=null;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();heartbeat?.stop();ui.confirmPanel.hidden=true;ui.successPanel.hidden=false;action(cleared?"제출 완료":"제출 완료 · 임시 저장 정리에 실패했습니다.");focus(ui.successTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingSubmit=null;ui.scoreError.textContent=recorderReason(error);status(ambiguous?`${recorderReason(error)} 같은 제출 요청으로 결과를 다시 확인하세요.`:`${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`);}finally{setBusy(false);fenceAmbiguousOperation();}};
-ui.endButton.onclick=async()=>{if(!actionsReady())return;edit.pendingEnd ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:false,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingEnd);edit.pendingEnd=null;edit.token=null;edit.reviewedPayload=null;heartbeat?.stop();status("입력을 종료했습니다. 초안은 보관됩니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingEnd=null;status(ambiguous?`${recorderReason(error)} 같은 종료 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
+ui.backToEditButton.onclick=()=>{edit.reviewedPayload=null;clearConfirmation();render();focus(ui.scoreFields.querySelector("input"));};
+ui.submitButton.onclick=async()=>{
+  if ((!edit.reviewedPayload && !edit.pendingSubmit) || !actionsReady()) return;
+  const submittedMatchKey = matchKey;
+  const submittedCourtId = courtId;
+  let pending = edit.pendingSubmit;
+  if (!pending) {
+    pending = buildRecorderSubmitContext({
+      matchKey: submittedMatchKey,
+      courtId: submittedCourtId,
+      token: edit.token,
+      queueRevision: queue?.queueRevision,
+      score: edit.reviewedPayload,
+      final: isFinal(),
+      operationId: operationId(),
+      storageKey: storageKeyForEdit(),
+    });
+    if (!pending) return;
+    edit.pendingSubmit = pending;
+  }
+  setBusy(true);
+  try {
+    await submitRecorderDraft(pending);
+    if (edit.pendingSubmit !== pending) return;
+    const completion = reconcileRecorderSubmit({
+      pendingSubmit: pending,
+      currentMatchKey: matchKey,
+      outcome: "success",
+    });
+    edit.pendingSubmit = completion.pendingSubmit;
+    const cleared = clearStoredKey(completion.clearStorageKey);
+    if (completion.resetCurrent) {
+      resetMatchEditor();
+      if (!queue?.currentMatchKey) clearCurrentMatch();
+    } else {
+      edit.token = null;
+      edit.dirty = false;
+      edit.localDraft = null;
+      edit.serverDraft = null;
+      edit.touched.clear();
+      renderedFormKey = "";
+      edit.reviewedPayload = null;
+      clearConfirmation();
+      heartbeat?.stop();
+      heartbeat = null;
+    }
+    ui.successPanel.hidden = false;
+    action(cleared ? "제출 완료" : "제출 완료 · 임시 저장 정리에 실패했습니다.");
+    focus(ui.successTitle);
+  } catch(error) {
+    const ambiguous = ambiguousNetworkResult(error);
+    if (!ambiguous && edit.pendingSubmit === pending) {
+      edit.pendingSubmit = null;
+      if (pending.matchKey !== matchKey) {
+        edit.reviewedPayload = null;
+        clearConfirmation();
+      }
+    }
+    ui.scoreError.textContent = recorderReason(error);
+    const submitStatus = ambiguous
+      ? "제출 여부를 확인하지 못했습니다. ‘점수 제출’을 다시 눌러 확인하세요."
+      : `${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`;
+    if (ambiguous && ui.confirmOutcome) ui.confirmOutcome.textContent = `제출 상태: ${submitStatus}`;
+    status(submitStatus);
+  } finally {
+    setBusy(false);
+    fenceAmbiguousOperation();
+    render();
+  }
+};
+ui.endButton.onclick=async()=>{if(!actionsReady())return;edit.pendingEnd ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:false,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingEnd);edit.pendingEnd=null;edit.token=null;edit.reviewedPayload=null;clearConfirmation();heartbeat?.stop();status("입력을 종료했습니다. 초안은 보관됩니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingEnd=null;status(ambiguous?`${recorderReason(error)} 같은 종료 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
 ui.discardButton.onclick=()=>{ui.discardMessage.textContent=`${name("a")} 대 ${name("b")} 경기의 저장 초안을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`;ui.discardPanel.hidden=false;focus(ui.keepDraftButton);};
 ui.keepDraftButton.onclick=()=>{ui.discardPanel.hidden=true;focus(ui.scoreFields.querySelector("input"));};
-ui.confirmDiscardButton.onclick=async()=>{if(!actionsReady())return;edit.pendingDiscard ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:true,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingDiscard);edit.pendingDiscard=null;const cleared=clearStored();edit.token=null;edit.dirty=false;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();renderedFormKey="";ui.scoreFields.replaceChildren(ui.scoreLegend);heartbeat?.stop();ui.discardPanel.hidden=true;status(cleared?"초안을 폐기했습니다.":"초안을 폐기했지만 임시 저장 정리에 실패했습니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingDiscard=null;status(ambiguous?`${recorderReason(error)} 같은 폐기 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};
-ui.nextSameButton.onclick=()=>{ui.successPanel.hidden=true;attachCourt(courtId);};
-ui.switchRecorderButton.onclick=()=>{ui.successPanel.hidden=true;attachCourt("");ui.courtSelect.value="";focus(ui.courtSelect);};
+ui.confirmDiscardButton.onclick=async()=>{if(!actionsReady())return;edit.pendingDiscard ||= {matchKey,courtId,token:edit.token,queueRevision:queue?.queueRevision,discardDraft:true,operationId:operationId()};setBusy(true);try{await cancelRecorderDraft(edit.pendingDiscard);edit.pendingDiscard=null;const cleared=clearStored();edit.token=null;edit.dirty=false;edit.reviewedPayload=null;edit.localDraft=null;edit.serverDraft=null;edit.touched.clear();renderedFormKey="";clearConfirmation();ui.scoreFields.replaceChildren(ui.scoreLegend);heartbeat?.stop();ui.discardPanel.hidden=true;status(cleared?"초안을 폐기했습니다.":"초안을 폐기했지만 임시 저장 정리에 실패했습니다.");focus(ui.workflowTitle);}catch(error){const ambiguous=ambiguousNetworkResult(error);if(!ambiguous)edit.pendingDiscard=null;status(ambiguous?`${recorderReason(error)} 같은 폐기 요청으로 결과를 다시 확인하세요.`:recorderReason(error));}finally{setBusy(false);fenceAmbiguousOperation();render();}};

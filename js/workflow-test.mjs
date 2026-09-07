@@ -12,12 +12,19 @@ import {
   selectQueueView,
 } from './score-workflow.js';
 import {
+  buildRecorderCourtSchedule,
+  buildRecorderConfirmationModel,
+  buildRecorderSubmitContext,
   parseStoredRecorderDraft,
+  reconcileRecorderSelections,
+  reconcileRecorderSubmit,
   readStoredRecorderDraft,
   recorderDataState,
+  recorderRouteState,
   reconcileRecorderSnapshot,
   recorderDraftsEqual,
   resolveRecorderConflict,
+  sortRecorderCourts,
 } from './recorder-state.js';
 
 const assignments = () => ({
@@ -37,6 +44,149 @@ const queue = (changes = {}) => ({
   queueRevision: 7, currentMatchKey: 'M2', nextMatchKey: 'M3', normalCursorMatchKey: 'M2',
   priorityEntries: [], nextPrioritySequence: 0, ...changes,
 });
+
+// Recorder selectors stay explicit: a court change or reassignment never
+// carries an old recorder name into a new authoritative court assignment.
+{
+  const courts = [
+    { id: 'court-a', name: 'A', recorderName: '민서' },
+    { id: 'court-b', name: 'B', recorderName: '' },
+  ];
+  const selected = reconcileRecorderSelections(courts, 'court-a', '민서');
+  assert.equal(selected.courtId, 'court-a');
+  assert.deepEqual(selected.availableNames, ['민서']);
+  assert.equal(selected.recorder, '민서');
+  assert.equal(reconcileRecorderSelections(courts, 'court-a', '').recorder, '');
+  assert.deepEqual(
+    reconcileRecorderSelections(courts.map((court) => (
+      court.id === 'court-a' ? { ...court, recorderName: '지우' } : court
+    )), 'court-a', '민서'),
+    {
+      court: { id: 'court-a', name: 'A', recorderName: '지우' },
+      courtId: 'court-a',
+      availableNames: ['지우'],
+      recorder: '',
+    },
+  );
+  assert.equal(reconcileRecorderSelections(courts, 'court-b', '민서').recorder, '');
+  assert.equal(reconcileRecorderSelections(courts, 'missing', '민서').courtId, '');
+}
+
+// Court choices use configured numeric order, then Korean/natural name and ID
+// order. Missing order values are not coerced to zero, and the subscription
+// array remains untouched.
+{
+  const courts = [
+    { id: 'court10', name: '10', order: null },
+    { id: 'court2', name: '2', order: null },
+    { id: 'court-ordered-2', name: '가', order: 2 },
+    { id: 'court-ordered-1', name: '나', order: 1 },
+  ];
+  const before = courts.map((court) => ({ ...court }));
+  assert.deepEqual(sortRecorderCourts(courts).map((court) => court.id), [
+    'court-ordered-1', 'court-ordered-2', 'court2', 'court10',
+  ]);
+  assert.deepEqual(courts, before);
+  assert.deepEqual(sortRecorderCourts([
+    { id: 'z10', name: '코트 10' },
+    { id: 'z2', name: '코트 2' },
+  ]).map((court) => court.id), ['z2', 'z10']);
+}
+
+// The ordered schedule follows courtOrder while queue current/next markers
+// remain authoritative when a priority replay is placed later in that list.
+{
+  const scheduleAssignments = [
+    { id: 'normal-1', matchKey: 'normal-1', courtOrder: 1, matchType: 'prelim', publicStatus: 'scheduled' },
+    { id: 'normal-2', matchKey: 'normal-2', courtOrder: 2, matchType: 'prelim', publicStatus: 'scheduled' },
+    { id: 'replay-1', matchKey: 'replay-1', courtOrder: 3, matchType: 'prelim', publicStatus: 'replay_required' },
+    { id: 'missing-order', matchKey: 'missing-order', courtOrder: null, matchType: 'prelim', publicStatus: 'scheduled' },
+  ];
+  const schedule = buildRecorderCourtSchedule({
+    assignments: scheduleAssignments,
+    queue: { currentMatchKey: 'replay-1', nextMatchKey: 'normal-1' },
+    officialMatches: new Map([
+      ['normal-1', { groupId: 'g1', teamA: 't1', teamB: 'missing-team', round: 1, status: 'done', officialCurrent: true, sets: [{ a: 10, b: 8 }], result: 'A' }],
+      ['normal-2', { groupId: 'g1', teamA: 't2', teamB: 't3', round: 2, status: 'done', officialCurrent: false, sets: [{ a: 10, b: 8 }], result: 'A' }],
+    ]),
+    teamsById: new Map([['t1', { id: 't1', name: '팀 하나' }]]),
+    groupsById: new Map([['g1', { id: 'g1', name: '한라' }]]),
+  });
+  assert.deepEqual(schedule.map((item) => item.matchKey), ['normal-1', 'normal-2', 'replay-1', 'missing-order']);
+  assert.equal(schedule.find((item) => item.matchKey === 'replay-1').status, 'current');
+  assert.equal(schedule.find((item) => item.matchKey === 'normal-1').status, 'next');
+  assert.equal(schedule.find((item) => item.matchKey === 'normal-2').score, null);
+  assert.equal(schedule.find((item) => item.matchKey === 'normal-2').baseStatus, 'waiting');
+  assert.match(schedule.find((item) => item.matchKey === 'normal-1').matchup, /대진 미정/);
+  assert.doesNotMatch(schedule.find((item) => item.matchKey === 'normal-1').matchup, /missing-team/);
+  assert.equal(recorderRouteState('selection', 'enter', { canEnter: false }), 'selection');
+  assert.equal(recorderRouteState('selection', 'enter', { canEnter: true }), 'operations');
+  assert.equal(recorderRouteState('operations', 'change', { blocked: true }), 'operations');
+  assert.equal(recorderRouteState('operations', 'change', { blocked: false }), 'selection');
+}
+
+// A submit request keeps its original operation and storage context while a
+// queue snapshot advances (or briefly reports no current match).
+{
+  const pending = buildRecorderSubmitContext({
+    matchKey: 'M1',
+    courtId: 'court-a',
+    token: 'token-1',
+    queueRevision: 7,
+    score: { sets: [{ a: 10, b: 8 }, { a: 10, b: 9 }] },
+    operationId: 'operation-1',
+    storageKey: 'recorder-score:tournament:M1:uid',
+  });
+  const retained = reconcileRecorderSubmit({
+    pendingSubmit: pending,
+    currentMatchKey: 'M2',
+    outcome: 'pending',
+  });
+  assert.equal(retained.status, 'pending');
+  assert.equal(retained.pendingSubmit, pending);
+  assert.equal(pending.operationId, 'operation-1');
+  const completed = reconcileRecorderSubmit({
+    pendingSubmit: pending,
+    currentMatchKey: 'M2',
+    outcome: 'success',
+  });
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.resetCurrent, false);
+  assert.equal(completed.clearStorageKey, 'recorder-score:tournament:M1:uid');
+  assert.equal(completed.pendingSubmit, null);
+}
+
+// Confirmation data preserves a draw, a deciding third set, and long names as
+// separate text fields/rows instead of flattening scores into one string.
+{
+  const draw = buildRecorderConfirmationModel({
+    court: 'A코트',
+    recorder: '민서',
+    matchLabel: '청춘조 예선 · 1경기',
+    teamA: '아주 긴 팀 이름 A',
+    teamB: '아주 긴 팀 이름 B',
+    score: { sets: [{ a: 10, b: 8 }, { a: 8, b: 10 }] },
+    outcome: '무승부',
+  });
+  assert.equal(draw.outcome, '무승부');
+  assert.deepEqual(draw.sets, [
+    { label: '1세트', a: 10, b: 8 },
+    { label: '2세트', a: 8, b: 10 },
+  ]);
+  assert.equal(draw.teamA, '아주 긴 팀 이름 A');
+  assert.equal(draw.teamB, '아주 긴 팀 이름 B');
+  const final = buildRecorderConfirmationModel({
+    court: '본선코트',
+    recorder: '지우',
+    matchLabel: '준결승 1경기',
+    teamA: '팀 A',
+    teamB: '팀 B',
+    score: { sets: [{ a: 10, b: 8 }, { a: 8, b: 10 }, { a: 7, b: 5 }] },
+    outcome: '팀 A 승리',
+  });
+  assert.equal(final.sets.length, 3);
+  assert.deepEqual(final.sets[2], { label: '3세트', a: 7, b: 5 });
+}
 
 // Recorder save recovery: a lost response is confirmed only by a newer matching
 // authoritative snapshot, while a different server draft never replaces local work.
