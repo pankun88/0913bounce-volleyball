@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
 import {
   getSetWinner,
   evaluatePrelimMatch,
@@ -1287,6 +1289,230 @@ check('getRingEdgeLabelPositions -> 변의 중점보다 중심에서 더 먼 위
   });
 })());
 check('getRingEdgeLabelPositions(0) -> 빈 배열', getRingEdgeLabelPositions(0, 260, 38).length === 0);
+
+// ---- dashboard venue rotation ----
+function createDashboardHarness(search = '?display=venue') {
+  const source = fs.readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8')
+    .replace(/^import[\s\S]*?;\s*/gm, '');
+  let now = 0;
+  let nextTimerId = 1;
+  const intervals = new Map();
+  const listeners = new Map();
+  const subscriptions = {};
+
+  function element(id, extra = {}) {
+    const classes = new Set();
+    const classList = {
+      add: (...names) => names.forEach((name) => classes.add(name)),
+      remove: (...names) => names.forEach((name) => classes.delete(name)),
+      toggle: (name, force) => {
+        const next = force === undefined ? !classes.has(name) : Boolean(force);
+        if (next) classes.add(name);
+        else classes.delete(name);
+        return next;
+      },
+      contains: (name) => classes.has(name),
+    };
+    return {
+      id,
+      classList,
+      dataset: {},
+      style: {},
+      hidden: false,
+      disabled: false,
+      textContent: '',
+      innerHTML: '',
+      offsetWidth: 0,
+      eventHandlers: {},
+      setAttribute(name, value) { this[name] = String(value); },
+      addEventListener(name, handler) {
+        (this.eventHandlers[name] ||= []).push(handler);
+      },
+      click() {
+        (this.eventHandlers.click || []).forEach((handler) => handler({ currentTarget: this }));
+      },
+      querySelectorAll() { return []; },
+      appendChild(child) { this.lastChild = child; return child; },
+      append(...children) { this.lastChildren = children; },
+      replaceChildren(...children) { this.lastChildren = children; this.innerHTML = ''; },
+      after(child) { this.afterChild = child; },
+      ...extra,
+    };
+  }
+
+  const elements = Object.fromEntries([
+    'dashboardShell', 'dashTitle', 'dashDivisionBadge', 'dashPrelim', 'dashBracketCard',
+    'dashBracketTitle', 'dashBracketContainer', 'dashBracketFullscreenBtn',
+    'dashDivisionSwitch', 'maintenanceNotice', 'dashboardLiveContent', 'venueStatusHome',
+    'venueSwitcher', 'venueCurrentDivision', 'venueNextDivision', 'venueCountdown',
+    'venueProgressTrack', 'venueProgressBar', 'errorBanner',
+  ].map((id) => [id, element(id)]));
+  const divisionButtons = ['men', 'women'].map((division) => element(`division-${division}`, { dataset: { division } }));
+  const tabButtons = ['prelim', 'final'].map((tab) => element(`tab-button-${tab}`, { dataset: { tab } }));
+  const tabPanels = ['prelim', 'final'].map((tab) => element(`tab-${tab}`, { id: `tab-${tab}` }));
+  elements.dashDivisionSwitch.querySelectorAll = () => divisionButtons;
+  elements.dashBracketFullscreenBtn.requestFullscreen = null;
+  elements.dashBracketCard.requestFullscreen = null;
+  const liveDot = element('live-dot');
+  const body = element('body');
+  const documentElement = element('documentElement');
+  const document = {
+    body,
+    documentElement,
+    visibilityState: 'visible',
+    getElementById(id) {
+      return elements[id] ||= element(id);
+    },
+    querySelectorAll(selector) {
+      if (selector === '.tab-btn') return tabButtons;
+      if (selector === '.tab-panel') return tabPanels;
+      if (selector === '#dashDivisionSwitch [data-division]') return divisionButtons;
+      return [];
+    },
+    querySelector(selector) {
+      return selector === '.live-dot' ? liveDot : null;
+    },
+    addEventListener(name, handler) {
+      (listeners.get(name) || (listeners.set(name, []), listeners.get(name))).push(handler);
+    },
+    dispatchEvent(event) {
+      (listeners.get(event.type) || []).forEach((handler) => handler(event));
+    },
+  };
+  const window = {
+    location: { search, pathname: '/dashboard.html' },
+    performance: { now: () => now },
+    setInterval(handler, delay) {
+      const id = nextTimerId++;
+      intervals.set(id, { handler, delay });
+      return id;
+    },
+    clearInterval(id) { intervals.delete(id); },
+    setTimeout,
+    clearTimeout,
+    addEventListener(name, handler) {
+      (listeners.get(`window:${name}`) || (listeners.set(`window:${name}`, []), listeners.get(`window:${name}`))).push(handler);
+    },
+    dispatchEvent(event) {
+      (listeners.get(`window:${event.type}`) || []).forEach((handler) => handler(event));
+    },
+  };
+  const context = {
+    window,
+    document,
+    subscriptions,
+    divisionButtons,
+    history: { replaceState() {} },
+    URLSearchParams,
+    setTimeout,
+    clearTimeout,
+    console,
+    subscribeTournamentInfo: (cb) => { subscriptions.tournament = cb; },
+    subscribeGroups: () => {},
+    subscribeTeams: () => {},
+    subscribePrelimMatches: () => {},
+    subscribeFinalMatches: () => {},
+    evaluatePrelimMatch: () => ({ result: null, status: 'pending' }),
+    computeGroupStandings: () => [],
+    publicMatchView: (match) => match,
+    renderBracket: () => {},
+    displayTeamName: (name) => name,
+    normalizeRingOrder: () => [],
+    renderRingDiagram: () => {},
+  };
+  Object.assign(window, context);
+  const bridge = `
+    globalThis.__dashboardTest = {
+      snapshot(info) {
+        subscriptions.tournament(info, { fromCache: false, hasPendingWrites: false });
+      },
+      clickDivision(division) {
+        divisionButtons.find((button) => button.dataset.division === division).click();
+      },
+      visibility(state) {
+        document.visibilityState = state;
+        document.dispatchEvent({ type: 'visibilitychange' });
+      },
+      state() {
+        return {
+          activeDivision,
+          venueConfigKey,
+          venueAutoStartedAt,
+          venueAutoIntervalMs,
+          timerCount: venueTimer === null ? 0 : 1,
+          maintenanceActive,
+          venueHidden: document.getElementById('venueSwitcher').hidden,
+          progressHidden: document.getElementById('venueProgressTrack').hidden,
+          current: document.getElementById('venueCurrentDivision').textContent,
+          next: document.getElementById('venueNextDivision').textContent,
+          countdown: document.getElementById('venueCountdown').textContent,
+          progress: document.getElementById('venueProgressBar').style.transform,
+        };
+      },
+    };
+  `;
+  vm.runInNewContext(`${source}\n${bridge}`, context, { filename: 'dashboard.js' });
+  return {
+    state: () => context.__dashboardTest.state(),
+    snapshot: (info) => context.__dashboardTest.snapshot(info),
+    clickDivision: (division) => context.__dashboardTest.clickDivision(division),
+    visibility: (state) => context.__dashboardTest.visibility(state),
+    advance(ms) {
+      now += ms;
+      intervals.forEach(({ handler }) => handler());
+    },
+    timerCount: () => intervals.size,
+  };
+}
+
+const venue = createDashboardHarness();
+let venueState = venue.state();
+check('venue auto starts without cycleStartedAt or server clock', venueState.activeDivision === 'men' && venueState.timerCount === 1 && venueState.countdown === '15초 후 전환');
+venue.advance(14999);
+venueState = venue.state();
+check('15-second boundary keeps the starting division until the interval ends', venueState.activeDivision === 'men' && venueState.countdown === '1초 후 전환');
+venue.advance(1);
+venueState = venue.state();
+check('15-second boundary switches to the next division', venueState.activeDivision === 'women' && venueState.countdown === '15초 후 전환');
+const venueStart = venueState.venueAutoStartedAt;
+venue.snapshot({ venueDisplay: { mode: 'auto', intervalSeconds: 15, cycleStartedAt: 1 } });
+check('repeated snapshots do not restart monotonic rotation', venue.state().venueAutoStartedAt === venueStart);
+check('auto mode exposes progress and current/next labels', !venue.state().progressHidden && venue.state().next === '다음: 남자부' && venue.state().progress.includes('scaleX'));
+const intervalVenue = createDashboardHarness();
+intervalVenue.advance(5000);
+const intervalStart = intervalVenue.state().venueAutoStartedAt;
+intervalVenue.snapshot({ venueDisplay: { mode: 'auto', intervalSeconds: 20 } });
+check('changing the auto interval deliberately restarts the current division', intervalVenue.state().venueAutoStartedAt > intervalStart && intervalVenue.state().countdown === '20초 후 전환');
+venue.snapshot({ venueDisplay: { mode: 'women', intervalSeconds: 15 } });
+venueState = venue.state();
+check('pinned mode stops rotation and hides progress', venueState.activeDivision === 'women' && venueState.timerCount === 0 && venueState.progressHidden);
+venue.visibility('hidden');
+venue.visibility('visible');
+check('pinned mode keeps progress hidden across visibility changes', venue.state().progressHidden && venue.timerCount() === 0);
+venue.snapshot({ venueDisplay: { mode: 'auto', intervalSeconds: 15 } });
+venueState = venue.state();
+check('pinned to auto starts the pinned division for a full interval', venueState.activeDivision === 'women' && venueState.countdown === '15초 후 전환' && venueState.timerCount === 1);
+venue.advance(14999);
+check('pinned to auto retains its starting division through the interval', venue.state().activeDivision === 'women');
+venue.visibility('hidden');
+const hiddenStart = venue.state().venueAutoStartedAt;
+check('hidden venue screen has no dangling timer', venue.timerCount() === 0 && hiddenStart !== null);
+venue.advance(15000);
+check('hidden venue screen does not render stale timer callbacks', venue.state().activeDivision === 'women');
+venue.visibility('visible');
+check('visible resume catches up from monotonic elapsed', venue.state().activeDivision === 'men' && venue.timerCount() === 1);
+venue.snapshot({ maintenance: { enabled: true }, venueDisplay: { mode: 'auto', intervalSeconds: 15 } });
+venueState = venue.state();
+check('maintenance pauses and hides venue rotation', venueState.maintenanceActive && venueState.timerCount === 0 && venueState.venueHidden);
+venue.advance(15000);
+venue.snapshot({ maintenance: { enabled: false }, venueDisplay: { mode: 'auto', intervalSeconds: 15 } });
+venueState = venue.state();
+check('maintenance resume restores auto progress', !venueState.maintenanceActive && venueState.timerCount === 1 && !venueState.venueHidden);
+
+const viewer = createDashboardHarness('');
+viewer.clickDivision('women');
+const viewerState = viewer.state();
+check('normal dashboard keeps manual division controls and no venue timer', viewerState.activeDivision === 'women' && viewerState.timerCount === 0 && viewerState.venueHidden);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

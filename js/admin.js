@@ -2214,10 +2214,7 @@ function bindStaticHandlers() {
     const mode = document.getElementById("venueDisplayMode").value;
     const intervalSeconds = Number(document.getElementById("venueDisplayInterval").value);
     try {
-      const clock = await adminWorkflowCallable("getServerClock", {});
-      const cycleStartedAt = Number(clock?.serverTimeMs);
-      if (!Number.isFinite(cycleStartedAt)) throw new Error("서버 기준 시간을 확인할 수 없습니다.");
-      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds, cycleStartedAt } });
+      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds } });
       showToast("경기장 송출 설정을 저장했습니다");
     } catch (err) {
       reportError("경기장 송출 설정 저장", err);

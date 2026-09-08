@@ -1,6 +1,6 @@
 import {
   subscribeTournamentInfo, subscribeGroups, subscribeTeams,
-  subscribePrelimMatches, subscribeFinalMatches, getServerClockOffset,
+  subscribePrelimMatches, subscribeFinalMatches,
 } from "./firestore-service.js";
 import { evaluatePrelimMatch, computeGroupStandings } from "./match-logic.js";
 import { publicMatchView } from "./bracket.js";
@@ -25,9 +25,9 @@ let venueTimer = null;
 let venueConfigKey = "";
 let venueDisplayLocked = isVenueMode;
 let maintenanceActive = false;
-let venueServerTimeOffsetMs = null;
-let venueClockRequest = null;
-let venueClockRetry = null;
+let venueAutoStartedAt = null;
+let venueAutoIntervalMs = null;
+let venueAutoStartDivision = null;
 const FEED_IDS = ["tournament", "groups", "teams", "prelim", "men-final", "women-final"];
 const feedHealth = Object.fromEntries(FEED_IDS.map((id) => [id, { state: "pending", message: "" }]));
 const feedIdByLabel = {
@@ -53,12 +53,12 @@ activateTab(activeTab, false);
 document.body.classList.toggle("venue-mode", venueDisplayLocked);
 applyVenueDisplaySettings();
 document.addEventListener("visibilitychange", () => {
-  if (!isVenueMode || document.visibilityState !== "visible") return;
-  stopVenueTimer();
-  renderUnsyncedVenueStatus();
-  venueServerTimeOffsetMs = null;
-  venueConfigKey = "";
-  ensureVenueServerClock();
+  if (!isVenueMode) return;
+  if (document.visibilityState === "visible") {
+    resumeVenueAuto();
+  } else {
+    stopVenueTimer();
+  }
 });
 
 subscribeTournamentInfo((info, metadata) => {
@@ -220,9 +220,7 @@ function applyVenueDisplaySettings() {
 
   const mode = ["auto", "men", "women"].includes(config.mode) ? config.mode : "auto";
   const intervalSeconds = [10, 15, 20, 30].includes(Number(config.intervalSeconds)) ? Number(config.intervalSeconds) : 15;
-  const cycleStartedAt = timestampMillis(config.cycleStartedAt);
-  const serverTimeOffsetMs = venueServerTimeOffsetMs;
-  const key = `${mode}:${intervalSeconds}:${cycleStartedAt}:${serverTimeOffsetMs}`;
+  const key = `${mode}:${intervalSeconds}`;
   if (key === venueConfigKey) return;
   venueConfigKey = key;
   stopVenueTimer();
@@ -231,53 +229,35 @@ function applyVenueDisplaySettings() {
   status.hidden = false;
   status.classList.toggle("is-pinned", mode !== "auto");
   if (mode === "men" || mode === "women") {
+    venueAutoStartedAt = null;
+    venueAutoIntervalMs = null;
+    venueAutoStartDivision = null;
     setActiveDivision(mode);
     renderPinnedVenueStatus(mode);
     return;
   }
-  if (!Number.isFinite(cycleStartedAt) || !Number.isFinite(serverTimeOffsetMs)) {
-    renderUnsyncedVenueStatus();
-    ensureVenueServerClock();
-    return;
-  }
 
-  const sync = () => syncVenueCycle(intervalSeconds, cycleStartedAt, serverTimeOffsetMs);
-  sync();
-  venueTimer = window.setInterval(sync, 250);
+  document.getElementById("venueProgressTrack").hidden = false;
+  const current = DIVISIONS.includes(activeDivision) ? activeDivision : DIVISIONS[0];
+  venueAutoStartDivision = current;
+  venueAutoIntervalMs = intervalSeconds * 1000;
+  venueAutoStartedAt = venueNow();
+  resumeVenueAuto();
 }
 
-function ensureVenueServerClock() {
-  if (!isVenueMode || maintenanceActive || venueClockRequest || Number.isFinite(venueServerTimeOffsetMs)) return;
-  if (venueClockRetry) {
-    window.clearTimeout(venueClockRetry);
-    venueClockRetry = null;
-  }
-  venueClockRequest = getServerClockOffset()
-    .then((offset) => {
-      venueServerTimeOffsetMs = offset;
-      venueConfigKey = "";
-      applyVenueDisplaySettings();
-    })
-    .catch(() => {
-      venueServerTimeOffsetMs = null;
-      stopVenueTimer();
-      renderUnsyncedVenueStatus();
-      venueClockRetry = window.setTimeout(() => {
-        venueClockRetry = null;
-        ensureVenueServerClock();
-      }, 5000);
-    })
-    .finally(() => {
-      venueClockRequest = null;
-    });
+function venueNow() {
+  return window.performance.now();
 }
 
-function syncVenueCycle(intervalSeconds, cycleStartedAt, serverTimeOffsetMs) {
-  const intervalMs = intervalSeconds * 1000;
-  const elapsed = Math.max(0, (Date.now() + serverTimeOffsetMs) - cycleStartedAt);
+function syncVenueCycle(now = venueNow()) {
+  if (!Number.isFinite(now) || !Number.isFinite(venueAutoStartedAt)
+      || !Number.isFinite(venueAutoIntervalMs) || venueAutoIntervalMs <= 0) return;
+  const elapsed = Math.max(0, now - venueAutoStartedAt);
+  const intervalMs = venueAutoIntervalMs;
   const slot = Math.floor(elapsed / intervalMs);
   const elapsedInSlot = elapsed % intervalMs;
-  const current = slot % 2 === 0 ? "men" : "women";
+  const initialIndex = DIVISIONS.indexOf(venueAutoStartDivision);
+  const current = DIVISIONS[(initialIndex + slot) % DIVISIONS.length] || DIVISIONS[0];
   const next = current === "men" ? "women" : "men";
   if (current !== activeDivision) setActiveDivision(current);
 
@@ -293,6 +273,14 @@ function syncVenueCycle(intervalSeconds, cycleStartedAt, serverTimeOffsetMs) {
   document.getElementById("venueProgressBar").style.transform = `scaleX(${remainingPercent / 100})`;
 }
 
+function resumeVenueAuto() {
+  if (!isVenueMode || maintenanceActive || document.visibilityState === "hidden") return;
+  if (!Number.isFinite(venueAutoStartedAt) || !Number.isFinite(venueAutoIntervalMs)) return;
+  syncVenueCycle();
+  if (venueTimer !== null) return;
+  venueTimer = window.setInterval(() => syncVenueCycle(), 250);
+}
+
 function renderPinnedVenueStatus(division) {
   document.getElementById("venueCurrentDivision").textContent = `${DIVISION_LABELS[division]} · 고정 송출 중`;
   document.getElementById("venueNextDivision").textContent = "";
@@ -300,26 +288,9 @@ function renderPinnedVenueStatus(division) {
   document.getElementById("venueProgressTrack").hidden = true;
 }
 
-function renderUnsyncedVenueStatus() {
-  document.getElementById("venueCurrentDivision").textContent = "송출 동기화 대기";
-  document.getElementById("venueNextDivision").textContent = "서버 기준 시간이 확인되면 자동 전환됩니다";
-  document.getElementById("venueCountdown").textContent = "";
-  document.getElementById("venueProgressTrack").hidden = true;
-}
-
-function timestampMillis(value) {
-  if (Number.isFinite(value)) return Number(value);
-  if (value && typeof value.toMillis === "function") {
-    const millis = value.toMillis();
-    return Number.isFinite(millis) ? millis : null;
-  }
-  return null;
-}
-
 function stopVenueTimer() {
-  if (venueTimer) window.clearInterval(venueTimer);
+  if (venueTimer !== null) window.clearInterval(venueTimer);
   venueTimer = null;
-  document.getElementById("venueProgressTrack").hidden = false;
 }
 
 function placeVenueStatus() {

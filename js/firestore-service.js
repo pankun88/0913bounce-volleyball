@@ -188,15 +188,6 @@ export function subscribeFinalMatches(division, cb) {
   });
 }
 
-export async function getServerClockOffset() {
-  const startedAt = Date.now();
-  const result = await httpsCallable(functions, "getServerClock")({ tournamentId: TID });
-  const finishedAt = Date.now();
-  const serverTimeMs = Number(result.data?.serverTimeMs);
-  if (!Number.isFinite(serverTimeMs)) throw new Error("서버 기준 시간을 확인할 수 없습니다.");
-  return serverTimeMs - ((startedAt + finishedAt) / 2);
-}
-
 // ---------- 백업 / 복원 ----------
 
 /**
