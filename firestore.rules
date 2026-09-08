@@ -349,6 +349,10 @@ service cloud.firestore {
         allow read: if isMain(tournamentId);
         allow write: if false;
       }
+      match /publicSchedule/current {
+        allow get: if isMain(tournamentId);
+        allow list, write: if false;
+      }
       match /recorderGrants/{uid} {
         allow get: if isMain(tournamentId) && request.auth != null && request.auth.uid == uid;
         allow list: if false;

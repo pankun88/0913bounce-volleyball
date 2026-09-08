@@ -7,19 +7,29 @@
 <link rel="stylesheet" href="css/style.css" />
 <link rel="stylesheet" href="css/bracket.css" />
 </head>
-<body>
+<body class="dashboard-page">
 <div class="app-shell" id="dashboardShell">
 
   <div class="top-bar">
     <div class="brand"><span class="emoji">🏐</span> <span id="dashTitle">바운스발리볼</span> <span id="dashDivisionBadge" class="division-badge" data-division-theme="men">남자부</span></div>
-    <span class="live-dot">실시간 중계중</span>
+    <div class="dashboard-top-actions">
+      <span class="live-dot">실시간 중계중</span>
+      <button type="button" class="dashboard-fullscreen-btn" id="dashFullscreenBtn" aria-pressed="false">⛶ 전체화면</button>
+      <span id="dashboardFullscreenStatus" class="dashboard-fullscreen-status" role="status" aria-live="polite" hidden></span>
+    </div>
   </div>
 
   <div id="errorBanner" class="error-banner"></div>
 
-  <div class="division-switch" id="dashDivisionSwitch" role="group" aria-label="경기 부문 선택">
-    <button type="button" class="division-btn active" data-division="men">남자부</button>
-    <button type="button" class="division-btn" data-division="women">여자부</button>
+  <div class="dashboard-controls" id="dashboardControls">
+    <div class="division-switch" id="dashDivisionSwitch" role="group" aria-label="경기 부문 선택">
+      <button type="button" class="division-btn active" data-division="men">남자부</button>
+      <button type="button" class="division-btn" data-division="women">여자부</button>
+    </div>
+    <div class="tabs" id="dashboardTabs">
+      <button class="tab-btn active" data-tab="prelim">예선</button>
+      <button class="tab-btn" data-tab="final">본선</button>
+    </div>
   </div>
 
   <section id="maintenanceNotice" class="maintenance-notice" hidden role="status">
@@ -27,30 +37,26 @@
     <p>점검이 끝난 뒤 경기 결과를 다시 안내합니다.</p>
   </section>
 
-  <div id="dashboardLiveContent">
-    <div class="tabs">
-      <button class="tab-btn active" data-tab="prelim">예선</button>
-      <button class="tab-btn" data-tab="final">본선</button>
-    </div>
+  <main id="dashboardViewport" aria-live="polite">
+    <div id="dashboardStage" class="dashboard-stage">
+      <div id="dashboardLiveContent">
+        <!-- 예선 -->
+        <section class="tab-panel active" id="tab-prelim">
+          <div id="dashPrelim" class="grid-auto" data-division-theme="men"></div>
+        </section>
 
-    <!-- 예선 -->
-    <section class="tab-panel active" id="tab-prelim">
-      <div id="dashPrelim" class="grid-auto" data-division-theme="men"></div>
-    </section>
-
-    <!-- 본선 -->
-    <section class="tab-panel" id="tab-final">
-      <div class="card" id="dashBracketCard" data-division-theme="men">
-        <div class="bracket-header">
-          <div class="bracket-banner"><span>🏆</span> <span id="dashBracketTitle">본선 대진표</span></div>
-          <button type="button" class="bracket-fullscreen-btn" id="dashBracketFullscreenBtn">⛶ 전체화면</button>
-        </div>
-        <div class="bracket-wrap" id="dashBracketContainer"></div>
+        <!-- 본선 -->
+        <section class="tab-panel" id="tab-final">
+          <div class="card" id="dashBracketCard" data-division-theme="men">
+            <div class="bracket-header">
+              <div class="bracket-banner"><span>🏆</span> <span id="dashBracketTitle">본선 대진표</span></div>
+            </div>
+            <div class="bracket-wrap" id="dashBracketContainer"></div>
+          </div>
+        </section>
       </div>
-    </section>
-  </div>
-
-  <p class="footer-note">바운스발리볼 · 실시간 경기 결과 대시보드</p>
+    </div>
+  </main>
 
   <div id="venueStatusHome"></div>
   <section id="venueSwitcher" class="venue-switcher" data-division-theme="men" hidden aria-label="경기 부문 자동 전환 상태">
@@ -63,6 +69,8 @@
       <div id="venueProgressBar" class="venue-progress-bar"></div>
     </div>
   </section>
+
+  <p class="footer-note">바운스발리볼 · 실시간 경기 결과 대시보드</p>
 </div>
 
 <script type="module" src="js/dashboard.js"></script>

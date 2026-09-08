@@ -1,10 +1,16 @@
 import { getApps, initializeApp } from 'firebase-admin/app';
 import { onCall } from 'firebase-functions/v2/https';
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
 import * as adminWorkflow from './admin-workflow.js';
+import * as publicSchedule from './public-schedule.js';
 import * as restore from './restore.js';
 
 if (!getApps().length) initializeApp();
 const callable = (handler) => onCall({ region: 'asia-northeast3' }, handler);
+const documentWritten = (document, handler) => onDocumentWritten(
+  { region: 'asia-northeast3', document, retry: true },
+  handler,
+);
 
 export const createRecorderAccessCode = callable(adminWorkflow.createRecorderAccessCode);
 export const revokeRecorderAccessCode = callable(adminWorkflow.revokeRecorderAccessCode);
@@ -40,3 +46,16 @@ export const verifyRestore = callable(restore.verifyRestore);
 export const promoteRestore = callable(restore.promoteRestore);
 export const getServerClock = callable(async () => ({ serverTimeMs: Date.now() }));
 export const exportTournamentBackup = callable(restore.exportTournamentBackup);
+export const ensurePublicSchedule = callable(publicSchedule.ensurePublicSchedule);
+export const publishPublicScheduleForCourt = documentWritten(
+  'tournaments/{tournamentId}/courts/{courtId}',
+  publicSchedule.onCourtWritten,
+);
+export const publishPublicScheduleForAssignment = documentWritten(
+  'tournaments/{tournamentId}/courtAssignments/{matchKey}',
+  publicSchedule.onAssignmentWritten,
+);
+export const publishPublicScheduleForTournament = documentWritten(
+  'tournaments/{tournamentId}',
+  publicSchedule.onTournamentWritten,
+);

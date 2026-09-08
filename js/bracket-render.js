@@ -145,6 +145,7 @@ export function renderBracket(container, matches, options = {}) {
   // 같은 입력이면 굳이 다시 그릴 필요가 없다. 마지막으로 처리한 폭/높이/전체화면 여부를
   // 기억해 두고, 그대로면 건너뛰어 불필요한 재계산(과 옵저버 루프 경고)을 막는다.
   let lastKey = "";
+  const dashboardFitMode = options.viewportFit === "dashboard";
 
   const redraw = () => {
     // 탭이 숨겨진(display:none) 상태면 크기가 0이라 계산이 무의미하므로 건너뛴다.
@@ -152,7 +153,7 @@ export function renderBracket(container, matches, options = {}) {
     if (container.clientWidth === 0) return;
 
     const fsMode = container.dataset.fullscreenZoom === "1";
-    const key = `${container.clientWidth}x${container.clientHeight}x${fsMode ? 1 : 0}`;
+    const key = `${container.clientWidth}x${container.clientHeight}x${fsMode ? 1 : 0}x${dashboardFitMode ? 1 : 0}`;
     if (key === lastKey) return;
     lastKey = key;
 
@@ -170,7 +171,11 @@ export function renderBracket(container, matches, options = {}) {
     const isMobile = window.innerWidth <= 720;
 
     let factor;
-    if (fsMode) {
+    if (dashboardFitMode) {
+      // The spectator dashboard owns the viewport scale. Keep this renderer at natural
+      // dimensions so the dashboard can measure the complete topology exactly once.
+      factor = 1;
+    } else if (fsMode) {
       // 전체화면(주로 PC 모니터 송출용): 가로뿐 아니라 세로까지 맞춰, 화면 안에 트리 전체가
       // 잘리지 않고 들어가는 한도 내에서 최대한 크게(1배 초과 확대도 허용) 보여준다.
       // 약간의 안전 여유(0.98배)를 둔다.
@@ -507,6 +512,20 @@ function drawConnectors(track, rounds) {
   track.prepend(svg);
 
   const trackRect = track.getBoundingClientRect();
+  const naturalWidth = track.offsetWidth || track.scrollWidth || 1;
+  const naturalHeight = track.offsetHeight || track.scrollHeight || 1;
+  // A spectator dashboard may scale the whole stage after this renderer has laid out
+  // the bracket. Normalize measured rectangles back into the track's natural coordinate
+  // system so connector paths do not inherit the ancestor transform.
+  const scaleX = trackRect.width / naturalWidth || 1;
+  const scaleY = trackRect.height / naturalHeight || 1;
+  const localRect = (rect) => ({
+    left: (rect.left - trackRect.left) / scaleX,
+    top: (rect.top - trackRect.top) / scaleY,
+    width: rect.width / scaleX,
+    height: rect.height / scaleY,
+    bottom: (rect.bottom - trackRect.top) / scaleY,
+  });
   svg.setAttribute("width", track.scrollWidth);
   svg.setAttribute("height", track.scrollHeight);
 
@@ -517,16 +536,16 @@ function drawConnectors(track, rounds) {
       const fromEl = track.querySelector(`[data-match-id="${m.id}"]`);
       const toEl = track.querySelector(`[data-match-id="${m.nextMatchId}"]`);
       if (!fromEl || !toEl) return;
-      const fr = fromEl.getBoundingClientRect();
+      const fr = localRect(fromEl.getBoundingClientRect());
       // 도착 지점은 카드 박스가 아니라 "카드+세트별 득점 테이블"을 합친 블록의 아래쪽 끝으로 잡는다.
       // 그래야 선이 다음 라운드 카드의 세트 테이블을 가로지르지 않고 그 아래쪽 빈 공간으로 지나간다.
       const toBlockEl = toEl.closest(".match-card-wrap") || toEl;
-      const tr = toBlockEl.getBoundingClientRect();
+      const tr = localRect(toBlockEl.getBoundingClientRect());
       // 세로형(결승이 위로 갈수록): 이전 라운드 카드 위쪽 중앙 -> 다음 라운드 블록 아래쪽 중앙으로 이어준다
-      const x1 = fr.left + fr.width / 2 - trackRect.left;
-      const y1 = fr.top - trackRect.top;
-      const x2 = tr.left + tr.width / 2 - trackRect.left;
-      const y2 = tr.bottom - trackRect.top;
+      const x1 = fr.left + fr.width / 2;
+      const y1 = fr.top;
+      const x2 = tr.left + tr.width / 2;
+      const y2 = tr.bottom;
       const midY = y1 + (y2 - y1) / 2;
       const path = document.createElementNS(SVG_NS, "path");
       path.setAttribute("d", `M ${x1} ${y1} V ${midY} H ${x2} V ${y2}`);

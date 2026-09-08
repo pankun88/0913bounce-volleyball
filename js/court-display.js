@@ -1,3 +1,5 @@
+import { getRingEdges } from "./ring-bracket.js";
+
 /**
  * 코트 대기열(courtAssignments)에는 경기 참조만 저장되고 팀 이름은 없다.
  * 팀 이름은 승인 여부와 무관한 공개 대진 정보이므로, 공식 경기 문서
@@ -66,36 +68,154 @@ export function courtMatchSummary(assignment, officialMatch, lookups = {}) {
 }
 
 /**
- * 조별 예선 순서가 바뀌면 각 코트에서 그 조 경기들이 차지하던 자리는 유지하고,
- * 그 자리 안의 경기만 새 예선 순서대로 다시 배치한다.
- * 다른 조와 본선 경기의 코트 순서는 건드리지 않는다.
+ * 예선 경기와 통합 코트 배정 초안을 읽기 전용으로 합쳐 화면용 순서를 만든다.
+ * 구조적 `round`는 대진 식별·동률 정렬에만 사용하고 실행 순서를 덮어쓰지 않는다.
  */
-export function syncCourtOrderWithPrelimOrder(assignments, orderedMatchKeys) {
-  const prelimOrder = new Map(orderedMatchKeys.map((matchKey, index) => [matchKey, index]));
-  const courtIds = new Set(assignments.map((assignment) => assignment.courtId || null));
-
-  courtIds.forEach((courtId) => {
-    const courtAssignments = assignments
-      .map((assignment, index) => ({ assignment, index }))
-      .filter(({ assignment }) => (assignment.courtId || null) === courtId)
-      .sort((a, b) => (
-        (a.assignment.courtOrder ?? Number.MAX_SAFE_INTEGER)
-        - (b.assignment.courtOrder ?? Number.MAX_SAFE_INTEGER)
-        || a.index - b.index
-      ));
-    const reorderedPrelim = courtAssignments
-      .map(({ assignment }) => assignment)
-      .filter((assignment) => prelimOrder.has(assignment.matchKey))
-      .sort((a, b) => prelimOrder.get(a.matchKey) - prelimOrder.get(b.matchKey));
-
-    let prelimIndex = 0;
-    courtAssignments.forEach(({ assignment }, index) => {
-      const nextAssignment = prelimOrder.has(assignment.matchKey)
-        ? reorderedPrelim[prelimIndex++]
-        : assignment;
-      nextAssignment.courtOrder = index + 1;
+export function projectPrelimCourtSchedule(matches, assignments, courts) {
+  const matchList = Array.isArray(matches) ? matches : [];
+  const assignmentList = Array.isArray(assignments) ? assignments : [];
+  const courtList = Array.isArray(courts) ? courts : [];
+  const assignmentByMatchKey = new Map(
+    assignmentList
+      .filter((assignment) => assignment && assignment.matchKey !== undefined && assignment.matchKey !== null)
+      .map((assignment) => [assignment.matchKey, assignment]),
+  );
+  const courtById = new Map();
+  courtList.forEach((court, index) => {
+    if (!court || court.id === undefined || court.id === null || courtById.has(court.id)) return;
+    courtById.set(court.id, {
+      index,
+      name: normalizeCourtName(court.name),
     });
   });
 
-  return assignments;
+  const numericCourtOrder = (value) => (
+    typeof value === "number"
+      && Number.isFinite(value)
+      && Number.isInteger(value)
+      && value > 0
+      ? value
+      : null
+  );
+  const structuralRound = (value) => {
+    const round = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(round) ? round : Number.POSITIVE_INFINITY;
+  };
+  const structuralId = (match) => (match?.id === undefined || match?.id === null ? "" : String(match.id));
+  const compareText = (left, right) => {
+    const a = String(left ?? "");
+    const b = String(right ?? "");
+    return a < b ? -1 : a > b ? 1 : 0;
+  };
+  const compareStructural = (left, right) => (
+    structuralRound(left.row.match?.round) - structuralRound(right.row.match?.round)
+      || compareText(structuralId(left.row.match), structuralId(right.row.match))
+      || left.index - right.index
+  );
+
+  return matchList
+    .map((match, index) => {
+      const assignment = assignmentByMatchKey.get(match?.id);
+      const courtId = typeof assignment?.courtId === "string" && assignment.courtId.trim()
+        ? assignment.courtId
+        : null;
+      const court = courtId === null ? null : courtById.get(courtId);
+      const courtOrder = numericCourtOrder(assignment?.courtOrder);
+      const courtName = court?.name || "";
+      const assigned = Boolean(court && courtName && courtOrder !== null);
+      if (!assigned) {
+        return {
+          index,
+          assigned: false,
+          courtIndex: Number.POSITIVE_INFINITY,
+          courtOrder: null,
+          row: {
+            match,
+            courtId: null,
+            courtName: "",
+            courtOrder: null,
+            label: "미배정",
+            shortLabel: "—",
+          },
+        };
+      }
+      return {
+        index,
+        assigned: true,
+        courtIndex: court.index,
+        courtOrder,
+        row: {
+          match,
+          courtId,
+          courtName,
+          courtOrder,
+          label: `${formatCourtName(courtName)} · 전체 ${courtOrder}번째`,
+          shortLabel: `${courtName}·${courtOrder}`,
+        },
+      };
+    })
+    .sort((left, right) => {
+      if (left.assigned !== right.assigned) return left.assigned ? -1 : 1;
+      if (left.assigned) {
+        return left.courtIndex - right.courtIndex
+          || left.courtOrder - right.courtOrder
+          || compareStructural(left, right);
+      }
+      return compareStructural(left, right);
+    })
+    .map(({ row }) => row);
+}
+
+function ringTeamId(value) {
+  if (value && typeof value === "object") return value.id ?? null;
+  return value ?? null;
+}
+
+function ringPairMatches(match, teamA, teamB) {
+  const hasTeamId = (value) => (
+    value !== null
+      && value !== undefined
+      && !(typeof value === "string" && value.trim() === "")
+  );
+  if (!hasTeamId(teamA) || !hasTeamId(teamB)) return false;
+  const matchA = ringTeamId(match?.teamA);
+  const matchB = ringTeamId(match?.teamB);
+  if (!hasTeamId(matchA) || !hasTeamId(matchB)) return false;
+  return (
+    (matchA === teamA && matchB === teamB)
+    || (matchA === teamB && matchB === teamA)
+  );
+}
+
+function assignedScheduleRow(row) {
+  return Boolean(
+    row
+      && typeof row.courtId === "string"
+      && row.courtId.trim()
+      && typeof row.shortLabel === "string"
+      && row.shortLabel !== "—"
+      && typeof row.label === "string"
+      && Number.isInteger(row.courtOrder)
+      && Number.isFinite(row.courtOrder)
+      && row.courtOrder > 0,
+  );
+}
+
+/**
+ * 링 도형의 구조적 변 순서는 그대로 두고, 각 변의 팀쌍에 해당하는
+ * 통합 코트 실행 위치만 표시용으로 투영한다.
+ */
+export function getPrelimRingEdgeLabels(ringOrder, schedule) {
+  const order = Array.isArray(ringOrder) ? ringOrder : [];
+  const rows = Array.isArray(schedule) ? schedule : [];
+  return getRingEdges(order.length).map(([i, j], edgeIndex) => {
+    const teamA = ringTeamId(order[i]);
+    const teamB = ringTeamId(order[j]);
+    const row = rows.find((item) => (
+      assignedScheduleRow(item) && ringPairMatches(item.match, teamA, teamB)
+    ));
+    return row
+      ? { text: row.shortLabel, title: row.label }
+      : { text: "—", title: `미배정 · 대진 ${edgeIndex + 1}` };
+  });
 }

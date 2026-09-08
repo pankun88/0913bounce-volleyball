@@ -93,11 +93,12 @@ function safeParseJson(str) {
  *   - onVertexDrop: (data, targetIndex) => void  (data = {type:'pool', teamId} | {type:'vertex', index})
  *   - onVertexClick: (index) => void
  *   - selectedVertexIndex: number|null - 클릭 선택(이동 중)인 꼭짓점 표시용
+ *   - edgeLabels: {text:string,title:string}[]|undefined - 변별 표시 라벨(생략하면 구조 순번)
  */
 export function renderRingDiagram(container, opts) {
   const {
     ringOrder, teamNameById, editable = false,
-    onVertexDrop, onVertexClick, selectedVertexIndex = null,
+    onVertexDrop, onVertexClick, selectedVertexIndex = null, edgeLabels,
   } = opts;
 
   const n = ringOrder.length;
@@ -142,8 +143,10 @@ export function renderRingDiagram(container, opts) {
     label.className = "ring-edge-label" + (filled ? " done" : "");
     label.style.left = pos.x + "px";
     label.style.top = pos.y + "px";
-    label.textContent = String(idx + 1);
-    label.title = `${idx + 1}경기`;
+    label.dataset.ringEdgeIndex = String(idx);
+    const edgeLabel = Array.isArray(edgeLabels) ? edgeLabels[idx] : null;
+    label.textContent = edgeLabel?.text ?? String(idx + 1);
+    label.title = edgeLabel?.title ?? `${idx + 1}경기`;
     stage.appendChild(label);
   });
 

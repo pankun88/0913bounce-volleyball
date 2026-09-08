@@ -2,7 +2,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:unit": "node js/test.mjs && node js/workflow-test.mjs && node functions/test/workflow-core.test.mjs",
+    "test:unit": "node js/test.mjs && node js/workflow-test.mjs && node functions/test/workflow-core.test.mjs && node functions/test/public-schedule.test.mjs",
     "test:emulator": "firebase emulators:exec --project demo-bounce-volleyball --only auth,firestore,functions \"node test/emulator/run-all.mjs\"",
     "test:release": "npm run test:unit && npm run test:emulator"
   },

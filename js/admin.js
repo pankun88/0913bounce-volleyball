@@ -30,7 +30,8 @@ import {
 } from "./score-workflow.js";
 import { upgradeLegacyBackup } from "./backup-format.js";
 import {
-  courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
+  courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName,
+  getPrelimRingEdgeLabels, projectPrelimCourtSchedule,
 } from "./court-display.js";
 import {
   correctionConfirmationState,
@@ -93,6 +94,8 @@ let workflowQueueRevisionBaseline = {};
 let workflowPhaseFilter = "all";
 const workflowCompletedDetailsOpen = new Map();
 const WORKFLOW_DRAG_HINT = "완료 경기가 분리되거나 일부 경기가 숨겨져 드래그 정렬은 제한됩니다. 코트 선택과 가능한 화살표를 사용하세요.";
+const PRELIM_ORDER_GUIDANCE = "경기 진행 순서는 통합 경기 배정·순서에서 변경합니다. 도형의 팀 배치는 대진 상대를 변경합니다.";
+const PRELIM_UNSAVED_PLAN_HINT = "저장되지 않은 코트 배정·진행 순서가 표시 중입니다. 통합 경기 배정·순서에서 저장하세요.";
 let tournamentResetInProgress = false;
 let tournamentResetState = null;
 const TOURNAMENT_RESET_STATE_KEY = "bounce-volleyball:tournament-reset";
@@ -927,6 +930,8 @@ function renderWorkflowCourtPlanner() {
   renderCourtBoard();
   syncPrelimCourtSelects();
   syncPrelimCourtBadges();
+  syncPrelimExecutionProjection();
+  syncPrelimWorkflowHints();
   syncWorkflowSaveControls();
 }
 
@@ -943,6 +948,210 @@ function syncWorkflowSaveControls() {
   });
 }
 
+function prelimCourtSchedule(matches = prelimMatches) {
+  return projectPrelimCourtSchedule(
+    matches,
+    workflowDraftAssignments.filter((assignment) => (assignment.matchType || "prelim") === "prelim"),
+    workflowDraftCourts,
+  );
+}
+
+function structuralPrelimMatches(matches) {
+  return [...matches].sort((left, right) => (
+    (Number.isFinite(Number(left.round)) ? Number(left.round) : Number.POSITIVE_INFINITY)
+      - (Number.isFinite(Number(right.round)) ? Number(right.round) : Number.POSITIVE_INFINITY)
+      || String(left.id || "").localeCompare(String(right.id || ""))
+  ));
+}
+
+function structuralPrelimNumber(match, fallback = 1) {
+  const round = Number(match?.round);
+  return Number.isFinite(round) && round > 0 ? round : fallback;
+}
+
+function prelimScheduleRow(matchKey, schedule = prelimCourtSchedule()) {
+  return schedule.find((row) => row.match?.id === matchKey) || null;
+}
+
+function createPrelimCourtLanes(groupId) {
+  const lanes = document.createElement("div");
+  lanes.className = "prelim-court-lanes";
+  lanes.dataset.prelimCourtLanes = groupId;
+  const laneDefinitions = [
+    ...workflowDraftCourts.map((court) => [court.id, formatCourtName(court.name, "이름 없는 코트")]),
+    ["", "미배정"],
+  ];
+  laneDefinitions.forEach(([courtId, name]) => {
+    const lane = document.createElement("section");
+    lane.className = "prelim-court-lane";
+    lane.dataset.prelimCourtLane = courtId;
+    const heading = document.createElement("h4");
+    heading.className = "prelim-court-lane-heading";
+    heading.dataset.prelimCourtLaneHeading = courtId;
+    heading.textContent = name;
+    const list = document.createElement("div");
+    list.className = "prelim-match-list";
+    list.dataset.prelimCourtLaneList = courtId;
+    lane.append(heading, list);
+    lanes.appendChild(lane);
+  });
+  return lanes;
+}
+
+function updatePrelimCourtLaneDefinitions(lanes) {
+  const desired = new Map([
+    ...workflowDraftCourts.map((court) => [
+      court.id,
+      formatCourtName(court.name, "이름 없는 코트"),
+    ]),
+    ["", "미배정"],
+  ]);
+  const existing = new Map(
+    [...lanes.querySelectorAll(":scope > [data-prelim-court-lane]")]
+      .map((lane) => [lane.dataset.prelimCourtLane || "", lane]),
+  );
+  desired.forEach((name, courtId) => {
+    let lane = existing.get(courtId);
+    if (!lane) {
+      lane = document.createElement("section");
+      lane.className = "prelim-court-lane";
+      lane.dataset.prelimCourtLane = courtId;
+      const heading = document.createElement("h4");
+      heading.className = "prelim-court-lane-heading";
+      heading.dataset.prelimCourtLaneHeading = courtId;
+      const list = document.createElement("div");
+      list.className = "prelim-match-list";
+      list.dataset.prelimCourtLaneList = courtId;
+      lane.append(heading, list);
+      lanes.appendChild(lane);
+    }
+    const heading = lane.querySelector("[data-prelim-court-lane-heading]");
+    if (heading) heading.textContent = name;
+  });
+  [...desired.keys()].forEach((courtId, index) => {
+    const lane = [...lanes.querySelectorAll(":scope > [data-prelim-court-lane]")]
+      .find((candidate) => (candidate.dataset.prelimCourtLane || "") === courtId);
+    if (lane && lanes.children[index] !== lane) {
+      lanes.insertBefore(lane, lanes.children[index] || null);
+    }
+  });
+}
+
+function syncPrelimExecutionProjection() {
+  const schedule = prelimCourtSchedule();
+  const scheduleById = new Map(schedule.map((row) => [row.match.id, row]));
+  const scheduleIndex = new Map(schedule.map((row, index) => [row.match.id, index]));
+  const knownCourtIds = new Set(workflowDraftCourts.map((court) => court.id));
+  const activeElement = document.activeElement;
+  const activeSelection = activeElement && typeof activeElement.selectionStart === "number"
+    ? {
+      start: activeElement.selectionStart,
+      end: activeElement.selectionEnd,
+      direction: activeElement.selectionDirection,
+    }
+    : null;
+  ["prelimSetupGroups", "prelimGroups"].forEach((rootId) => {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    root.querySelectorAll("[data-prelim-court-lanes]").forEach((lanes) => {
+      const rows = [...lanes.querySelectorAll("[data-prelim-match-row]")];
+      const rowsByLane = new Map();
+      updatePrelimCourtLaneDefinitions(lanes);
+      rows.forEach((row) => {
+        const scheduleRow = scheduleById.get(row.dataset.prelimMatchRow);
+        if (!scheduleRow) return;
+        const laneKey = scheduleRow.courtId && knownCourtIds.has(scheduleRow.courtId)
+          ? scheduleRow.courtId
+          : "";
+        if (!rowsByLane.has(laneKey)) rowsByLane.set(laneKey, []);
+        rowsByLane.get(laneKey).push(row);
+        const executionLabel = row.querySelector("[data-prelim-execution-label]");
+        if (executionLabel) executionLabel.textContent = scheduleRow.label;
+        const courtBadge = row.querySelector("[data-prelim-court-badge]");
+        if (courtBadge) {
+          courtBadge.textContent = scheduleRow.label;
+          const assigned = scheduleRow.courtId && knownCourtIds.has(scheduleRow.courtId);
+          courtBadge.title = assigned
+            ? `실행 순서: ${scheduleRow.label}`
+            : "코트가 배정되지 않았습니다.";
+          courtBadge.classList.toggle("unassigned", !assigned);
+        }
+      });
+      rowsByLane.forEach((laneRows, laneKey) => {
+        const list = [...lanes.querySelectorAll("[data-prelim-court-lane-list]")]
+          .find((candidate) => (candidate.dataset.prelimCourtLaneList || "") === laneKey);
+        if (!list) return;
+        laneRows
+          .sort((left, right) => (
+            (scheduleIndex.get(left.dataset.prelimMatchRow) ?? Number.POSITIVE_INFINITY)
+              - (scheduleIndex.get(right.dataset.prelimMatchRow) ?? Number.POSITIVE_INFINITY)
+          ))
+          .forEach((row, index) => {
+            const current = list.children[index] || null;
+            if (current !== row) list.insertBefore(row, current);
+          });
+      });
+      const desiredLaneIds = new Set([
+        ...workflowDraftCourts.map((court) => court.id),
+        "",
+      ]);
+      [...lanes.querySelectorAll(":scope > [data-prelim-court-lane]")]
+        .forEach((lane) => {
+          const laneId = lane.dataset.prelimCourtLane || "";
+          if (!desiredLaneIds.has(laneId)) {
+            lane.remove();
+            return;
+          }
+          lane.hidden = !lane.querySelector("[data-prelim-match-row]");
+        });
+    });
+  });
+  if (activeElement && activeElement.isConnected && typeof activeElement.focus === "function") {
+    activeElement.focus({ preventScroll: true });
+    if (activeSelection && typeof activeElement.setSelectionRange === "function") {
+      activeElement.setSelectionRange(
+        activeSelection.start,
+        activeSelection.end,
+        activeSelection.direction,
+      );
+    }
+  }
+
+  ["prelimSetupGroups", "prelimGroups"].forEach((rootId) => {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    root.querySelectorAll("[data-prelim-group-id] .ring-edge-label").forEach((label) => {
+      const groupNode = label.closest("[data-prelim-group-id]");
+      const group = groups.find((item) => item.id === groupNode?.dataset.prelimGroupId);
+      if (!group) return;
+      const groupTeams = teams.filter((team) => team.groupId === group.id);
+      const ringOrder = normalizeRingOrder(group.ringOrder, groupTeams.map((team) => team.id));
+      const edgeLabels = getPrelimRingEdgeLabels(ringOrder, schedule);
+      const edgeIndex = Number(label.dataset.ringEdgeIndex);
+      const edgeLabel = edgeLabels[edgeIndex];
+      if (!edgeLabel) return;
+      label.textContent = edgeLabel.text;
+      label.title = edgeLabel.title;
+    });
+  });
+}
+
+function syncPrelimWorkflowHints() {
+  ["prelimSetupGroups", "prelimGroups"].forEach((rootId) => {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    let hint = root.querySelector(":scope > [data-prelim-workflow-hint]");
+    if (!hint) {
+      hint = document.createElement("div");
+      hint.className = "unsaved-change prelim-workflow-hint";
+      hint.dataset.prelimWorkflowHint = "true";
+      root.prepend(hint);
+    }
+    hint.hidden = !workflowDirty;
+    hint.textContent = workflowDirty ? PRELIM_UNSAVED_PLAN_HINT : "";
+  });
+}
+
 function markWorkflowDirty() {
   workflowDirty = true;
   syncWorkflowSaveControls();
@@ -950,13 +1159,18 @@ function markWorkflowDirty() {
 
 function fillPrelimCourtSelect(select, matchKey) {
   const assignment = assignmentFor(matchKey);
+  const editable = workflowMatchEditable(matchKey);
   select.replaceChildren(new Option("미배정", ""));
   workflowDraftCourts.forEach((court) => {
     select.append(new Option(formatCourtName(court.name, "이름 없는 코트"), court.id));
   });
   select.value = assignment?.courtId || "";
-  select.disabled = !assignment;
-  select.title = assignment ? "이 경기의 코트를 선택하세요." : "결과가 기록된 경기는 코트에 새로 배정할 수 없습니다.";
+  select.disabled = !editable;
+  select.title = !assignment
+    ? "코트 배정 정보가 없습니다."
+    : editable
+      ? "이 경기의 코트를 선택하세요."
+      : "완료되었거나 잠금·검수 중인 경기는 코트를 변경할 수 없습니다.";
 }
 
 function syncPrelimCourtSelects() {
@@ -966,13 +1180,14 @@ function syncPrelimCourtSelects() {
 }
 
 function prelimCourtDisplay(matchKey) {
-  const assignment = assignmentFor(matchKey);
-  if (!assignment?.courtId) return { label: "미배정", recorderName: "" };
-  const court = workflowDraftCourts.find((item) => item.id === assignment.courtId);
-  if (!court) return { label: "미배정", recorderName: "" };
+  const scheduleRow = prelimScheduleRow(matchKey);
+  const court = scheduleRow?.courtId
+    ? workflowDraftCourts.find((item) => item.id === scheduleRow.courtId)
+    : null;
   return {
-    label: formatCourtName(court.name),
-    recorderName: court.recorderName?.trim() || "",
+    label: scheduleRow?.label || "미배정",
+    shortLabel: scheduleRow?.shortLabel || "—",
+    recorderName: court?.recorderName?.trim() || "",
   };
 }
 
@@ -1012,13 +1227,13 @@ function renderCourtSettings() {
       court.name = name.value;
       resizeCourtNameInput(name);
       markWorkflowDirty();
+      renderWorkflowCourtPlanner();
     });
     name.addEventListener("change", () => {
       court.name = normalizeCourtName(name.value);
       name.value = court.name;
       resizeCourtNameInput(name);
-      renderCourtBoard();
-      syncPrelimCourtSelects();
+      renderWorkflowCourtPlanner();
     });
     const nameField = document.createElement("label");
     nameField.className = "court-setting-field";
@@ -1189,7 +1404,28 @@ function createWorkflowBoardCard(option, courtId, completed, dragEnabled) {
   } else {
     card.draggable = false;
   }
-  card.innerHTML = `<b>${escapeHtml(option.label)}</b><span>${escapeHtml(option.teams)}</span><span class="badge">${workflowStatusBadge(option.matchKey)}</span>`;
+  const prelimMatch = option.matchType === "prelim"
+    ? allPrelimMatches.find((match) => match.id === option.matchKey)
+    : null;
+  const boardLabel = document.createElement("b");
+  boardLabel.textContent = prelimMatch
+    ? `대진 ${structuralPrelimNumber(prelimMatch)}`
+    : option.label;
+  const executionLabel = prelimMatch && prelimScheduleRow(option.matchKey)?.label;
+  if (executionLabel) {
+    const execution = document.createElement("span");
+    execution.className = "workflow-execution-label";
+    execution.textContent = executionLabel;
+    card.append(boardLabel, execution);
+  } else {
+    card.appendChild(boardLabel);
+  }
+  const teams = document.createElement("span");
+  teams.textContent = option.teams;
+  const status = document.createElement("span");
+  status.className = "badge";
+  status.textContent = workflowStatusBadge(option.matchKey);
+  card.append(teams, status);
   if (completed) return card;
 
   const controls = document.createElement("div");
@@ -2867,10 +3103,7 @@ async function syncRoundRobinOrderAfterTeamReorder(groupId, orderedTeamIds) {
 
   const orderedMatchIds = orderExistingRoundRobinMatchIds(groupMatches, orderedTeamIds);
   await reorderPrelimMatches(groupId, orderedMatchIds);
-  syncCourtOrderWithPrelimOrder(workflowDraftAssignments, orderedMatchIds);
-  workflowDirty = true;
-  renderWorkflowCourtPlanner();
-  showToast("참가팀 순서에 맞춰 예선 대진과 코트 경기 순서를 반영했습니다. 코트 설정·배정 저장을 눌러 확정하세요.", 5000);
+  showToast("참가팀 순서에 맞춰 예선 대진 순서를 반영했습니다. 코트 실행 순서는 변경되지 않습니다.", 5000);
 }
 
 // ---------------- 예선 ----------------
@@ -3131,9 +3364,11 @@ function buildRingControls(g, groupTeams) {
   diagramHost.style.margin = "14px auto 4px";
   wrap.appendChild(diagramHost);
   const selectedVertexIndex = (ringSelection && ringSelection.type === "vertex" && ringSelection.groupId === g.id) ? ringSelection.index : null;
+  const edgeLabels = getPrelimRingEdgeLabels(ringOrder, prelimCourtSchedule());
   renderRingDiagram(diagramHost, {
     ringOrder,
     teamNameById: (id) => teamName(id),
+    edgeLabels,
     editable: !blocked,
     selectedVertexIndex,
     onVertexDrop: (data, targetIndex) => handleRingVertexDrop(g, ringOrder, data, targetIndex),
@@ -3151,29 +3386,109 @@ function safeParseJson(str) {
   }
 }
 
-/** 라운드로빈 경기 목록을 드래그로 재배열한 결과(=새 round 순서)를 Firestore에 저장한다 */
-async function handleMatchReorderDrop(groupId, groupMatches, draggedId, targetId) {
-  if (!draggedId || draggedId === targetId) return;
-  const ids = groupMatches.map((m) => m.id);
-  const fromIdx = ids.indexOf(draggedId);
-  const toIdx = ids.indexOf(targetId);
-  if (fromIdx === -1 || toIdx === -1) return;
-  ids.splice(toIdx, 0, ids.splice(fromIdx, 1)[0]);
-  try {
-    await reorderPrelimMatches(groupId, ids);
-    syncCourtOrderWithPrelimOrder(workflowDraftAssignments, ids);
-    workflowDirty = true;
-    renderWorkflowCourtPlanner();
-    showToast("경기 순서를 코트 설정에도 반영했습니다. 코트 설정·배정 저장을 눌러 확정하세요.", 5000);
-  } catch (err) {
-    reportError("경기 순서 변경", err);
-  }
-}
-
 /** 예선 관련 화면(대회설정 탭의 생성 컨트롤 + 예선 탭의 대진표)을 함께 다시 그린다 */
 function renderPrelimViews() {
   renderPrelimSetupGroups();
   renderPrelimGroups();
+  syncPrelimExecutionProjection();
+  syncPrelimWorkflowHints();
+}
+
+function createPrelimMatchup(match, scheduleRow, structuralNumber) {
+  const matchup = document.createElement("span");
+  matchup.className = "prelim-matchup";
+  const line = document.createElement("span");
+  line.className = "prelim-matchup-line";
+  const teamA = document.createElement("strong");
+  teamA.textContent = teamName(match.teamA);
+  const versus = document.createElement("b");
+  versus.textContent = "VS";
+  const teamB = document.createElement("strong");
+  teamB.textContent = teamName(match.teamB);
+  if (structuralNumber != null) {
+    const order = document.createElement("span");
+    order.className = "match-order-badge";
+    order.dataset.prelimStructuralOrder = String(structuralNumber);
+    order.textContent = `대진 ${structuralNumber}`;
+    order.title = `구조상 대진 ${structuralNumber}`;
+    line.append(order);
+  }
+  line.append(teamA, versus, teamB);
+  const execution = document.createElement("span");
+  execution.className = "prelim-execution-label";
+  execution.dataset.prelimExecutionLabel = match.id;
+  execution.textContent = scheduleRow?.label || "미배정";
+  matchup.append(line, execution);
+  return matchup;
+}
+
+function createPrelimResultBadge(match, evaluated) {
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  if (evaluated.result === "A") {
+    badge.classList.add("win");
+    badge.textContent = `${teamName(match.teamA)} 승`;
+  } else if (evaluated.result === "B") {
+    badge.classList.add("win");
+    badge.textContent = `${teamName(match.teamB)} 승`;
+  } else if (evaluated.result === "draw") {
+    badge.classList.add("draw");
+    badge.textContent = "무승부";
+  } else if (evaluated.status === "in_progress") {
+    badge.textContent = "경기중";
+  } else {
+    badge.textContent = "경기전";
+  }
+  return badge;
+}
+
+function appendPrelimScheduleLanes(parent, groupId, groupMatches, rowFactory) {
+  const schedule = prelimCourtSchedule();
+  const scheduleById = new Map(schedule.map((row) => [row.match.id, row]));
+  const scheduleIndex = new Map(schedule.map((row, index) => [row.match.id, index]));
+  const knownCourtIds = new Set(workflowDraftCourts.map((court) => court.id));
+  const structuralNumbers = new Map(
+    structuralPrelimMatches(groupMatches).map((match, index) => [
+      match.id,
+      structuralPrelimNumber(match, index + 1),
+    ]),
+  );
+  const lanes = createPrelimCourtLanes(groupId);
+  const rowsByLane = new Map();
+  groupMatches.forEach((match) => {
+    const scheduleRow = scheduleById.get(match.id) || {
+      match,
+      courtId: null,
+      label: "미배정",
+      shortLabel: "—",
+    };
+    const laneKey = scheduleRow.courtId && knownCourtIds.has(scheduleRow.courtId)
+      ? scheduleRow.courtId
+      : "";
+    if (!rowsByLane.has(laneKey)) rowsByLane.set(laneKey, []);
+    rowsByLane.get(laneKey).push({ match, scheduleRow });
+  });
+  rowsByLane.forEach((items, laneKey) => {
+    const laneList = [...lanes.querySelectorAll("[data-prelim-court-lane-list]")]
+      .find((list) => (list.dataset.prelimCourtLaneList || "") === laneKey);
+    if (!laneList) return;
+    items
+      .sort((left, right) => (
+        (scheduleIndex.get(left.match.id) ?? Number.POSITIVE_INFINITY)
+          - (scheduleIndex.get(right.match.id) ?? Number.POSITIVE_INFINITY)
+      ))
+      .forEach(({ match, scheduleRow }) => {
+        laneList.appendChild(rowFactory(
+          match,
+          scheduleRow,
+          structuralNumbers.get(match.id) || 1,
+        ));
+      });
+  });
+  lanes.querySelectorAll("[data-prelim-court-lane]").forEach((lane) => {
+    lane.hidden = !lane.querySelector("[data-prelim-match-row]");
+  });
+  parent.appendChild(lanes);
 }
 
 /** [대회설정] 탭: 조별 대진 방식 선택과 대진 생성 컨트롤 (링크제 배치 / 라운드로빈 생성) */
@@ -3254,7 +3569,7 @@ function renderPrelimSetupGroups() {
       box.appendChild(buildRoundRobinControls(g, groupTeams));
     }
 
-    const groupMatches = prelimMatches.filter((m) => m.groupId === g.id).sort((a, b) => (a.round || 0) - (b.round || 0));
+    const groupMatches = structuralPrelimMatches(prelimMatches.filter((m) => m.groupId === g.id));
     const madeHint = document.createElement("div");
     madeHint.className = "prelim-match-status";
     if (!groupMatches.length) {
@@ -3264,27 +3579,21 @@ function renderPrelimSetupGroups() {
     }
     box.appendChild(madeHint);
 
+    const guidance = document.createElement("p");
+    guidance.className = "empty-hint prelim-order-guidance";
+    guidance.textContent = PRELIM_ORDER_GUIDANCE;
+    box.appendChild(guidance);
     if (groupMatches.length) {
-      const reorderable = mode === "roundrobin" && groupMatches.length > 1;
-      const matchList = document.createElement("div");
-      matchList.className = `prelim-match-list${reorderable ? " is-reorderable" : ""}`;
-      groupMatches.forEach((m, idx) => {
+      appendPrelimScheduleLanes(box, g.id, groupMatches, (m, scheduleRow, structuralNumber) => {
         const row = document.createElement("div");
-        row.className = `prelim-match-row${reorderable ? " is-draggable" : ""}`;
-        if (reorderable) {
-          row.title = "드래그하여 경기 순서 변경";
-          const handle = document.createElement("span");
-          handle.className = "prelim-drag-handle";
-          handle.setAttribute("aria-hidden", "true");
-          handle.textContent = "⠿";
-          row.appendChild(handle);
-        }
+        row.className = "prelim-match-row";
+        row.dataset.prelimMatchRow = m.id;
+        row.dataset.prelimMatchId = m.id;
+        const matchup = createPrelimMatchup(m, scheduleRow, null);
         const order = document.createElement("span");
         order.className = "prelim-match-order";
-        order.textContent = String(idx + 1);
-        const matchup = document.createElement("span");
-        matchup.className = "prelim-matchup";
-        matchup.innerHTML = `<strong>${escapeHtml(teamName(m.teamA))}</strong><b>VS</b><strong>${escapeHtml(teamName(m.teamB))}</strong>`;
+        order.dataset.prelimStructuralOrder = String(structuralNumber);
+        order.textContent = `대진 ${structuralNumber}`;
         row.append(order, matchup);
         const courtControl = document.createElement("label");
         courtControl.className = "prelim-court-control";
@@ -3297,39 +3606,14 @@ function renderPrelimSetupGroups() {
         fillPrelimCourtSelect(courtSelect, m.id);
         courtSelect.addEventListener("mousedown", (e) => e.stopPropagation());
         courtSelect.addEventListener("click", (e) => e.stopPropagation());
-        courtSelect.addEventListener("change", () => {
-          const laterMatchOnCourt = groupMatches
-            .slice(idx + 1)
-            .find((match) => (assignmentFor(match.id)?.courtId || "") === courtSelect.value);
-          setMatchCourt(m.id, courtSelect.value, laterMatchOnCourt?.id || null);
-        });
+        courtSelect.addEventListener("change", () => setMatchCourt(m.id, courtSelect.value));
         courtControl.append(courtLabel, courtSelect);
         row.appendChild(courtControl);
-        if (reorderable) {
-          row.draggable = true;
-          row.addEventListener("dragstart", (e) => {
-            e.dataTransfer.setData("text/plain", m.id);
-            e.dataTransfer.effectAllowed = "move";
-            row.classList.add("dragging");
-          });
-          row.addEventListener("dragend", () => row.classList.remove("dragging"));
-          row.addEventListener("dragover", (e) => {
-            e.preventDefault();
-            row.classList.add("drag-over-row");
-          });
-          row.addEventListener("dragleave", () => row.classList.remove("drag-over-row"));
-          row.addEventListener("drop", (e) => {
-            e.preventDefault();
-            row.classList.remove("drag-over-row");
-            const draggedId = e.dataTransfer.getData("text/plain");
-            handleMatchReorderDrop(g.id, groupMatches, draggedId, m.id);
-          });
-        }
-        matchList.appendChild(row);
+        return row;
       });
-      box.appendChild(matchList);
     }
 
+    box.dataset.prelimGroupId = g.id;
     el.appendChild(box);
   });
 }
@@ -3344,13 +3628,14 @@ function renderPrelimGroups() {
   el.innerHTML = "";
   groups.forEach((g) => {
     const groupTeams = teams.filter((t) => t.groupId === g.id);
-    // Firestore는 정렬 없이 구독 중이라 docId 순서로 오므로, 화면에 보여줄 때는 항상 round 순으로 정렬한다
-    const groupMatches = prelimMatches.filter((m) => m.groupId === g.id).sort((a, b) => (a.round || 0) - (b.round || 0));
+    const groupMatches = structuralPrelimMatches(prelimMatches.filter((m) => m.groupId === g.id));
+    const schedule = prelimCourtSchedule();
     const standings = computeGroupStandings(groupTeams, groupMatches);
     const mode = g.matchMode || "ring";
 
     const card = document.createElement("div");
     card.className = "card";
+    card.dataset.prelimGroupId = g.id;
     const heading = document.createElement("h2");
     heading.innerHTML = `${escapeHtml(g.name)} 예선 <span style="margin-left:auto; font-weight:400; color:var(--muted); font-size:13px;">${mode === "ring" ? "링크제" : "라운드로빈"}</span>`;
     card.appendChild(heading);
@@ -3359,9 +3644,11 @@ function renderPrelimGroups() {
     if (mode === "ring" && (g.ringOrder || []).some(Boolean)) {
       const diagramHost = document.createElement("div");
       diagramHost.style.margin = "4px auto 10px";
+      const ringOrder = normalizeRingOrder(g.ringOrder, groupTeams.map((t) => t.id));
       renderRingDiagram(diagramHost, {
-        ringOrder: normalizeRingOrder(g.ringOrder, groupTeams.map((t) => t.id)),
+        ringOrder,
         teamNameById: (id) => teamName(id),
+        edgeLabels: getPrelimRingEdgeLabels(ringOrder, schedule),
         editable: false,
       });
       card.appendChild(diagramHost);
@@ -3391,23 +3678,21 @@ function renderPrelimGroups() {
       card.appendChild(noTeamHint);
     }
 
-    // 경기 목록 (라운드로빈은 모든 팀이 만나므로, 드래그로 경기 순서를 바꿀 수 있게 한다)
-    const matchList = document.createElement("div");
-    matchList.style.marginTop = "14px";
+    const guidance = document.createElement("p");
+    guidance.className = "empty-hint prelim-order-guidance";
+    guidance.textContent = PRELIM_ORDER_GUIDANCE;
+    card.appendChild(guidance);
     if (!groupMatches.length) {
-      matchList.innerHTML = '<div class="empty-hint">생성된 경기가 없습니다. 대회설정 탭의 \'예선 대진 방식·생성\'에서 대진을 생성하세요.</div>';
+      const empty = document.createElement("div");
+      empty.className = "empty-hint";
+      empty.textContent = "생성된 경기가 없습니다. 대회설정 탭의 '예선 대진 방식·생성'에서 대진을 생성하세요.";
+      card.appendChild(empty);
     } else {
-      const reorderable = mode === "roundrobin" && groupMatches.length > 1;
-      if (reorderable) {
-        const dragHint = document.createElement("div");
-        dragHint.className = "empty-hint";
-        dragHint.style.padding = "0 4px 6px";
-        dragHint.textContent = "경기 카드를 드래그해서 경기 순서를 바꿀 수 있습니다.";
-        matchList.appendChild(dragHint);
-      }
-      groupMatches.forEach((m, idx) => {
+      appendPrelimScheduleLanes(card, g.id, groupMatches, (m, scheduleRow, structuralNumber) => {
         const row = document.createElement("div");
-        row.className = "row" + (reorderable ? " match-row-draggable" : "");
+        row.className = "prelim-score-row";
+        row.dataset.prelimMatchRow = m.id;
+        row.dataset.prelimMatchId = m.id;
         row.style.justifyContent = "space-between";
         row.style.padding = "8px 4px";
         row.style.borderBottom = "1px solid var(--line)";
@@ -3419,17 +3704,29 @@ function renderPrelimGroups() {
           ? submittedWorkflow.submittedSnapshot.sets
           : [];
         const pendingScoreText = pendingSets.map((s) => `${s.a}:${s.b}`).join(" / ");
-        const resultBadge = evald.result === "A" ? `<span class="badge win">${teamName(m.teamA)} 승</span>`
-          : evald.result === "B" ? `<span class="badge win">${teamName(m.teamB)} 승</span>`
-          : evald.result === "draw" ? '<span class="badge draw">무승부</span>'
-          : evald.status === "in_progress" ? '<span class="badge">경기중</span>'
-          : '<span class="badge">경기전</span>';
-        const left = document.createElement("span");
-        left.innerHTML = `<span class="match-order-badge">${idx + 1}</span>${escapeHtml(teamName(m.teamA))} <b>vs</b> ${escapeHtml(teamName(m.teamB))} <span style="color:var(--muted); font-size:12px;">${scoreText}</span>${pendingScoreText ? `<br><span style="color:var(--red); font-size:12px; margin-left:34px;">검수 대기 점수: ${escapeHtml(pendingScoreText)}</span>` : ""}`;
+        const left = createPrelimMatchup(m, scheduleRow, structuralNumber);
+        if (scoreText) {
+          const score = document.createElement("span");
+          score.className = "prelim-score-text";
+          score.textContent = scoreText;
+          left.appendChild(score);
+        }
+        if (pendingScoreText) {
+          const pending = document.createElement("span");
+          pending.className = "prelim-pending-score";
+          pending.textContent = `검수 대기 점수: ${pendingScoreText}`;
+          left.appendChild(pending);
+        }
         row.appendChild(left);
         const right = document.createElement("span");
         right.className = "row";
-        right.innerHTML = resultBadge + (pendingScoreText ? '<span class="badge">검수 대기</span>' : "");
+        right.appendChild(createPrelimResultBadge(m, evald));
+        if (pendingScoreText) {
+          const pendingBadge = document.createElement("span");
+          pendingBadge.className = "badge";
+          pendingBadge.textContent = "검수 대기";
+          right.appendChild(pendingBadge);
+        }
         if (pendingScoreText) {
           const reviewBtn = document.createElement("button");
           reviewBtn.className = "btn primary small";
@@ -3457,38 +3754,9 @@ function renderPrelimGroups() {
         right.appendChild(courtBadge);
         right.appendChild(editBtn);
         row.appendChild(right);
-
-        if (reorderable) {
-          row.draggable = true;
-          row.addEventListener("dragstart", (e) => {
-            e.dataTransfer.setData("text/plain", m.id);
-            e.dataTransfer.effectAllowed = "move";
-            row.classList.add("dragging");
-          });
-          row.addEventListener("dragend", () => row.classList.remove("dragging"));
-          row.addEventListener("dragover", (e) => {
-            e.preventDefault();
-            row.classList.add("drag-over-row");
-          });
-          row.addEventListener("dragleave", () => row.classList.remove("drag-over-row"));
-          row.addEventListener("drop", (e) => {
-            e.preventDefault();
-            row.classList.remove("drag-over-row");
-            const draggedId = e.dataTransfer.getData("text/plain");
-            handleMatchReorderDrop(g.id, groupMatches, draggedId, m.id);
-          });
-        }
-
-        matchList.appendChild(row);
+        return row;
       });
-      if (!matchList.children.length || (reorderable && matchList.children.length === 1)) {
-        const empty = document.createElement("div");
-        empty.className = "empty-hint";
-        empty.textContent = "선택한 코트 필터에 해당하는 경기가 없습니다.";
-        matchList.appendChild(empty);
-      }
     }
-    card.appendChild(matchList);
     el.appendChild(card);
   });
 }

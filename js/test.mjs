@@ -13,11 +13,13 @@ import {
 import { generateBracket, recordMatchResult, invalidateDescendantResults, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, publicMatchView, roundLabel } from './bracket.js';
 import { generateRoundRobin, orderExistingRoundRobinMatchIds } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
+import { movePlannerMatchByOffset } from './score-workflow.js';
 import {
   backupFromServerExport, normalizeBackupData, restorableRootData, selectRestoreRecovery, upgradeLegacyBackup,
 } from './backup-format.js';
 import {
-  courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName, syncCourtOrderWithPrelimOrder,
+  courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName,
+  projectPrelimCourtSchedule, getPrelimRingEdgeLabels,
 } from './court-display.js';
 import {
   correctionConfirmationState,
@@ -113,22 +115,210 @@ const finalCourtView = courtMatchSummary(
 check('final court display resolves embedded team names', finalCourtView.teams === '남자 1위 vs 남자 2위');
 check('final court display resolves round label', finalCourtView.label === '결승 1경기');
 check('unresolved final teams are explicit', courtTeamNames({ teamA: null, teamB: null }).a === '대진 미정');
-const reorderedCourtAssignments = [
-  { matchKey: 'group-a-1', courtId: 'court-1', courtOrder: 1 },
-  { matchKey: 'other-group', courtId: 'court-1', courtOrder: 2 },
-  { matchKey: 'group-a-2', courtId: 'court-1', courtOrder: 3 },
-  { matchKey: 'group-a-3', courtId: 'court-2', courtOrder: 1 },
+const prelimProjectionMatches = [
+  { id: 'p1', groupId: 'g', round: 1, teamA: 't1', teamB: 't2' },
+  { id: 'p2', groupId: 'g', round: 2, teamA: 't2', teamB: 't3' },
+  { id: 'p3', groupId: 'g', round: 3, teamA: 't3', teamB: 't1' },
 ];
-syncCourtOrderWithPrelimOrder(reorderedCourtAssignments, ['group-a-2', 'group-a-3', 'group-a-1']);
-check(
-  'prelim reorder updates matching games within each court while preserving unrelated slots',
-  reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-2').courtOrder === 1
-    && reorderedCourtAssignments.find((item) => item.matchKey === 'other-group').courtOrder === 2
-    && reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-1').courtOrder === 3,
+const prelimProjectionAssignments = [
+  { matchKey: 'p1', courtId: 'court-a', courtOrder: 5 },
+  { matchKey: 'p2', courtId: 'court-a', courtOrder: 3 },
+  { matchKey: 'p3', courtId: 'court-a', courtOrder: 1 },
+];
+const prelimProjectionBefore = JSON.stringify(prelimProjectionAssignments);
+const prelimMatchesBefore = JSON.stringify(prelimProjectionMatches);
+const prelimProjection = projectPrelimCourtSchedule(
+  prelimProjectionMatches,
+  prelimProjectionAssignments,
+  [{ id: 'court-a', name: 'A코트' }],
 );
 check(
-  'prelim reorder normalizes independently assigned courts',
-  reorderedCourtAssignments.find((item) => item.matchKey === 'group-a-3').courtOrder === 1,
+  'projection preserves absolute reverse planner slots 1/3/5',
+  JSON.stringify(prelimProjection.map((item) => [item.match.id, item.courtOrder])) === JSON.stringify([
+    ['p3', 1], ['p2', 3], ['p1', 5],
+  ]),
+);
+check(
+  'projection labels use normalized court name and absolute slot',
+  prelimProjection[0].label === 'A코트 · 전체 1번째'
+    && prelimProjection[0].shortLabel === 'A·1'
+    && prelimProjection[2].label === 'A코트 · 전체 5번째',
+);
+check(
+  'projection does not mutate matches or assignments',
+  JSON.stringify(prelimProjectionAssignments) === prelimProjectionBefore
+    && JSON.stringify(prelimProjectionMatches) === prelimMatchesBefore,
+);
+
+const interleavedProjectionMatches = [
+  { id: 'prelim-men', division: 'men', round: 1, teamA: 'm1', teamB: 'm2' },
+  { id: 'prelim-women', division: 'women', round: 1, teamA: 'w1', teamB: 'w2' },
+  { id: 'prelim-men-later', division: 'men', round: 2, teamA: 'm2', teamB: 'm3' },
+];
+const interleavedProjection = projectPrelimCourtSchedule(
+  interleavedProjectionMatches,
+  [
+    { matchKey: 'prelim-men', courtId: 'court-a', courtOrder: 1 },
+    { matchKey: 'final:women:final-women', courtId: 'court-a', courtOrder: 2 },
+    { matchKey: 'prelim-women', courtId: 'court-a', courtOrder: 3 },
+    { matchKey: 'prelim-men-later', courtId: 'court-a', courtOrder: 4 },
+  ],
+  [{ id: 'court-a', name: 'A' }],
+);
+check(
+  'projection keeps interleaved final/opposite-division slots in the same court lane',
+  JSON.stringify(interleavedProjection.map((item) => [item.match.id, item.courtOrder])) === JSON.stringify([
+    ['prelim-men', 1], ['prelim-women', 3], ['prelim-men-later', 4],
+  ]),
+);
+
+const customCourtProjection = projectPrelimCourtSchedule(
+  [
+    { id: 'a', round: 1 },
+    { id: 'b', round: 1 },
+    { id: 'c', round: 1 },
+  ],
+  [
+    { matchKey: 'a', courtId: 'court-z', courtOrder: 2 },
+    { matchKey: 'b', courtId: 'court-a', courtOrder: 1 },
+    { matchKey: 'c', courtId: 'court-z', courtOrder: 1 },
+  ],
+  [{ id: 'court-z', name: 'Z' }, { id: 'court-a', name: 'A' }],
+);
+check(
+  'projection follows passed custom court input order before court order',
+  JSON.stringify(customCourtProjection.map((item) => [item.match.id, item.courtName, item.courtOrder])) === JSON.stringify([
+    ['c', 'Z', 1], ['a', 'Z', 2], ['b', 'A', 1],
+  ]),
+);
+
+const invalidProjectionMatches = [
+  { id: 'missing', round: 1 },
+  { id: 'unknown-court', round: 2 },
+  { id: 'unassigned', round: 3 },
+  { id: 'zero-order', round: 4 },
+  { id: 'fractional-order', round: 5 },
+  { id: 'infinite-order', round: 6 },
+];
+const invalidProjection = projectPrelimCourtSchedule(
+  invalidProjectionMatches,
+  [
+    { matchKey: 'unknown-court', courtId: 'court-missing', courtOrder: 1 },
+    { matchKey: 'unassigned', courtId: null, courtOrder: 2 },
+    { matchKey: 'zero-order', courtId: 'court-a', courtOrder: 0 },
+    { matchKey: 'fractional-order', courtId: 'court-a', courtOrder: 1.5 },
+    { matchKey: 'infinite-order', courtId: 'court-a', courtOrder: Infinity },
+  ],
+  [{ id: 'court-a', name: 'A' }],
+);
+check(
+  'missing, unknown, unassigned, and invalid placements are explicit unassigned',
+  invalidProjection.every((item) => item.courtId === null
+    && item.courtName === ""
+    && item.courtOrder === null
+    && item.label === "미배정"
+    && item.shortLabel === "—"),
+);
+check(
+  'unassigned projection rows retain structural round/id order',
+  JSON.stringify(invalidProjection.map((item) => item.match.id)) === JSON.stringify(invalidProjectionMatches.map((item) => item.id)),
+);
+
+const equalOrderProjectionMatches = [
+  { id: 'z-id', round: 2 },
+  { id: 'a-id', round: 1 },
+  { id: 'b-id', round: 1 },
+];
+const equalOrderProjection = projectPrelimCourtSchedule(
+  equalOrderProjectionMatches,
+  equalOrderProjectionMatches.map((match) => ({
+    matchKey: match.id, courtId: 'court-a', courtOrder: 1,
+  })),
+  [{ id: 'court-a', name: 'A' }],
+);
+check(
+  'equal court-order ties are deterministic by structural round then id',
+  JSON.stringify(equalOrderProjection.map((item) => item.match.id)) === JSON.stringify(['a-id', 'b-id', 'z-id']),
+);
+
+const ringSchedule = projectPrelimCourtSchedule(
+  [
+    { id: 'm-ab', round: 3, teamA: 'a', teamB: 'b' },
+    { id: 'm-bc', round: 1, teamA: 'c', teamB: 'b' },
+    { id: 'm-ca', round: 2, teamA: 'a', teamB: 'c' },
+  ],
+  [
+    { matchKey: 'm-ab', courtId: 'court-a', courtOrder: 5 },
+    { matchKey: 'm-bc', courtId: 'court-a', courtOrder: 3 },
+    { matchKey: 'm-ca', courtId: 'court-a', courtOrder: 1 },
+  ],
+  [{ id: 'court-a', name: 'A' }],
+);
+const ringOrderBefore = ['a', 'b', 'c'];
+const ringScheduleBefore = JSON.stringify(ringSchedule);
+const ringLabels = getPrelimRingEdgeLabels(ringOrderBefore, ringSchedule);
+check(
+  'ring labels resolve reverse team orientation without changing topology',
+  JSON.stringify(ringLabels.map((item) => item.text)) === JSON.stringify(['A·5', 'A·3', 'A·1'])
+    && JSON.stringify(ringOrderBefore) === JSON.stringify(['a', 'b', 'c'])
+    && JSON.stringify(ringSchedule) === ringScheduleBefore,
+);
+check(
+  'ring labels support the two-vertex special case',
+  JSON.stringify(getPrelimRingEdgeLabels(['a', 'b'], ringSchedule).map((item) => item.text)) === JSON.stringify(['A·5']),
+);
+check(
+  'ring labels preserve structural edge count and use explicit unassigned fallback',
+  getPrelimRingEdgeLabels(['a', 'b', 'missing', 'c'], ringSchedule).length === 4
+    && getPrelimRingEdgeLabels(['a', 'b', 'missing', 'c'], ringSchedule)
+      .every((item, index) => index === 0
+        ? item.text === 'A·5'
+        : index === 3
+          ? item.text === 'A·1'
+          : item.text === '—' && item.title === `미배정 · 대진 ${index + 1}`),
+);
+check(
+  'ring label text and titles are safe strings',
+  ringLabels.every((item) => typeof item.text === 'string' && typeof item.title === 'string')
+    && ringLabels[0].title === 'A코트 · 전체 5번째',
+);
+const shuffledUnassignedMatches = [
+  { id: 'z-unassigned', round: 2 },
+  { id: 'b-unassigned', round: 1 },
+  { id: 'a-unassigned', round: 1 },
+];
+const shuffledUnassigned = projectPrelimCourtSchedule(shuffledUnassignedMatches, [], []);
+check(
+  'shuffled unassigned rows sort deterministically by structural round then id',
+  JSON.stringify(shuffledUnassigned.map((item) => item.match.id)) === JSON.stringify([
+    'a-unassigned', 'b-unassigned', 'z-unassigned',
+  ]),
+);
+const partialRingLabels = getPrelimRingEdgeLabels([null, 'b'], [
+  {
+    match: { teamA: null, teamB: 'b' },
+    courtId: 'court-a',
+    courtName: 'A',
+    courtOrder: 1,
+    label: 'A코트 · 전체 1번째',
+    shortLabel: 'A·1',
+  },
+]);
+check(
+  'partial ring vertices never match rows with missing team IDs',
+  partialRingLabels.length === 1
+    && partialRingLabels[0].text === '—'
+    && partialRingLabels[0].title === '미배정 · 대진 1',
+);
+check(
+  'blank ring vertices never match rows with blank team IDs',
+  getPrelimRingEdgeLabels(["", "b"], [{
+    match: { teamA: "", teamB: "b" },
+    courtId: "court-a",
+    courtOrder: 1,
+    label: "A코트 · 전체 1번째",
+    shortLabel: "A·1",
+  }])[0].text === "—",
 );
 
 // ---- approved correction selection state ----
@@ -1290,15 +1480,33 @@ check('getRingEdgeLabelPositions -> 변의 중점보다 중심에서 더 먼 위
 })());
 check('getRingEdgeLabelPositions(0) -> 빈 배열', getRingEdgeLabelPositions(0, 260, 38).length === 0);
 
-// ---- dashboard venue rotation ----
-function createDashboardHarness(search = '?display=venue') {
+// ---- dashboard venue rotation / public schedule ----
+function createDashboardHarness(search = '?display=venue', options = {}) {
   const source = fs.readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8')
     .replace(/^import[\s\S]*?;\s*/gm, '');
   let now = 0;
   let nextTimerId = 1;
+  let nextAnimationFrameId = 1;
   const intervals = new Map();
+  const animationFrames = new Map();
+  const resizeObservers = [];
+  const fontReadyHandlers = [];
+  const fontEventHandlers = new Map();
   const listeners = new Map();
   const subscriptions = {};
+  const ringRenders = [];
+  const bracketRenders = [];
+  let animationFrameRequestCount = 0;
+  const fitGeometry = {
+    viewportWidth: 1280,
+    viewportHeight: 720,
+    stageWidth: 1280,
+    stageHeight: 720,
+    compactStageHeight: null,
+    stageLeft: 0,
+    stageTop: 0,
+    descendants: [],
+  };
 
   function element(id, extra = {}) {
     const classes = new Set();
@@ -1313,8 +1521,11 @@ function createDashboardHarness(search = '?display=venue') {
       },
       contains: (name) => classes.has(name),
     };
-    return {
+    const node = {
       id,
+      children: [],
+      parentNode: null,
+      className: '',
       classList,
       dataset: {},
       style: {},
@@ -1323,6 +1534,9 @@ function createDashboardHarness(search = '?display=venue') {
       textContent: '',
       innerHTML: '',
       offsetWidth: 0,
+      offsetHeight: 0,
+      scrollWidth: 0,
+      scrollHeight: 0,
       eventHandlers: {},
       setAttribute(name, value) { this[name] = String(value); },
       addEventListener(name, handler) {
@@ -1332,24 +1546,132 @@ function createDashboardHarness(search = '?display=venue') {
         (this.eventHandlers.click || []).forEach((handler) => handler({ currentTarget: this }));
       },
       querySelectorAll() { return []; },
-      appendChild(child) { this.lastChild = child; return child; },
-      append(...children) { this.lastChildren = children; },
-      replaceChildren(...children) { this.lastChildren = children; this.innerHTML = ''; },
+      matches(selector) {
+        if (selector === '*') return true;
+        if (selector.startsWith('.')) {
+          const name = selector.slice(1);
+          return classes.has(name) || String(this.className || '').split(/\s+/).includes(name);
+        }
+        return false;
+      },
+      getBoundingClientRect() {
+        const rect = typeof this._rect === 'function' ? this._rect() : this._rect;
+        if (rect) return { ...rect };
+        const width = Number(this.offsetWidth) || 0;
+        const height = Number(this.offsetHeight) || 0;
+        return { left: 0, top: 0, right: width, bottom: height, width, height };
+      },
+      appendChild(child) {
+        if (child) {
+          child.parentNode = this;
+          this.children.push(child);
+        }
+        this.lastChild = child;
+        return child;
+      },
+      append(...children) { children.forEach((child) => this.appendChild(child)); },
+      replaceChildren(...children) {
+        this.children = [];
+        this.lastChildren = children;
+        this.innerHTML = '';
+        children.forEach((child) => this.appendChild(child));
+      },
       after(child) { this.afterChild = child; },
       ...extra,
     };
+    return node;
+  }
+
+  function setFitGeometry(next = {}) {
+    Object.assign(fitGeometry, next);
+    const viewport = elements.dashboardViewport;
+    const stage = elements.dashboardStage;
+    const compactPrelim = () => Boolean(
+      elements.dashPrelim?.classList?.contains("dashboard-prelim-compact"),
+    );
+    viewport.clientWidth = Number(fitGeometry.viewportWidth) || 0;
+    viewport.clientHeight = Number(fitGeometry.viewportHeight) || 0;
+    viewport.offsetWidth = viewport.clientWidth;
+    viewport.offsetHeight = viewport.clientHeight;
+    viewport._rect = () => ({
+      left: 0,
+      top: 0,
+      right: viewport.clientWidth,
+      bottom: viewport.clientHeight,
+      width: viewport.clientWidth,
+      height: viewport.clientHeight,
+    });
+    stage.offsetWidth = Number(fitGeometry.stageWidth) || 0;
+    if (!stage._fitHeightAccessors) {
+      Object.defineProperty(stage, "offsetHeight", {
+        configurable: true,
+        get() {
+          const compactHeight = Number(fitGeometry.compactStageHeight);
+          return compactPrelim() && Number.isFinite(compactHeight)
+            ? compactHeight
+            : Number(fitGeometry.stageHeight) || 0;
+        },
+      });
+      Object.defineProperty(stage, "scrollHeight", {
+        configurable: true,
+        get() {
+          return stage.offsetHeight;
+        },
+      });
+      stage._fitHeightAccessors = true;
+    }
+    stage.scrollWidth = stage.offsetWidth;
+    stage._rect = () => ({
+      left: Number(fitGeometry.stageLeft) || 0,
+      top: Number(fitGeometry.stageTop) || 0,
+      right: (Number(fitGeometry.stageLeft) || 0) + stage.offsetWidth,
+      bottom: (Number(fitGeometry.stageTop) || 0) + stage.offsetHeight,
+      width: stage.offsetWidth,
+      height: stage.offsetHeight,
+    });
+    stage._fitDescendants = (fitGeometry.descendants || []).map((item) => {
+      if (item && typeof item.getBoundingClientRect === 'function') return item;
+      const rect = { ...(item || {}) };
+      return {
+        hidden: Boolean(item?.hidden),
+        _computedStyle: item?._computedStyle || {},
+        getBoundingClientRect() {
+          if (compactPrelim() && Number.isFinite(Number(item?.compactHeight))) {
+            const compactHeight = Number(item.compactHeight);
+            return {
+              ...rect,
+              height: compactHeight,
+              bottom: (Number(rect.top) || 0) + compactHeight,
+            };
+          }
+          return { ...rect };
+        },
+      };
+    });
   }
 
   const elements = Object.fromEntries([
     'dashboardShell', 'dashTitle', 'dashDivisionBadge', 'dashPrelim', 'dashBracketCard',
     'dashBracketTitle', 'dashBracketContainer', 'dashBracketFullscreenBtn',
+    'dashFullscreenBtn', 'dashboardFullscreenStatus',
+    'dashboardViewport', 'dashboardStage',
     'dashDivisionSwitch', 'maintenanceNotice', 'dashboardLiveContent', 'venueStatusHome',
     'venueSwitcher', 'venueCurrentDivision', 'venueNextDivision', 'venueCountdown',
     'venueProgressTrack', 'venueProgressBar', 'errorBanner',
   ].map((id) => [id, element(id)]));
+  elements.dashboardViewport.children = [elements.dashboardStage];
+  elements.dashboardStage.parentNode = elements.dashboardViewport;
+  elements.dashboardStage.children = [elements.dashboardLiveContent];
+  elements.dashboardLiveContent.parentNode = elements.dashboardStage;
+  elements.venueSwitcher.parentNode = elements.dashboardShell;
+  elements.dashboardStage.querySelectorAll = (selector) => selector === '*'
+    ? elements.dashboardStage._fitDescendants || []
+    : [];
+  setFitGeometry();
   const divisionButtons = ['men', 'women'].map((division) => element(`division-${division}`, { dataset: { division } }));
   const tabButtons = ['prelim', 'final'].map((tab) => element(`tab-button-${tab}`, { dataset: { tab } }));
   const tabPanels = ['prelim', 'final'].map((tab) => element(`tab-${tab}`, { id: `tab-${tab}` }));
+  tabPanels.forEach((panel) => { elements[panel.id] = panel; });
   elements.dashDivisionSwitch.querySelectorAll = () => divisionButtons;
   elements.dashBracketFullscreenBtn.requestFullscreen = null;
   elements.dashBracketCard.requestFullscreen = null;
@@ -1360,6 +1682,23 @@ function createDashboardHarness(search = '?display=venue') {
     body,
     documentElement,
     visibilityState: 'visible',
+    fonts: {
+      ready: {
+        then(handler) {
+          fontReadyHandlers.push(handler);
+          return { catch() {} };
+        },
+      },
+      addEventListener(name, handler) {
+        (fontEventHandlers.get(name) || (fontEventHandlers.set(name, []), fontEventHandlers.get(name))).push(handler);
+      },
+    },
+    createElement(tagName) {
+      return element(`created-${tagName}-${nextTimerId++}`, { tagName: String(tagName).toUpperCase() });
+    },
+    createTextNode(text) {
+      return element(`text-${nextTimerId++}`, { textContent: String(text) });
+    },
     getElementById(id) {
       return elements[id] ||= element(id);
     },
@@ -1388,6 +1727,13 @@ function createDashboardHarness(search = '?display=venue') {
       return id;
     },
     clearInterval(id) { intervals.delete(id); },
+    requestAnimationFrame(handler) {
+      const id = nextAnimationFrameId++;
+      animationFrameRequestCount += 1;
+      animationFrames.set(id, handler);
+      return id;
+    },
+    cancelAnimationFrame(id) { animationFrames.delete(id); },
     setTimeout,
     clearTimeout,
     addEventListener(name, handler) {
@@ -1402,23 +1748,51 @@ function createDashboardHarness(search = '?display=venue') {
     document,
     subscriptions,
     divisionButtons,
+    tabButtons,
+    tabPanels,
     history: { replaceState() {} },
     URLSearchParams,
     setTimeout,
     clearTimeout,
     console,
+    getComputedStyle: (node) => ({
+      display: node?._computedStyle?.display || 'block',
+      visibility: node?._computedStyle?.visibility || 'visible',
+      columnGap: node?._computedStyle?.columnGap || node?.style?.columnGap || '16px',
+      gap: node?._computedStyle?.gap || node?.style?.gap || '16px',
+    }),
+    ResizeObserver: class ResizeObserverMock {
+      constructor(callback) {
+        this.callback = callback;
+        resizeObservers.push(this);
+      }
+      observe(target) { this.target = target; }
+      disconnect() {}
+    },
     subscribeTournamentInfo: (cb) => { subscriptions.tournament = cb; },
-    subscribeGroups: () => {},
-    subscribeTeams: () => {},
-    subscribePrelimMatches: () => {},
-    subscribeFinalMatches: () => {},
-    evaluatePrelimMatch: () => ({ result: null, status: 'pending' }),
-    computeGroupStandings: () => [],
-    publicMatchView: (match) => match,
-    renderBracket: () => {},
+    subscribeGroups: (cb) => { subscriptions.groups = cb; },
+    subscribeTeams: (cb) => { subscriptions.teams = cb; },
+    subscribePrelimMatches: (cb) => { subscriptions.prelim = cb; },
+    subscribeFinalMatches: (division, cb) => {
+      (subscriptions.final ||= {})[division] = cb;
+    },
+    subscribePublicSchedule: (cb) => {
+      subscriptions.publicSchedule = cb;
+      const stop = () => {};
+      stop.retry = () => { subscriptions.publicScheduleRetry = true; };
+      return stop;
+    },
+    evaluatePrelimMatch: options.realData ? evaluatePrelimMatch : () => ({ result: null, status: 'pending' }),
+    computeGroupStandings: options.realData ? computeGroupStandings : () => [],
+    publicMatchView: options.realData ? publicMatchView : (match) => match,
+    renderBracket: (...args) => { bracketRenders.push(args); },
     displayTeamName: (name) => name,
-    normalizeRingOrder: () => [],
-    renderRingDiagram: () => {},
+    getRingEdges,
+    normalizeRingOrder: options.realData ? normalizeRingOrder : () => [],
+    renderRingDiagram: (...args) => { ringRenders.push(args); },
+    formatCourtName,
+    projectPrelimCourtSchedule,
+    getPrelimRingEdgeLabels,
   };
   Object.assign(window, context);
   const bridge = `
@@ -1426,8 +1800,23 @@ function createDashboardHarness(search = '?display=venue') {
       snapshot(info) {
         subscriptions.tournament(info, { fromCache: false, hasPendingWrites: false });
       },
+      groups(data, metadata = { fromCache: false, hasPendingWrites: false }) {
+        subscriptions.groups(data, metadata);
+      },
+      teams(data, metadata = { fromCache: false, hasPendingWrites: false }) {
+        subscriptions.teams(data, metadata);
+      },
+      prelim(data, metadata = { fromCache: false, hasPendingWrites: false }) {
+        subscriptions.prelim(data, metadata);
+      },
+      publicSchedule(data, metadata = { fromCache: false, hasPendingWrites: false }) {
+        subscriptions.publicSchedule(data, metadata);
+      },
       clickDivision(division) {
         divisionButtons.find((button) => button.dataset.division === division).click();
+      },
+      clickTab(tab) {
+        tabButtons.find((button) => button.dataset.tab === tab).click();
       },
       visibility(state) {
         document.visibilityState = state;
@@ -1441,6 +1830,8 @@ function createDashboardHarness(search = '?display=venue') {
           venueAutoIntervalMs,
           timerCount: venueTimer === null ? 0 : 1,
           maintenanceActive,
+          publicScheduleState,
+          publicScheduleIsCached,
           venueHidden: document.getElementById('venueSwitcher').hidden,
           progressHidden: document.getElementById('venueProgressTrack').hidden,
           current: document.getElementById('venueCurrentDivision').textContent,
@@ -1455,8 +1846,43 @@ function createDashboardHarness(search = '?display=venue') {
   return {
     state: () => context.__dashboardTest.state(),
     snapshot: (info) => context.__dashboardTest.snapshot(info),
+    groups: (data, metadata) => context.__dashboardTest.groups(data, metadata),
+    teams: (data, metadata) => context.__dashboardTest.teams(data, metadata),
+    prelim: (data, metadata) => context.__dashboardTest.prelim(data, metadata),
+    publicSchedule: (data, metadata) => context.__dashboardTest.publicSchedule(data, metadata),
     clickDivision: (division) => context.__dashboardTest.clickDivision(division),
+    clickTab: (tab) => context.__dashboardTest.clickTab(tab),
     visibility: (state) => context.__dashboardTest.visibility(state),
+    element: (id) => elements[id] || null,
+    error(label, err = {}) {
+      window.dispatchEvent({ type: 'firestore-error', detail: { label, err } });
+    },
+    ringRenders,
+    bracketRenders,
+    setFitGeometry,
+    flushAnimationFrames() {
+      const queued = [...animationFrames.values()];
+      animationFrames.clear();
+      queued.forEach((handler) => handler(now));
+      return queued.length;
+    },
+    pendingAnimationFrames: () => animationFrames.size,
+    animationFrameRequestCount: () => animationFrameRequestCount,
+    triggerResize() {
+      window.dispatchEvent({ type: 'resize' });
+    },
+    triggerResizeObserver() {
+      resizeObservers.forEach((observer) => observer.callback([{ target: observer.target }]));
+    },
+    triggerFontReady() {
+      fontReadyHandlers.splice(0).forEach((handler) => handler());
+    },
+    triggerFontLoadingDone() {
+      (fontEventHandlers.get('loadingdone') || []).forEach((handler) => handler());
+    },
+    triggerFullscreenChange() {
+      document.dispatchEvent({ type: 'fullscreenchange' });
+    },
     advance(ms) {
       now += ms;
       intervals.forEach(({ handler }) => handler());
@@ -1513,6 +1939,970 @@ const viewer = createDashboardHarness('');
 viewer.clickDivision('women');
 const viewerState = viewer.state();
 check('normal dashboard keeps manual division controls and no venue timer', viewerState.activeDivision === 'women' && viewerState.timerCount === 0 && viewerState.venueHidden);
+
+function dashboardNodeText(node) {
+  return [
+    node.textContent || "",
+    ...(node.children || []).map((child) => dashboardNodeText(child)),
+  ].join(" ");
+}
+
+function dashboardNodes(node, predicate, result = []) {
+  if (predicate(node)) result.push(node);
+  (node.children || []).forEach((child) => dashboardNodes(child, predicate, result));
+  return result;
+}
+
+const dashboardSchedule = createDashboardHarness("", { realData: true });
+dashboardSchedule.snapshot({ maintenance: { enabled: false } });
+dashboardSchedule.groups([
+  { id: "gm", division: "men", name: "A조", matchMode: "ring", ringOrder: ["m1", "m2", "m3"] },
+  { id: "gw", division: "women", name: "W조", matchMode: "ring", ringOrder: ["w1", "w2", "w3"] },
+]);
+dashboardSchedule.teams([
+  { id: "m1", division: "men", groupId: "gm", name: "남자1" },
+  { id: "m2", division: "men", groupId: "gm", name: "남자2" },
+  { id: "m3", division: "men", groupId: "gm", name: "남자3" },
+  { id: "w1", division: "women", groupId: "gw", name: "여자1" },
+  { id: "w2", division: "women", groupId: "gw", name: "여자2" },
+  { id: "w3", division: "women", groupId: "gw", name: "여자3" },
+]);
+dashboardSchedule.prelim([
+  {
+    id: "m1-m2", division: "men", groupId: "gm", round: 1, teamA: "m1", teamB: "m2",
+    status: "done", officialRevision: 1, officialCurrent: true,
+    sets: [{ a: 10, b: 5 }, { a: 10, b: 6 }], result: "A", winner: "A",
+  },
+  {
+    id: "m2-m3", division: "men", groupId: "gm", round: 2, teamA: "m2", teamB: "m3",
+    status: "done", officialRevision: 1, officialCurrent: true,
+    sets: [{ a: 10, b: 8 }, { a: 8, b: 10 }], result: "draw",
+  },
+  {
+    id: "m3-m1", division: "men", groupId: "gm", round: 3, teamA: "m3", teamB: "m1",
+    status: "in_progress", sets: [{ a: 25, b: 0 }], result: "A", winner: "A",
+    winnerTeam: { id: "m3", name: "남자3" }, setsWonA: 1, setsWonB: 0,
+  },
+  { id: "w1-w2", division: "women", groupId: "gw", round: 1, teamA: "w1", teamB: "w2", status: "pending" },
+  { id: "w2-w3", division: "women", groupId: "gw", round: 2, teamA: "w2", teamB: "w3", status: "pending" },
+  { id: "w3-w1", division: "women", groupId: "gw", round: 3, teamA: "w3", teamB: "w1", status: "pending" },
+]);
+dashboardSchedule.publicSchedule(null);
+check(
+  "dashboard public schedule bootstrap remains pending instead of unassigned",
+  dashboardSchedule.state().publicScheduleState === "loading"
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("순서 확인 중")
+    && !dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("미배정"),
+);
+const savedPublicSchedule = {
+  status: "ready",
+  courts: [{ id: "court-a", name: "A" }],
+  assignments: [
+    { matchKey: "m1-m2", matchType: "prelim", courtId: "court-a", courtOrder: 5 },
+    { matchKey: "m2-m3", matchType: "prelim", courtId: "court-a", courtOrder: 3 },
+    { matchKey: "m3-m1", matchType: "prelim", courtId: "court-a", courtOrder: 1 },
+    { matchKey: "w1-w2", matchType: "prelim", courtId: "court-a", courtOrder: 2 },
+    { matchKey: "w2-w3", matchType: "prelim", courtId: "court-a", courtOrder: 4 },
+    { matchKey: "w3-w1", matchType: "prelim", courtId: "court-a", courtOrder: 6 },
+    { matchKey: "final:women:f1", matchType: "final", courtId: "court-a", courtOrder: 7 },
+  ],
+};
+dashboardSchedule.publicSchedule(savedPublicSchedule);
+let dashboardRows = dashboardNodes(
+  dashboardSchedule.element("dashPrelim"),
+  (node) => String(node.className || "").includes("dashboard-prelim-match-row"),
+);
+check(
+  "saved public schedule reorders men rows by absolute court slots",
+  dashboardRows.slice(0, 3).map((row) => row.dataset.prelimMatchId).join(",") === "m3-m1,m2-m3,m1-m2"
+    && dashboardRows.slice(0, 3).map((row) => row.dataset.prelimCourtOrder).join(",") === "1,3,5",
+);
+check(
+  "spectator prelim does not render ring diagrams",
+  dashboardSchedule.ringRenders.length === 0
+    && !dashboardNodes(
+      dashboardSchedule.element("dashPrelim"),
+      (node) => /\bring-/.test(String(node.className || "")),
+    ).length,
+);
+check(
+  "approved preliminary win and draw show both set scores and results",
+  dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("10:5 / 10:6")
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("남자1 승")
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("10:8 / 8:10")
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("무승부"),
+);
+check(
+  "approved-only score boundary remains intact in dashboard rows",
+  !dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("25:0")
+    && !dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("남자3 승"),
+);
+dashboardSchedule.clickDivision("women");
+dashboardRows = dashboardNodes(
+  dashboardSchedule.element("dashPrelim"),
+  (node) => String(node.className || "").includes("dashboard-prelim-match-row"),
+);
+check(
+  "saved public schedule keeps women absolute slots without ring diagrams",
+  dashboardRows.slice(0, 3).map((row) => row.dataset.prelimCourtOrder).join(",") === "2,4,6"
+    && dashboardSchedule.ringRenders.length === 0,
+);
+dashboardSchedule.publicSchedule({
+  status: "unavailable",
+  courts: [],
+  assignments: [],
+});
+check(
+  "unavailable public schedule never fabricates execution ordering",
+  dashboardSchedule.state().publicScheduleState === "unavailable"
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("순서 사용 불가")
+    && !dashboardNodes(
+      dashboardSchedule.element("dashPrelim"),
+      (node) => String(node.className || "").includes("prelim-execution-label"),
+    ).length,
+);
+dashboardSchedule.error("공개 경기 일정 구독", { code: "permission-denied" });
+check(
+  "public schedule errors are explicit and retryable without fake unassigned rows",
+  dashboardSchedule.state().publicScheduleState === "error"
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("순서 연결 오류")
+    && !dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("미배정"),
+);
+dashboardSchedule.publicSchedule(savedPublicSchedule, { fromCache: true, hasPendingWrites: false });
+check(
+  "cached ready schedule is marked as cache rather than freshly confirmed",
+  dashboardSchedule.state().publicScheduleIsCached
+    && dashboardNodeText(dashboardSchedule.element("dashPrelim")).includes("오프라인 캐시"),
+);
+dashboardSchedule.snapshot({ maintenance: { enabled: true } });
+check(
+  "root maintenance hides public schedule and live content",
+  dashboardSchedule.state().maintenanceActive
+    && dashboardSchedule.element("dashboardLiveContent").hidden
+    && dashboardSchedule.element("dashPrelim").children.length === 0,
+);
+
+// ---- dashboard viewport fitting ----
+function fitRect(left, top, width, height, extra = {}) {
+  return {
+    left,
+    top,
+    width,
+    height,
+    right: left + width,
+    bottom: top + height,
+    ...extra,
+  };
+}
+
+function dashboardFitSnapshot(harness) {
+  const transform = String(harness.element("dashboardStage").style.transform || "");
+  const match = transform.match(/^translate\(([-+.0-9eE]+)px,\s*([-+.0-9eE]+)px\)\s+scale\(([-+.0-9eE]+)\)$/);
+  if (!match) return null;
+  return {
+    left: Number(match[1]),
+    top: Number(match[2]),
+    scale: Number(match[3]),
+    width: Number.parseFloat(harness.element("dashboardStage").style.width),
+    height: Number.parseFloat(harness.element("dashboardStage").style.height),
+  };
+}
+
+const dashboardFitCases = [
+  [1920, 1080],
+  [1366, 768],
+  [1280, 720],
+  [390, 844],
+];
+for (const division of ["men", "women"]) {
+  for (const tab of ["prelim", "final"]) {
+    for (const [viewportWidth, viewportHeight] of dashboardFitCases) {
+      const naturalWidth = tab === "prelim" ? 1600 : 1800;
+      const naturalHeight = tab === "prelim" ? 900 : 1000;
+      const descendants = tab === "prelim"
+        ? [
+          fitRect(0, 0, naturalWidth, naturalHeight),
+          fitRect(naturalWidth - 480, 80, 460, naturalHeight - 120),
+          fitRect(0, 0, 1, 1, { hidden: true, right: 99999, bottom: 99999 }),
+        ]
+        : [
+          fitRect(-24, -18, naturalWidth + 24, naturalHeight + 18),
+          fitRect(naturalWidth - 240, naturalHeight - 180, 230, 170),
+        ];
+      const fitHarness = createDashboardHarness(
+        `?display=venue&division=${division}&tab=${tab}`,
+      );
+      fitHarness.setFitGeometry({
+        viewportWidth,
+        viewportHeight,
+        stageWidth: naturalWidth,
+        stageHeight: naturalHeight,
+        descendants,
+      });
+      fitHarness.flushAnimationFrames();
+      const snapshot = dashboardFitSnapshot(fitHarness);
+      const visible = descendants.filter((item) => !item.hidden);
+      const contentLeft = Math.min(...visible.map((item) => item.left));
+      const contentTop = Math.min(...visible.map((item) => item.top));
+      const contentRight = Math.max(...visible.map((item) => item.right));
+      const contentBottom = Math.max(...visible.map((item) => item.bottom));
+      const screenLeft = snapshot ? snapshot.left + contentLeft * snapshot.scale : NaN;
+      const screenTop = snapshot ? snapshot.top + contentTop * snapshot.scale : NaN;
+      const screenRight = snapshot ? snapshot.left + contentRight * snapshot.scale : NaN;
+      const screenBottom = snapshot ? snapshot.top + contentBottom * snapshot.scale : NaN;
+      const label = `${division} ${tab} ${viewportWidth}x${viewportHeight}`;
+      check(`${label} computes a finite uniform fit transform`, Boolean(snapshot)
+        && [snapshot.left, snapshot.top, snapshot.scale, snapshot.width, snapshot.height].every(Number.isFinite)
+        && snapshot.scale > 0
+        && snapshot.scale <= 1 + 1e-9);
+      check(`${label} keeps standings/results/bracket content inside the viewport`, Boolean(snapshot)
+        && screenLeft >= -0.5
+        && screenTop >= -0.5
+        && screenRight <= viewportWidth + 0.5
+        && screenBottom <= viewportHeight + 0.5);
+      check(`${label} activates the requested tab without moving the venue counter into stage`,
+        fitHarness.element(`tab-${tab}`).classList.contains("active")
+          && fitHarness.element("venueSwitcher").parentNode === fitHarness.element("dashboardShell")
+          && !fitHarness.element("dashboardStage").children.includes(fitHarness.element("venueSwitcher")));
+    }
+  }
+}
+
+const compactPrelimFit = createDashboardHarness("?display=venue&division=men&tab=prelim");
+compactPrelimFit.setFitGeometry({
+  viewportWidth: 1530,
+  viewportHeight: 596,
+  stageWidth: 1530,
+  stageHeight: 636,
+  compactStageHeight: 584,
+  descendants: [
+    fitRect(0, 0, 1530, 636, { compactHeight: 584 }),
+    fitRect(0, 0, 1, 1, { hidden: true, right: 99999, bottom: 99999 }),
+  ],
+});
+compactPrelimFit.flushAnimationFrames();
+let compactSnapshot = dashboardFitSnapshot(compactPrelimFit);
+check(
+  "prelim uses compact density before uniform scaling when full-height content is too tall",
+  compactPrelimFit.element("dashPrelim").classList.contains("dashboard-prelim-compact")
+    && compactSnapshot?.scale === 1
+    && compactSnapshot?.width >= 1530
+    && compactSnapshot?.height <= 596,
+);
+check(
+  "compact prelim keeps visible content inside the viewport without hiding it",
+  compactSnapshot?.scale === 1
+    && compactSnapshot?.height <= compactPrelimFit.element("dashboardViewport").clientHeight
+    && !compactPrelimFit.element("dashPrelim").hidden,
+);
+compactPrelimFit.clickTab("final");
+compactPrelimFit.flushAnimationFrames();
+check(
+  "switching to finals resets preliminary compact density",
+  !compactPrelimFit.element("dashPrelim").classList.contains("dashboard-prelim-compact"),
+);
+compactPrelimFit.clickTab("prelim");
+compactPrelimFit.flushAnimationFrames();
+compactPrelimFit.setFitGeometry({ viewportHeight: 680, compactStageHeight: 636 });
+compactPrelimFit.triggerResize();
+compactPrelimFit.flushAnimationFrames();
+compactSnapshot = dashboardFitSnapshot(compactPrelimFit);
+check(
+  "resizing a fitting prelim viewport back to normal height clears compact density",
+  !compactPrelimFit.element("dashPrelim").classList.contains("dashboard-prelim-compact")
+    && compactSnapshot?.scale === 1,
+);
+
+const coalescedFit = createDashboardHarness("?display=venue&division=men&tab=prelim");
+coalescedFit.setFitGeometry({
+  viewportWidth: 1366,
+  viewportHeight: 768,
+  stageWidth: 1800,
+  stageHeight: 1000,
+  descendants: [fitRect(0, 0, 1800, 1000)],
+});
+coalescedFit.flushAnimationFrames();
+const coalescedBefore = coalescedFit.animationFrameRequestCount();
+coalescedFit.setFitGeometry({ viewportWidth: 1280, viewportHeight: 720 });
+coalescedFit.triggerResize();
+coalescedFit.triggerResize();
+coalescedFit.triggerResizeObserver();
+coalescedFit.triggerFontLoadingDone();
+coalescedFit.triggerFontReady();
+coalescedFit.clickDivision("women");
+coalescedFit.clickTab("final");
+check(
+  "division/tab/resize/font updates coalesce into one pending fit frame",
+  coalescedFit.pendingAnimationFrames() === 1,
+);
+check(
+  "coalesced viewport fitting does not create a second venue rotation timer",
+  coalescedFit.timerCount() === 1,
+);
+coalescedFit.flushAnimationFrames();
+check(
+  "coalesced viewport fitting requests exactly one frame",
+  coalescedFit.animationFrameRequestCount() === coalescedBefore + 1
+    && coalescedFit.pendingAnimationFrames() === 0,
+);
+
+const emptyFit = createDashboardHarness("?display=venue&division=men&tab=prelim");
+emptyFit.setFitGeometry({
+  viewportWidth: 0,
+  viewportHeight: 0,
+  stageWidth: 0,
+  stageHeight: 0,
+  descendants: [fitRect(0, 0, 2000, 2000)],
+});
+emptyFit.flushAnimationFrames();
+check(
+  "empty/hidden viewport dimensions skip fitting without NaN or a frame loop",
+  !String(emptyFit.element("dashboardStage").style.transform || "").includes("NaN")
+    && emptyFit.pendingAnimationFrames() === 0,
+);
+emptyFit.setFitGeometry({
+  viewportWidth: 390,
+  viewportHeight: 844,
+  stageWidth: 0,
+  stageHeight: 0,
+  descendants: [],
+});
+emptyFit.triggerResize();
+emptyFit.flushAnimationFrames();
+check(
+  "empty content receives a finite non-upscaled fallback fit",
+  !String(emptyFit.element("dashboardStage").style.transform || "").includes("NaN")
+    && (dashboardFitSnapshot(emptyFit)?.scale ?? 0) <= 1,
+);
+const emptyFitRequests = emptyFit.animationFrameRequestCount();
+emptyFit.snapshot({ maintenance: { enabled: true } });
+check(
+  "maintenance/content hiding schedules one bounded refit",
+  emptyFit.pendingAnimationFrames() === 1,
+);
+emptyFit.flushAnimationFrames();
+check(
+  "maintenance/content hiding settles without repeated fit requests",
+  emptyFit.pendingAnimationFrames() === 0
+    && emptyFit.animationFrameRequestCount() === emptyFitRequests + 1,
+);
+
+const rotationFit = createDashboardHarness("?display=venue&division=men&tab=prelim");
+rotationFit.setFitGeometry({
+  viewportWidth: 1366,
+  viewportHeight: 768,
+  stageWidth: 1800,
+  stageHeight: 1000,
+  descendants: [fitRect(0, 0, 1800, 1000)],
+});
+rotationFit.flushAnimationFrames();
+rotationFit.advance(14999);
+check(
+  "viewport fitting leaves the 15-second venue rotation on its starting division",
+  rotationFit.state().activeDivision === "men" && rotationFit.timerCount() === 1,
+);
+rotationFit.triggerResize();
+rotationFit.triggerResize();
+check(
+  "rotation resize coalesces without multiplying timers",
+  rotationFit.pendingAnimationFrames() === 1 && rotationFit.timerCount() === 1,
+);
+rotationFit.flushAnimationFrames();
+rotationFit.advance(1);
+check(
+  "viewport fitting does not disrupt the 15-second division boundary",
+  rotationFit.state().activeDivision === "women" && rotationFit.timerCount() === 1,
+);
+
+// ---- admin preliminary projection UI ----
+function createAdminProjectionHarness() {
+  const elements = new Map();
+  const listeners = new Map();
+  const toDatasetKey = (name) => name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+  const classNames = (element) => String(element.className || "").split(/\s+/).filter(Boolean);
+
+  class FakeElement {
+    constructor(tagName = "div") {
+      this.tagName = String(tagName).toUpperCase();
+      this.nodeName = this.tagName;
+      this.children = [];
+      this.parentNode = null;
+      this.parentElement = null;
+      this.dataset = {};
+      this.style = {};
+      this.className = "";
+      this.hidden = false;
+      this.disabled = false;
+      this.value = "";
+      this.checked = false;
+      this.open = false;
+      this.type = "";
+      this.textContent = "";
+      this._innerHTML = "";
+      this.eventHandlers = {};
+      this.attributes = {};
+      this.ownerDocument = null;
+      this.classList = {
+        add: (...names) => {
+          const merged = new Set(classNames(this));
+          names.forEach((name) => merged.add(name));
+          this.className = [...merged].join(" ");
+        },
+        remove: (...names) => {
+          const removed = new Set(names);
+          this.className = classNames(this).filter((name) => !removed.has(name)).join(" ");
+        },
+        contains: (name) => classNames(this).includes(name),
+        toggle: (name, force) => {
+          const next = force === undefined ? !this.classList.contains(name) : Boolean(force);
+          if (next) this.classList.add(name);
+          else this.classList.remove(name);
+          return next;
+        },
+      };
+    }
+
+    get innerHTML() {
+      return this._innerHTML;
+    }
+
+    set innerHTML(value) {
+      this._innerHTML = String(value ?? "");
+      if (this._innerHTML === "") this.replaceChildren();
+    }
+
+    get options() {
+      return this.children;
+    }
+
+    get selectedIndex() {
+      const index = this.children.findIndex((child) => child.selected);
+      return index < 0 ? 0 : index;
+    }
+
+    set selectedIndex(index) {
+      this.children.forEach((child, childIndex) => { child.selected = childIndex === index; });
+    }
+
+    appendChild(child) {
+      if (!child || typeof child !== "object") return child;
+      if (child.parentNode) child.parentNode.removeChild(child);
+      this.children.push(child);
+      child.parentNode = this;
+      child.parentElement = this;
+      return child;
+    }
+
+    insertBefore(child, reference) {
+      if (reference == null) return this.appendChild(child);
+      assert.ok(this.children.includes(reference), "insertBefore reference belongs to parent");
+      if (child === reference) return child;
+      child.parentNode?.removeChild(child);
+      this.children.splice(this.children.indexOf(reference), 0, child);
+      child.parentNode = this;
+      child.parentElement = this;
+      return child;
+    }
+
+    append(...children) {
+      children.flat().forEach((child) => {
+        if (child && typeof child === "object") this.appendChild(child);
+      });
+    }
+
+    prepend(...children) {
+      const nodes = children.flat().filter((child) => child && typeof child === "object");
+      nodes.reverse().forEach((child) => {
+        if (child.parentNode) child.parentNode.removeChild(child);
+        this.children.unshift(child);
+        child.parentNode = this;
+        child.parentElement = this;
+      });
+    }
+
+    replaceChildren(...children) {
+      this.children.forEach((child) => {
+        child.parentNode = null;
+        child.parentElement = null;
+      });
+      this.children = [];
+      this.append(...children);
+    }
+
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      if (index < 0) return child;
+      this.children.splice(index, 1);
+      child.parentNode = null;
+      child.parentElement = null;
+      return child;
+    }
+
+    remove() {
+      this.parentNode?.removeChild(this);
+    }
+
+    after(child) {
+      if (!this.parentNode) return;
+      const index = this.parentNode.children.indexOf(this);
+      if (index < 0) return;
+      if (child.parentNode) child.parentNode.removeChild(child);
+      this.parentNode.children.splice(index + 1, 0, child);
+      child.parentNode = this.parentNode;
+      child.parentElement = this.parentNode;
+    }
+
+    addEventListener(name, handler) {
+      (this.eventHandlers[name] ||= []).push(handler);
+    }
+
+    click() {
+      (this.eventHandlers.click || []).forEach((handler) => handler({ currentTarget: this, target: this }));
+    }
+
+    focus() {
+      document.activeElement = this;
+    }
+
+    select() {}
+
+    scrollIntoView() {}
+
+    setAttribute(name, value) {
+      const text = String(value);
+      this.attributes[name] = text;
+      if (name === "class") this.className = text;
+      else if (name.startsWith("data-")) this.dataset[toDatasetKey(name.slice(5))] = text;
+      else this[name] = text;
+    }
+
+    getAttribute(name) {
+      if (name.startsWith("data-")) return this.dataset[toDatasetKey(name.slice(5))] ?? null;
+      return this.attributes[name] ?? (this[name] === undefined ? null : String(this[name]));
+    }
+
+    removeAttribute(name) {
+      delete this.attributes[name];
+      if (name.startsWith("data-")) delete this.dataset[toDatasetKey(name.slice(5))];
+      else delete this[name];
+    }
+
+    matches(selector) {
+      return matchesSimple(this, selector);
+    }
+
+    closest(selector) {
+      let current = this;
+      while (current) {
+        if (matchesSimple(current, selector)) return current;
+        current = current.parentNode;
+      }
+      return null;
+    }
+
+    contains(node) {
+      let current = node;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentNode;
+      }
+      return false;
+    }
+
+    querySelectorAll(selector) {
+      return selectWithin(this, selector);
+    }
+
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
+    }
+  }
+
+  function readAttribute(element, name) {
+    if (name.startsWith("data-")) return element.dataset[toDatasetKey(name.slice(5))];
+    if (name === "class") return element.className;
+    return element[name] ?? element.attributes[name];
+  }
+
+  function matchesSimple(element, selector) {
+    const source = String(selector || "").trim();
+    if (!source || source.includes(" ") || source.includes(":")) return false;
+    if (source === "*") return true;
+    const idMatch = source.match(/^#([A-Za-z0-9_-]+)/);
+    if (idMatch && element.id !== idMatch[1]) return false;
+    const tagMatch = source.match(/^[A-Za-z][A-Za-z0-9-]*/);
+    if (tagMatch && element.tagName.toLowerCase() !== tagMatch[0].toLowerCase()) return false;
+    const classes = [...source.matchAll(/\.([A-Za-z0-9_-]+)/g)].map((match) => match[1]);
+    if (classes.some((name) => !classNames(element).includes(name))) return false;
+    const attributes = [...source.matchAll(/\[([^=\]]+)(?:=(["']?)([^"'\]]*)\2)?\]/g)];
+    return attributes.every(([, name, , expected]) => {
+      const actual = readAttribute(element, name);
+      return expected === undefined ? actual !== undefined : String(actual ?? "") === expected;
+    });
+  }
+
+  function descendants(root) {
+    const result = [];
+    root.children.forEach((child) => {
+      result.push(child, ...descendants(child));
+    });
+    return result;
+  }
+
+  function hasMatchingAncestor(node, selector, root) {
+    let current = node.parentNode;
+    while (current && current !== root) {
+      if (matchesSimple(current, selector)) return true;
+      current = current.parentNode;
+    }
+    return current === root && matchesSimple(current, selector);
+  }
+
+  function selectWithin(root, selector) {
+    const source = String(selector || "").trim();
+    const directPrefix = ":scope > ";
+    if (source.startsWith(directPrefix)) {
+      const directSelector = source.slice(directPrefix.length).trim();
+      return root.children.filter((child) => matchesSimple(child, directSelector));
+    }
+    const parts = source.split(/\s+/);
+    if (parts.length > 1) {
+      const finalSelector = parts.pop();
+      const ancestorSelector = parts.join(" ");
+      return descendants(root).filter((node) => (
+        matchesSimple(node, finalSelector) && hasMatchingAncestor(node, ancestorSelector, root)
+      ));
+    }
+    return descendants(root).filter((node) => matchesSimple(node, source));
+  }
+
+  let document;
+  function element(tagName = "div") {
+    const created = new FakeElement(tagName);
+    created.ownerDocument = document;
+    return created;
+  }
+
+  const body = element("body");
+  body.id = "body";
+  document = {
+    body,
+    activeElement: body,
+    visibilityState: "visible",
+    createElement: element,
+    createElementNS: (_, tagName) => element(tagName),
+    createTextNode: (text) => {
+      const node = element("span");
+      node.textContent = String(text);
+      return node;
+    },
+    getElementById(id) {
+      if (!elements.has(id)) {
+        const created = element("div");
+        created.id = id;
+        elements.set(id, created);
+      }
+      return elements.get(id);
+    },
+    querySelectorAll(selector) {
+      return selectWithin(body, selector);
+    },
+    querySelector(selector) {
+      return document.querySelectorAll(selector)[0] || null;
+    },
+    addEventListener(name, handler) {
+      (listeners.get(name) || (listeners.set(name, []), listeners.get(name))).push(handler);
+    },
+    dispatchEvent(event) {
+      (listeners.get(event.type) || []).forEach((handler) => handler(event));
+    },
+  };
+  body.ownerDocument = document;
+  ["prelimSetupGroups", "prelimGroups", "courtSettingsList", "allCourtBoard"].forEach((id) => {
+    body.appendChild(document.getElementById(id));
+  });
+
+  function Option(text, value) {
+    const option = element("option");
+    option.textContent = String(text);
+    option.value = value;
+    return option;
+  }
+
+  const windowListeners = new Map();
+  const window = {
+    location: { search: "", pathname: "/admin.html" },
+    addEventListener(name, handler) {
+      (windowListeners.get(name) || (windowListeners.set(name, []), windowListeners.get(name))).push(handler);
+    },
+    dispatchEvent(event) {
+      (windowListeners.get(event.type) || []).forEach((handler) => handler(event));
+    },
+  };
+  const storage = {
+    values: new Map(),
+    getItem(key) { return this.values.get(key) || null; },
+    setItem(key, value) { this.values.set(key, String(value)); },
+    removeItem(key) { this.values.delete(key); },
+  };
+  const renderRingDiagramForTest = (container, opts = {}) => {
+    container.replaceChildren();
+    const labels = Array.isArray(opts.edgeLabels) ? opts.edgeLabels : [];
+    getRingEdges(Array.isArray(opts.ringOrder) ? opts.ringOrder.length : 0).forEach((_, index) => {
+      const label = element("div");
+      label.className = "ring-edge-label";
+      label.dataset.ringEdgeIndex = String(index);
+      label.textContent = labels[index]?.text ?? String(index + 1);
+      label.title = labels[index]?.title ?? `${index + 1}경기`;
+      container.appendChild(label);
+    });
+  };
+  const context = {
+    window,
+    document,
+    Option,
+    URLSearchParams,
+    sessionStorage: storage,
+    localStorage: storage,
+    crypto: { randomUUID: () => "test-uuid-00000000" },
+    setTimeout,
+    clearTimeout,
+    requestAnimationFrame: (callback) => callback(),
+    console,
+    isFirebaseConfigured: true,
+    db: {},
+    collection: () => ({}),
+    doc: () => ({}),
+    getDoc: async () => ({ exists: () => false }),
+    getDocs: async () => ({ docs: [] }),
+    onSnapshot: () => () => {},
+    serverTimestamp: () => "server-timestamp",
+    updateDoc: async () => {},
+    watchAuthState: () => () => {},
+    login: async () => {},
+    logout: async () => {},
+    requestPasswordReset: async () => {},
+    changePassword: async () => {},
+    describeAuthError: () => "",
+    saveTournamentInfo: async () => {},
+    subscribeTournamentInfo: () => () => {},
+    addGroup: async () => {},
+    renameGroup: async () => {},
+    reorderGroups: async () => {},
+    subscribeGroups: () => () => {},
+    addTeam: async () => {},
+    moveAndReorderTeam: async () => {},
+    subscribeTeams: () => () => {},
+    mutatePrelimStructure: async () => {},
+    subscribePrelimMatches: () => () => {},
+    reorderPrelimMatches: async () => {},
+    setGroupMatchMode: async () => {},
+    setGroupRingOrder: async () => {},
+    publishFinalBracket: async () => {},
+    subscribeFinalMatches: () => () => {},
+    exportAllData: async () => {},
+    importAllData: async () => {},
+    evaluatePrelimMatch: () => ({ result: null, status: "pending" }),
+    evaluateFinalMatch: () => ({ result: null, status: "pending" }),
+    computeGroupStandings: () => [],
+    computeAutomaticQualifiers: () => [],
+    validateSetScore: () => ({ ok: true }),
+    buildCrossGroupSeedOrder: () => [],
+    swapFinalSeedSlots: () => ({ ok: true }),
+    confirmBye: () => ({ ok: true }),
+    placeByeTeam: () => ({ ok: true }),
+    generateBracket: () => ({ matches: [] }),
+    recordMatchResult: () => {},
+    invalidateDescendantResults: () => [],
+    renderBracket: () => {},
+    buildFullResultsCsv: () => "",
+    downloadCsv: () => {},
+    normalizeRingOrder,
+    renderRingDiagram: renderRingDiagramForTest,
+    orderExistingRoundRobinMatchIds: () => [],
+    adminWorkflowCallable: async () => ({}),
+    getPlannerVisibleAdjacent: () => ({ previousMatchKey: null, nextMatchKey: null }),
+    isPlannerMatchCompleted: () => false,
+    movePlannerAssignment: (assignments) => assignments.map((item) => ({ ...item })),
+    movePlannerMatchByOffset,
+    plannerPhaseMatches: () => true,
+    reconcilePlannerAssignments: (assignments) => assignments,
+    groupPlannerAssignments: () => new Map(),
+    correctionConfirmationState: () => ({}),
+    correctionSelectionInfo: () => ({}),
+    correctionSelectionKeys: (selection) => selection,
+    correctionSelectionMatches: () => false,
+    eligibleCorrectionCandidates: () => [],
+    isCorrectionCandidateEligible: () => false,
+    upgradeLegacyBackup: () => ({}),
+    courtMatchSummary,
+    courtTeamNames,
+    formatCourtName,
+    normalizeCourtName,
+    getPrelimRingEdgeLabels,
+    projectPrelimCourtSchedule,
+    TOURNAMENT_ID: "test",
+    confirm: () => true,
+    alert: () => {},
+    prompt: () => "",
+  };
+  Object.assign(window, context);
+  const sourcePath = new URL("./admin.js", import.meta.url);
+  const rawSource = fs.readFileSync(sourcePath, "utf8");
+  const bootstrapMarker = "// ---------------- 부트스트랩 ----------------";
+  const bootstrapStart = rawSource.indexOf(bootstrapMarker);
+  const bootstrapEnd = rawSource.indexOf("// ---------------- 연결 상태 감시 ----------------", bootstrapStart);
+  assert.ok(bootstrapStart >= 0 && bootstrapEnd > bootstrapStart, "admin bootstrap boundaries exist");
+  const source = (rawSource.slice(0, bootstrapStart) + rawSource.slice(bootstrapEnd))
+    .replace(/^import[\s\S]*?;\s*/gm, "");
+  const bridge = `
+    renderGroupList = () => {};
+    renderTeamGroupSelect = () => {};
+    renderGroupTeamLists = () => {};
+    renderFinalTeamPicker = () => {};
+    renderScoreReviews = () => {};
+    updatePrelimMutationGuardUi = () => {};
+    renderCourtSettings = () => {};
+    renderCourtBoard = () => {};
+    syncPrelimCourtSelects = () => {};
+    syncPrelimCourtBadges = () => {};
+    syncWorkflowSaveControls = () => {};
+    syncWorkflowPhaseFilter = () => {};
+    buildRoundRobinControls = () => document.createElement("div");
+    buildRingControls = (group, groupTeams) => {
+      const host = document.createElement("div");
+      const ringOrder = normalizeRingOrder(group.ringOrder, groupTeams.map((team) => team.id));
+      renderRingDiagram(host, {
+        ringOrder,
+        edgeLabels: getPrelimRingEdgeLabels(ringOrder, prelimCourtSchedule()),
+      });
+      return host;
+    };
+    let preservedScoreInput = null;
+    let preservedScoreRow = null;
+    const projectionFixture = {
+      groups: [{
+        id: "group-a", division: "men", name: "A조", matchMode: "ring",
+        ringOrder: ["team-a", "team-b", "team-c"],
+      }],
+      teams: [
+        { id: "team-a", division: "men", groupId: "group-a", name: "A팀" },
+        { id: "team-b", division: "men", groupId: "group-a", name: "B팀" },
+        { id: "team-c", division: "men", groupId: "group-a", name: "C팀" },
+      ],
+      matches: [
+        { id: "match-ab", division: "men", groupId: "group-a", round: 1, teamA: "team-a", teamB: "team-b", sets: [] },
+        { id: "match-bc", division: "men", groupId: "group-a", round: 2, teamA: "team-b", teamB: "team-c", sets: [] },
+        { id: "match-ca", division: "men", groupId: "group-a", round: 3, teamA: "team-c", teamB: "team-a", sets: [] },
+      ],
+      assignments: [
+        { matchKey: "match-ab", matchType: "prelim", courtId: "court-a", courtOrder: 5 },
+        { matchKey: "match-bc", matchType: "prelim", courtId: "court-a", courtOrder: 3 },
+        { matchKey: "match-ca", matchType: "prelim", courtId: "court-a", courtOrder: 1 },
+      ],
+      courts: [{ id: "court-a", name: "A" }],
+    };
+    function projectionRows(rootId) {
+      const root = document.getElementById(rootId);
+      const lanes = root.querySelector("[data-prelim-court-lanes='group-a']");
+      const list = lanes?.querySelector("[data-prelim-court-lane-list='court-a']");
+      return list ? [...list.children] : [];
+    }
+    function projectionRingLabels(rootId) {
+      return [...document.getElementById(rootId).querySelectorAll(".ring-edge-label")]
+        .map((label) => ({ text: label.textContent, title: label.title }));
+    }
+    function projectionState() {
+      const setupRows = projectionRows("prelimSetupGroups");
+      const scoreRows = projectionRows("prelimGroups");
+      const setupHint = document.getElementById("prelimSetupGroups")
+        .querySelector(":scope > [data-prelim-workflow-hint]");
+      const scoreHint = document.getElementById("prelimGroups")
+        .querySelector(":scope > [data-prelim-workflow-hint]");
+      return {
+        setupIds: setupRows.map((row) => row.dataset.prelimMatchRow),
+        scoreIds: scoreRows.map((row) => row.dataset.prelimMatchRow),
+        setupExecution: setupRows.map((row) => row.querySelector("[data-prelim-execution-label]")?.textContent),
+        scoreExecution: scoreRows.map((row) => row.querySelector("[data-prelim-execution-label]")?.textContent),
+        setupRing: projectionRingLabels("prelimSetupGroups"),
+        scoreRing: projectionRingLabels("prelimGroups"),
+        dirty: workflowDirty,
+        setupHintVisible: setupHint ? !setupHint.hidden : false,
+        scoreHintVisible: scoreHint ? !scoreHint.hidden : false,
+        hintText: setupHint?.textContent || "",
+        scoreInputPreserved: Boolean(
+          preservedScoreRow
+            && preservedScoreRow.querySelector("input") === preservedScoreInput,
+        ),
+        scoreRowPreserved: projectionRows("prelimGroups").includes(preservedScoreRow),
+        scoreInputValue: preservedScoreInput?.value || "",
+      };
+    }
+    globalThis.__adminProjectionTest = {
+      setup() {
+        allGroups = projectionFixture.groups.map((group) => ({ ...group }));
+        allTeams = projectionFixture.teams.map((team) => ({ ...team }));
+        allPrelimMatches = projectionFixture.matches.map((match) => ({ ...match }));
+        workflowDraftAssignments = projectionFixture.assignments.map((assignment) => ({ ...assignment }));
+        workflowDraftCourts = projectionFixture.courts.map((court) => ({ ...court }));
+        reviewAssignments = [];
+        reviewWorkflows = new Map();
+        prelimHistoryReadiness = { status: "ready", error: null };
+        workflowPhaseFilter = "all";
+        workflowDirty = false;
+        refreshActiveDivisionData();
+        preservedScoreRow = document.getElementById("prelimGroups")
+          .querySelector("[data-prelim-match-row='match-ab']");
+        preservedScoreInput = document.createElement("input");
+        preservedScoreInput.value = "25";
+        preservedScoreRow?.appendChild(preservedScoreInput);
+        return projectionState();
+      },
+      moveDraft() {
+        moveWorkflowMatch("match-ab", -1);
+        return projectionState();
+      },
+    };
+  `;
+  vm.runInNewContext(`${source}\n${bridge}`, context, { filename: "admin.js" });
+  return {
+    setup: () => context.__adminProjectionTest.setup(),
+    moveDraft: () => context.__adminProjectionTest.moveDraft(),
+  };
+}
+
+const adminProjectionUi = createAdminProjectionHarness();
+const savedProjectionUi = adminProjectionUi.setup();
+check(
+  'admin setup and score views initially share projected court execution order',
+  JSON.stringify(savedProjectionUi.setupIds) === JSON.stringify(['match-ca', 'match-bc', 'match-ab'])
+    && JSON.stringify(savedProjectionUi.scoreIds) === JSON.stringify(savedProjectionUi.setupIds)
+    && JSON.stringify(savedProjectionUi.setupExecution) === JSON.stringify(savedProjectionUi.scoreExecution)
+    && savedProjectionUi.setupExecution[0] === 'A코트 · 전체 1번째'
+    && savedProjectionUi.setupExecution[2] === 'A코트 · 전체 5번째',
+);
+check(
+  'saved planner projection keeps preliminary hints hidden',
+  !savedProjectionUi.dirty && !savedProjectionUi.setupHintVisible && !savedProjectionUi.scoreHintVisible,
+);
+const draftedProjectionUi = adminProjectionUi.moveDraft();
+check(
+  'planner draft reorders existing setup and score rows and updates ring labels',
+  JSON.stringify(draftedProjectionUi.setupIds) === JSON.stringify(['match-ca', 'match-ab', 'match-bc'])
+    && JSON.stringify(draftedProjectionUi.scoreIds) === JSON.stringify(draftedProjectionUi.setupIds)
+    && draftedProjectionUi.setupRing.map((item) => item.text).join("|") === "A·3|A·5|A·1"
+    && draftedProjectionUi.scoreRing.map((item) => item.text).join("|") === "A·3|A·5|A·1",
+);
+check(
+  'planner draft preserves score input node and value while marking both views unsaved',
+  draftedProjectionUi.scoreRowPreserved
+    && draftedProjectionUi.scoreInputPreserved
+    && draftedProjectionUi.scoreInputValue === "25"
+    && draftedProjectionUi.dirty
+    && draftedProjectionUi.setupHintVisible
+    && draftedProjectionUi.scoreHintVisible
+    && draftedProjectionUi.hintText.includes("저장되지 않은 코트"),
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

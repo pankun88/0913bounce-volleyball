@@ -17,6 +17,7 @@ const groupsCol = () => collection(db, "tournaments", TID, "groups");
 const teamsCol = () => collection(db, "tournaments", TID, "teams");
 const prelimCol = () => collection(db, "tournaments", TID, "prelimMatches");
 const finalCol = (division) => collection(db, "tournaments", TID, "divisions", division, "finalMatches");
+const publicScheduleDoc = () => doc(db, "tournaments", TID, "publicSchedule", "current");
 
 /** onSnapshot 오류를 콘솔뿐 아니라 화면(firestore-error 이벤트)으로도 알린다 */
 function reportSnapshotError(label, err) {
@@ -159,6 +160,70 @@ export function subscribePrelimMatches(cb) {
     clearWatch();
     reportSnapshotError("예선경기 구독", err);
   });
+}
+
+// ---------- 공개 코트 일정 ----------
+
+/**
+ * 공개 대시보드는 저장된 공개 투영만 구독한다. 문서가 아직 없을 때만
+ * 서버에 기존 저장 상태로 투영을 만들도록 한 번 요청하고, 그 결과를
+ * 다시 스냅샷으로 받는다. 실패한 요청은 사용자의 명시적인 retry 호출
+ * 전까지 반복하지 않는다.
+ */
+export function subscribePublicSchedule(cb) {
+  let closed = false;
+  let ensureAttempted = false;
+  let ensurePending = false;
+  let clearWatch = watchForTimeout("공개 경기 일정");
+  let stopSnapshot = () => {};
+
+  const ensure = async () => {
+    if (closed || ensureAttempted || ensurePending) return;
+    ensureAttempted = true;
+    ensurePending = true;
+    try {
+      await httpsCallable(functions, "ensurePublicSchedule")({ tournamentId: TID });
+    } catch (err) {
+      if (!closed) reportSnapshotError("공개 경기 일정 초기화", err);
+    } finally {
+      ensurePending = false;
+    }
+  };
+
+  const retry = () => {
+    if (closed) return;
+    ensureAttempted = false;
+    stopSnapshot();
+    clearWatch();
+    clearWatch = watchForTimeout("공개 경기 일정");
+    listen();
+    ensure();
+  };
+
+  const listen = () => {
+    stopSnapshot = onSnapshot(publicScheduleDoc(), { includeMetadataChanges: true }, (snap) => {
+      if (serverConfirmed(snap)) clearWatch();
+      if (snap.exists()) {
+        ensureAttempted = false;
+        cb(snap.data(), snap.metadata);
+        return;
+      }
+      cb(null, snap.metadata);
+      ensure();
+    }, (err) => {
+      clearWatch();
+      if (!closed) reportSnapshotError("공개 경기 일정 구독", err);
+    });
+  };
+  listen();
+
+  const unsubscribe = () => {
+    closed = true;
+    clearWatch();
+    stopSnapshot();
+  };
+  unsubscribe.retry = retry;
+  return unsubscribe;
 }
 
 // ---------- 본선 ----------
