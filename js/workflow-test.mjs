@@ -146,6 +146,12 @@ const queue = (changes = {}) => ({
     score: { sets: [{ a: 10, b: 8 }, { a: 10, b: 9 }] },
     operationId: 'operation-1',
     storageKey: 'recorder-score:tournament:M1:uid',
+    fixtureIdentity: {
+      matchKey: 'M1', matchType: 'prelim', divisionId: 'men',
+      teamAId: 'team-a', teamBId: 'team-b', officialRevision: 0,
+      lastTransitionId: 'fixture-created',
+    },
+    contextVersion: 0,
   });
   const retained = reconcileRecorderSubmit({
     pendingSubmit: pending,

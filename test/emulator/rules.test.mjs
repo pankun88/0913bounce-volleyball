@@ -195,7 +195,7 @@ export async function runRulesSuite() {
       name: 'UI-owned tournament name',
       updatedAt: serverTimestamp(),
     }));
-    await assertSucceeds(updateDoc(doc(seededAdmin, 'tournaments/main'), {
+    await assertFails(updateDoc(doc(seededAdmin, 'tournaments/main'), {
       qualifyPerGroup: { men: 2, women: 3 },
       updatedAt: serverTimestamp(),
     }));
@@ -226,12 +226,34 @@ export async function runRulesSuite() {
       unknownRootField: true,
       updatedAt: serverTimestamp(),
     }));
-    await assertSucceeds(setDoc(doc(seededAdmin, path('groups', 'rule-group')), { name: 'Allowed group' }));
+    await assertFails(setDoc(doc(seededAdmin, path('groups', 'rule-group')), { name: 'Allowed group', division: 'men' }));
+    await f.seed(async (admin) => {
+      await setDoc(doc(admin, path('groups', 'rule-group')), { name: 'Allowed group', division: 'men' });
+      await setDoc(doc(admin, path('teams', 'rule-team')), { name: 'Allowed team', division: 'men', groupId: 'rule-group' });
+    });
     await assertSucceeds(updateDoc(doc(seededAdmin, path('groups', 'rule-group')), { name: 'Updated group' }));
     await assertFails(deleteDoc(doc(seededAdmin, path('groups', 'rule-group'))));
-    await assertSucceeds(setDoc(doc(seededAdmin, path('teams', 'rule-team')), { name: 'Allowed team' }));
+    await assertFails(setDoc(doc(seededAdmin, path('teams', 'new-rule-team')), { name: 'Blocked direct create', division: 'men', groupId: 'rule-group' }));
     await assertSucceeds(updateDoc(doc(seededAdmin, path('teams', 'rule-team')), { name: 'Updated team' }));
     await assertFails(deleteDoc(doc(seededAdmin, path('teams', 'rule-team'))));
+    await assertFails(updateDoc(doc(seededAdmin, 'tournaments/main'), {
+      finalQualification: { men: { status: 'current' } },
+      updatedAt: serverTimestamp(),
+    }));
+    await f.seed(async (admin) => {
+      await updateDoc(doc(admin, 'tournaments/main'), { finalQualification: { men: { status: 'current' } } });
+    });
+    await assertFails(setDoc(doc(seededAdmin, path('groups', 'published-group')), { name: 'Late group', division: 'men' }));
+    await assertFails(setDoc(doc(seededAdmin, path('teams', 'published-team')), { name: 'Late team', division: 'men', groupId: 'rule-group' }));
+    await assertFails(updateDoc(doc(seededAdmin, path('groups', 'rule-group')), { matchMode: 'roundrobin' }));
+    await assertFails(updateDoc(doc(seededAdmin, path('teams', 'rule-team')), { groupId: 'another-group' }));
+    await assertFails(updateDoc(doc(seededAdmin, path('teams', 'rule-team')), { division: 'women' }));
+    await assertSucceeds(updateDoc(doc(seededAdmin, path('groups', 'rule-group')), { name: 'Display name only', order: 2 }));
+    await assertSucceeds(updateDoc(doc(seededAdmin, path('teams', 'rule-team')), { name: 'Display team only', order: 2 }));
+    await assertFails(setDoc(doc(seededAdmin, path('groups', 'open-women-group')), { name: 'Use authoritative callable', division: 'women' }));
+    await f.seed(async (admin) => {
+      await updateDoc(doc(admin, 'tournaments/main'), { finalQualification: deleteField() });
+    });
     await assertFails(setDoc(doc(seededAdmin, path('prelimMatches', 'rule-match')), {
       id: 'rule-match', status: 'pending', sets: [], result: null,
     }));

@@ -7,6 +7,9 @@ import {
   evaluateFinalMatch,
   computeGroupStandings,
   computeAutomaticQualifiers,
+  buildQualificationSnapshot,
+  computeQualificationState,
+  validateQualificationSelection,
   normalizePlayedSets,
   validateSetScore,
 } from './match-logic.js';
@@ -44,9 +47,29 @@ import {
 } from './recorder-state.js';
 
 let pass = 0, fail = 0;
+const recorderFixtureIdentity = {
+  matchKey: 'M1', matchType: 'prelim', divisionId: 'men',
+  teamAId: 'team-a', teamBId: 'team-b', officialRevision: 0,
+  lastTransitionId: 'fixture-created',
+};
 function check(label, cond) {
   if (cond) { pass++; }
   else { fail++; console.error('FAIL:', label); }
+}
+
+{
+  const source = fs.readFileSync(new URL('./workflow-service.js', import.meta.url), 'utf8')
+    .replace(/^import[\s\S]*?;\s*/gm, '')
+    .replace(/^export /gm, '');
+  const context = { TOURNAMENT_ID: 'test' };
+  vm.runInNewContext(`${source}
+    globalThis.structuredReason = recorderReason({details:{reason:"qualification_unverified"}});
+    globalThis.messageReason = recorderReason({message:"qualification_unverified"});
+  `, context);
+  check('unverified final qualification gives recorder actionable Korean guidance',
+    context.structuredReason.includes('본선 진출팀') && context.structuredReason.includes('관리자'));
+  check('unverified qualification guidance also handles plain reason responses',
+    context.messageReason === context.structuredReason);
 }
 
 // A cached assignment may briefly contain the post-swap court. Only the
@@ -84,7 +107,7 @@ function check(label, cond) {
   const movedKey = 'recorder-score:tournament:M2:uid-1';
   const draft = { sets: [{ a: 10, b: 8 }] };
   const pendingSave = {
-    context: { matchKey: 'M1', courtId: 'court-a', storageKey: originalKey },
+    context: { matchKey: 'M1', courtId: 'court-a', storageKey: originalKey, fixtureIdentity: recorderFixtureIdentity },
     draft,
     touched: new Set(['0-a']),
     expectedRevision: 3,
@@ -93,6 +116,7 @@ function check(label, cond) {
     draft: pendingSave.draft,
     touched: [...pendingSave.touched],
     revision: pendingSave.expectedRevision,
+    identity: pendingSave.context.fixtureIdentity,
   });
   const recovered = readStoredRecorderDraft(storage, originalKey);
   check(
@@ -113,6 +137,8 @@ function check(label, cond) {
     score: { sets: [{ a: 10, b: 8 }] },
     operationId: 'operation-1',
     storageKey: 'recorder-score:tournament:M1:uid-1',
+    fixtureIdentity: recorderFixtureIdentity,
+    contextVersion: 0,
   });
   const rejected = reconcileRecorderSubmit({
     pendingSubmit: pending,
@@ -1663,6 +1689,10 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
         return child;
       },
       append(...children) { children.forEach((child) => this.appendChild(child)); },
+      prepend(...children) {
+        children.forEach((child) => { child.parentNode = this; });
+        this.children.unshift(...children);
+      },
       replaceChildren(...children) {
         this.children = [];
         this.lastChildren = children;
@@ -1878,7 +1908,10 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
     evaluatePrelimMatch: options.realData ? evaluatePrelimMatch : () => ({ result: null, status: 'pending' }),
     computeGroupStandings: options.realData ? computeGroupStandings : () => [],
     publicMatchView: options.realData ? publicMatchView : (match) => match,
-    renderBracket: (...args) => { bracketRenders.push(args); },
+    renderBracket: (...args) => {
+      if (options.clearBracketRender) args[0].replaceChildren();
+      bracketRenders.push(args);
+    },
     displayTeamName: (name) => name,
     getRingEdges,
     normalizeRingOrder: options.realData ? normalizeRingOrder : () => [],
@@ -1890,8 +1923,8 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
   Object.assign(window, context);
   const bridge = `
     globalThis.__dashboardTest = {
-      snapshot(info) {
-        subscriptions.tournament(info, { fromCache: false, hasPendingWrites: false });
+      snapshot(info, metadata = { fromCache: false, hasPendingWrites: false }) {
+        subscriptions.tournament(info, metadata);
       },
       groups(data, metadata = { fromCache: false, hasPendingWrites: false }) {
         subscriptions.groups(data, metadata);
@@ -1901,6 +1934,9 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
       },
       prelim(data, metadata = { fromCache: false, hasPendingWrites: false }) {
         subscriptions.prelim(data, metadata);
+      },
+      finals(division, data, metadata = { fromCache: false, hasPendingWrites: false }) {
+        subscriptions.final[division](data, metadata);
       },
       publicSchedule(data, metadata = { fromCache: false, hasPendingWrites: false }) {
         subscriptions.publicSchedule(data, metadata);
@@ -1936,12 +1972,16 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
     };
   `;
   vm.runInNewContext(`${source}\n${bridge}`, context, { filename: 'dashboard.js' });
+  if (options.initialConfirmed !== false) {
+    context.__dashboardTest.snapshot({ maintenance: { enabled: false } });
+  }
   return {
     state: () => context.__dashboardTest.state(),
-    snapshot: (info) => context.__dashboardTest.snapshot(info),
+    snapshot: (info, metadata) => context.__dashboardTest.snapshot(info, metadata),
     groups: (data, metadata) => context.__dashboardTest.groups(data, metadata),
     teams: (data, metadata) => context.__dashboardTest.teams(data, metadata),
     prelim: (data, metadata) => context.__dashboardTest.prelim(data, metadata),
+    finals: (division, data, metadata) => context.__dashboardTest.finals(division, data, metadata),
     publicSchedule: (data, metadata) => context.__dashboardTest.publicSchedule(data, metadata),
     clickDivision: (division) => context.__dashboardTest.clickDivision(division),
     clickTab: (tab) => context.__dashboardTest.clickTab(tab),
@@ -2027,6 +2067,12 @@ venue.advance(15000);
 venue.snapshot({ maintenance: { enabled: false }, venueDisplay: { mode: 'auto', intervalSeconds: 15 } });
 venueState = venue.state();
 check('maintenance resume restores auto progress', !venueState.maintenanceActive && venueState.timerCount === 1 && !venueState.venueHidden);
+venue.error("대회정보 구독", { code: "permission-denied" });
+check("terminated root listener pauses venue rotation", venue.timerCount() === 0);
+venue.snapshot({ maintenance: { enabled: false } }, { fromCache: true, hasPendingWrites: false });
+check("cached root cannot restart venue rotation after terminal failure", venue.timerCount() === 0);
+venue.snapshot({ maintenance: { enabled: false }, venueDisplay: { mode: "auto", intervalSeconds: 15 } });
+check("authoritative root recovery restores exactly one venue timer", venue.timerCount() === 1);
 
 const viewer = createDashboardHarness('');
 viewer.clickDivision('women');
@@ -2173,6 +2219,70 @@ check(
   dashboardSchedule.state().maintenanceActive
     && dashboardSchedule.element("dashboardLiveContent").hidden
     && dashboardSchedule.element("dashPrelim").children.length === 0,
+);
+
+const dashboardRecovery = createDashboardHarness("", { clearBracketRender: true, initialConfirmed: false });
+check(
+  "spectator results stay hidden before authoritative tournament confirmation",
+  dashboardRecovery.element("dashboardLiveContent").hidden,
+);
+dashboardRecovery.snapshot({ maintenance: { enabled: false } });
+check(
+  "authoritative tournament confirmation enables spectator results",
+  !dashboardRecovery.element("dashboardLiveContent").hidden,
+);
+dashboardRecovery.snapshot({ maintenance: { enabled: false } }, { fromCache: true, hasPendingWrites: false });
+check(
+  "ordinary offline cache keeps last confirmed spectator results visible",
+  !dashboardRecovery.element("dashboardLiveContent").hidden,
+);
+dashboardRecovery.error("대회정보 구독", { code: "permission-denied" });
+check(
+  "terminal tournament subscription failure hides potentially stale official results",
+  dashboardRecovery.element("dashboardLiveContent").hidden
+    && !dashboardRecovery.element("maintenanceNotice").hidden,
+);
+dashboardRecovery.snapshot({ maintenance: { enabled: false } }, { fromCache: true, hasPendingWrites: false });
+check(
+  "cached root snapshot cannot reopen a terminally disconnected spectator view",
+  dashboardRecovery.element("dashboardLiveContent").hidden,
+);
+dashboardRecovery.snapshot({ maintenance: { enabled: true } });
+check(
+  "recovered maintenance snapshot keeps spectator results hidden",
+  dashboardRecovery.state().maintenanceActive
+    && dashboardRecovery.element("dashboardLiveContent").hidden,
+);
+dashboardRecovery.snapshot({ maintenance: { enabled: false } });
+check(
+  "recovered authoritative open state restores spectator results",
+  !dashboardRecovery.element("dashboardLiveContent").hidden,
+);
+check(
+  "no qualification warning is shown before a final bracket exists",
+  !dashboardNodeText(dashboardRecovery.element("dashBracketContainer")).includes("재확인"),
+);
+dashboardRecovery.finals("men", [{ id: "final-fixture", round: 1, status: "pending" }]);
+check(
+  "unverified existing final bracket is prominently marked as the previous publication",
+  dashboardRecovery.element("dashBracketContainer").children[0]?.className === "qualification-stale-notice"
+    && dashboardNodeText(dashboardRecovery.element("dashBracketContainer")).includes("이전 공개 대진"),
+);
+dashboardRecovery.snapshot({
+  maintenance: { enabled: false },
+  finalQualification: { men: { status: "current" } },
+});
+check(
+  "verified current qualification removes the spectator warning",
+  !dashboardNodeText(dashboardRecovery.element("dashBracketContainer")).includes("재확인"),
+);
+dashboardRecovery.snapshot({
+  maintenance: { enabled: false },
+  finalQualification: { men: { status: "stale" } },
+});
+check(
+  "preliminary correction reintroduces the previous-publication warning",
+  dashboardNodeText(dashboardRecovery.element("dashBracketContainer")).includes("이전 공개 대진"),
 );
 
 // ---- dashboard viewport fitting ----
@@ -2808,6 +2918,9 @@ function createAdminProjectionHarness() {
     evaluateFinalMatch: () => ({ result: null, status: "pending" }),
     computeGroupStandings: () => [],
     computeAutomaticQualifiers: () => [],
+    buildQualificationSnapshot,
+    computeQualificationState,
+    validateQualificationSelection,
     validateSetScore: () => ({ ok: true }),
     buildCrossGroupSeedOrder: () => [],
     swapFinalSeedSlots: () => ({ ok: true }),

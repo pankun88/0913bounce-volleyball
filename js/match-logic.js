@@ -354,6 +354,484 @@ export function computeAutomaticQualifiers(standings, qualificationCount) {
   ));
 }
 
+// ---------- 예선 진출 검증 (공통 브라우저/서버 로직) ----------
+
+/*
+ * Qualification data is deliberately kept separate from display data. The
+ * snapshot below contains only identifiers, schedule topology and score
+ * revisions/currentness. Names, display order and court assignment fields
+ * therefore cannot invalidate an already prepared publication.
+ */
+function qualificationRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  if (value.data && typeof value.data === 'object' && !Array.isArray(value.data)) {
+    return { ...value.data, id: value.id };
+  }
+  return value;
+}
+
+function qualificationId(value) {
+  const record = qualificationRecord(value);
+  return typeof record.id === 'string' ? record.id : null;
+}
+
+function qualificationString(value) {
+  return typeof value === 'string' ? value : null;
+}
+
+function qualificationNumber(value) {
+  return Number.isInteger(value) ? value : (value == null ? null : Number(value));
+}
+
+function canonicalQualification(value) {
+  if (Array.isArray(value)) return value.map(canonicalQualification);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalQualification(value[key])]),
+    );
+  }
+  return value === undefined ? null : value;
+}
+
+function qualificationPairKey(a, b) {
+  return [a, b].sort().join('\u0000');
+}
+
+function expectedQualificationPairs(group, teamIds) {
+  const mode = group.matchMode || group.mode || group.scheduleMode || 'ring';
+  if (mode === 'ring') {
+    const ringCandidate = Array.isArray(group.ringOrder) && group.ringOrder.length
+      ? group.ringOrder
+      : [...teamIds];
+    const ring = new Set(ringCandidate).size === teamIds.length
+      && ringCandidate.every((id) => teamIds.includes(id))
+      ? ringCandidate : [...teamIds];
+    if (ring.length < 2) return [];
+    if (ring.length === 2) return [qualificationPairKey(ring[0], ring[1])];
+    return ring.map((id, index) => qualificationPairKey(id, ring[(index + 1) % ring.length]));
+  }
+  const pairs = [];
+  for (let i = 0; i < teamIds.length; i += 1) {
+    for (let j = i + 1; j < teamIds.length; j += 1) {
+      pairs.push(qualificationPairKey(teamIds[i], teamIds[j]));
+    }
+  }
+  return pairs;
+}
+
+function qualificationSets(value) {
+  const sets = Array.isArray(value) ? value : [];
+  return sets.map((set) => ({
+    a: Number.isInteger(set?.a) ? set.a : null,
+    b: Number.isInteger(set?.b) ? set.b : null,
+  }));
+}
+
+function qualificationSnapshotMatch(value) {
+  const match = qualificationRecord(value);
+  const currentness = match.officialCurrent === undefined
+    ? match.current : match.officialCurrent;
+  return {
+    id: qualificationId(match),
+    division: qualificationString(match.division),
+    groupId: qualificationString(match.groupId),
+    teamA: qualificationString(match.teamA),
+    teamB: qualificationString(match.teamB),
+    round: qualificationNumber(match.round),
+    index: qualificationNumber(match.index),
+    sets: qualificationSets(match.sets),
+    status: qualificationString(match.status),
+    result: qualificationString(match.result),
+    winner: qualificationString(match.winner),
+    winnerSide: qualificationString(match.winnerSide),
+    winnerTeam: qualificationString(match.winnerTeam?.id || match.winnerTeam),
+    setsWonA: qualificationNumber(match.setsWonA),
+    setsWonB: qualificationNumber(match.setsWonB),
+    pointsForA: qualificationNumber(match.pointsForA),
+    pointsForB: qualificationNumber(match.pointsForB),
+    officialCurrent: currentness === undefined || currentness === null
+      ? null : currentness === true ? true : currentness === false ? false : 'invalid',
+    dependencyReady: match.dependencyReady === undefined || match.dependencyReady === null
+      ? null : match.dependencyReady === true ? true : match.dependencyReady === false ? false : 'invalid',
+    retracted: match.retracted === true,
+    officialRevision: qualificationNumber(match.officialRevision) ?? 0,
+    revision: qualificationNumber(match.revision),
+    scoreRevision: qualificationNumber(match.scoreRevision),
+    lastTransitionId: qualificationString(match.lastTransitionId),
+    transitionId: qualificationString(match.transitionId),
+  };
+}
+
+/**
+ * Build the canonical, cosmetic-free preliminary input for one division.
+ *
+ * Records may be plain objects or `{id, data: {...}}` Firestore-like records.
+ * No validation is performed here; computeQualificationState returns all
+ * blockers so callers can present them without partially applying a result.
+ */
+export function buildQualificationSnapshot({
+  division,
+  qualifyPerGroup,
+  groups = [],
+  teams = [],
+  matches = [],
+} = {}) {
+  const normalizeGroup = (value) => {
+    const group = qualificationRecord(value);
+    const id = qualificationId(group);
+    return {
+      id,
+      division: qualificationString(group.division),
+      matchMode: qualificationString(group.matchMode || group.mode || group.scheduleMode)
+        || 'ring',
+      ringOrder: Array.isArray(group.ringOrder)
+        ? group.ringOrder.filter((item) => typeof item === 'string')
+        : [],
+    };
+  };
+  const normalizeTeam = (value) => {
+    const team = qualificationRecord(value);
+    return {
+      id: qualificationId(team),
+      division: qualificationString(team.division),
+      groupId: qualificationString(team.groupId),
+      name: typeof team.name === 'string' ? team.name : '',
+    };
+  };
+  const normalizedGroups = (Array.isArray(groups) ? groups : []).map(normalizeGroup)
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const normalizedTeams = (Array.isArray(teams) ? teams : []).map(normalizeTeam)
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const normalizedMatches = (Array.isArray(matches) ? matches : []).map(qualificationSnapshotMatch)
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const count = Number.isInteger(qualifyPerGroup)
+    ? qualifyPerGroup
+    : Number(qualifyPerGroup);
+  return canonicalQualification({
+    version: 1,
+    division: qualificationString(division),
+    qualifyPerGroup: Number.isFinite(count) ? Math.floor(count) : null,
+    groups: normalizedGroups,
+    teams: normalizedTeams,
+    matches: normalizedMatches,
+  });
+}
+
+function qualificationBlocker(code, message) {
+  return `${code}: ${message}`;
+}
+
+function standingTeamIds(standings) {
+  return standings.map((standing) => standing.teamId);
+}
+
+/**
+ * Compute standings and structural blockers for a canonical snapshot.
+ *
+ * `ready` means all populated groups have a complete, current schedule.
+ * Cutoff lottery choices are exposed through each group's cutoffSlots and
+ * are validated separately, so the input remains ready while choices render.
+ */
+export function computeQualificationState(snapshot = {}) {
+  const blockers = [];
+  const groups = Array.isArray(snapshot.groups) ? snapshot.groups : [];
+  const teams = Array.isArray(snapshot.teams) ? snapshot.teams : [];
+  const matches = Array.isArray(snapshot.matches) ? snapshot.matches : [];
+  const division = snapshot.division;
+  const count = snapshot.qualifyPerGroup;
+  const groupIds = new Set();
+  const teamIds = new Set();
+  const matchIds = new Set();
+  const teamsByGroup = new Map();
+  const matchesByGroup = new Map();
+
+  if (!['men', 'women'].includes(division)) {
+    blockers.push(qualificationBlocker('invalid_division', 'A supported division is required.'));
+  }
+  if (!Number.isInteger(count) || count < 1 || count > 64) {
+    blockers.push(qualificationBlocker('invalid_qualification_count', 'Qualification count must be an integer from 1 to 64.'));
+  }
+  groups.forEach((group) => {
+    if (!group.id || groupIds.has(group.id)) {
+      blockers.push(qualificationBlocker('duplicate_group', `Group identifiers must be unique (${group.id || 'unknown'}).`));
+      return;
+    }
+    groupIds.add(group.id);
+    if (group.division !== division) {
+      blockers.push(qualificationBlocker('foreign_group', `Group does not belong to the selected division (${group.id}).`));
+    }
+  });
+  teams.forEach((team) => {
+    if (!team.id || teamIds.has(team.id)) {
+      blockers.push(qualificationBlocker('duplicate_team', `Team identifiers must be unique (${team.id || 'unknown'}).`));
+      return;
+    }
+    teamIds.add(team.id);
+    if (team.division !== division) {
+      blockers.push(qualificationBlocker('foreign_team', `Team does not belong to the selected division (${team.id}).`));
+    }
+    if (team.groupId && !groupIds.has(team.groupId)) {
+      blockers.push(qualificationBlocker('unknown_team_group', `Team ${team.id} references unknown group ${team.groupId}.`));
+    }
+    if (team.groupId) {
+      if (!teamsByGroup.has(team.groupId)) teamsByGroup.set(team.groupId, []);
+      teamsByGroup.get(team.groupId).push(team);
+    }
+  });
+  matches.forEach((match) => {
+    if (!match.id || matchIds.has(match.id)) {
+      blockers.push(qualificationBlocker('duplicate_match', `Preliminary match identifiers must be unique (${match.id || 'unknown'}).`));
+      return;
+    }
+    matchIds.add(match.id);
+    if (match.division !== division) {
+      blockers.push(qualificationBlocker('foreign_match', `Preliminary match does not belong to the selected division (${match.id}).`));
+    }
+    if (!match.groupId || !groupIds.has(match.groupId)) {
+      blockers.push(qualificationBlocker('unknown_match_group', `Preliminary match ${match.id} references unknown group ${match.groupId || 'unknown'}.`));
+      return;
+    }
+    if (!matchesByGroup.has(match.groupId)) matchesByGroup.set(match.groupId, []);
+    matchesByGroup.get(match.groupId).push(match);
+  });
+  for (const [groupId, scheduled] of matchesByGroup) {
+    if (!(teamsByGroup.get(groupId) || []).length) {
+      blockers.push(qualificationBlocker('orphan_match', `Preliminary matches reference an empty group (${groupId}).`));
+    }
+  }
+
+  const groupStates = [];
+  for (const group of groups) {
+    const groupTeams = (teamsByGroup.get(group.id) || []).slice()
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (!groupTeams.length) {
+      if ((matchesByGroup.get(group.id) || []).length) {
+        blockers.push(qualificationBlocker('empty_group_games', `Group ${group.id} has games but no current members.`));
+      }
+      continue;
+    }
+    const memberIds = groupTeams.map((team) => team.id);
+    const memberSet = new Set(memberIds);
+    const scheduled = matchesByGroup.get(group.id) || [];
+    const mode = group.matchMode || 'ring';
+    if (!['roundrobin', 'ring'].includes(mode)) {
+      blockers.push(qualificationBlocker('invalid_schedule_mode', `Unsupported schedule mode in ${group.id}.`));
+    }
+    if (mode === 'ring') {
+      const ring = Array.isArray(group.ringOrder) ? group.ringOrder : [];
+      if (ring.length !== memberIds.length
+          || new Set(ring).size !== ring.length
+          || ring.some((id) => !memberSet.has(id))) {
+        blockers.push(qualificationBlocker('invalid_ring_order', `Ring order must contain every member of ${group.id} exactly once.`));
+      }
+    }
+    const expectedPairs = expectedQualificationPairs(group, memberIds);
+    const expectedSet = new Set(expectedPairs);
+    const seenPairs = new Set();
+    let scheduleValid = memberIds.length >= 2;
+    if (memberIds.length < 2) {
+      blockers.push(qualificationBlocker('insufficient_group_members', `${group.id} must contain at least two teams.`));
+    }
+    for (const match of scheduled) {
+      if (!memberSet.has(match.teamA) || !memberSet.has(match.teamB) || match.teamA === match.teamB) {
+        scheduleValid = false;
+        blockers.push(qualificationBlocker('foreign_match_team', `Preliminary match ${match.id} has a foreign or duplicate group member.`));
+        continue;
+      }
+      const pair = qualificationPairKey(match.teamA, match.teamB);
+      if (seenPairs.has(pair)) {
+        scheduleValid = false;
+        blockers.push(qualificationBlocker('duplicate_game', `Duplicate preliminary pairing in ${group.id} (${match.id}).`));
+      } else {
+        seenPairs.add(pair);
+      }
+      if (!expectedSet.has(pair)) {
+        scheduleValid = false;
+        blockers.push(qualificationBlocker('unexpected_game', `Preliminary pairing ${pair} is not in ${group.id}'s schedule.`));
+      }
+      const evaluated = evaluatePrelimMatch(match.sets);
+      if (match.officialCurrent === 'invalid' || match.dependencyReady === 'invalid'
+          || match.retracted
+          || match.officialCurrent === false || match.status === 'retracted'
+          || match.status === 'invalid' || match.status === 'unresolved'
+          || match.status !== 'done'
+          || !Number.isInteger(match.officialRevision) || match.officialRevision <= 0
+          || evaluated.status !== 'done' || match.dependencyReady === false) {
+        scheduleValid = false;
+        blockers.push(qualificationBlocker(
+          match.officialCurrent === false || match.status === 'retracted'
+            ? 'retracted_match' : 'incomplete_match',
+          `Preliminary match ${match.id} must have a current complete result.`,
+        ));
+      }
+    }
+    for (const pair of expectedPairs) {
+      if (!seenPairs.has(pair)) {
+        scheduleValid = false;
+        blockers.push(qualificationBlocker('missing_game', `Scheduled pairing ${pair} is missing from ${group.id}.`));
+      }
+    }
+    if (scheduled.length !== expectedPairs.length) {
+      scheduleValid = false;
+      blockers.push(qualificationBlocker('schedule_size', `Preliminary schedule for ${group.id} has ${scheduled.length}/${expectedPairs.length} pairings.`));
+    }
+    const standings = computeGroupStandings(groupTeams, scheduled);
+    const seats = Math.min(count > 0 ? count : 0, groupTeams.length);
+    const automatic = scheduleValid
+      ? computeAutomaticQualifiers(standings, seats)
+      : [];
+    const rankSizes = new Map();
+    standings.forEach((standing) => {
+      rankSizes.set(standing.rank, (rankSizes.get(standing.rank) || 0) + 1);
+    });
+    const cutoffRank = standings.find((standing) => (
+      standing.rank <= seats
+      && standing.rank + (rankSizes.get(standing.rank) || 1) - 1 > seats
+    ))?.rank;
+    const cutoffCandidates = cutoffRank == null ? [] : standings
+      .filter((standing) => standing.rank === cutoffRank)
+      .map((standing) => standing.teamId);
+    const automaticIds = standingTeamIds(automatic);
+    const cutoffSlots = Math.max(0, seats - automaticIds.length);
+    groupStates.push({
+      groupId: group.id,
+      requiredCount: seats,
+      standings,
+      automaticIds,
+      cutoffCandidateIds: cutoffCandidates,
+      cutoffSlots,
+    });
+  }
+
+  if (!groupStates.length) blockers.push(qualificationBlocker('no_groups', 'At least one populated qualification group is required.'));
+  const requiredCount = groupStates.reduce((sum, group) => sum + group.requiredCount, 0);
+  return {
+    ready: blockers.length === 0,
+    blockers,
+    requiredCount,
+    groups: groupStates,
+  };
+}
+
+/**
+ * Validate an administrator's complete finalist selection. Automatic
+ * qualifiers are mandatory; only the exact number of cutoff seats may be
+ * supplied by a group's string-array lottery record.
+ */
+export function validateQualificationSelection(state, participantIds, tieSelections = {}) {
+  const errors = [];
+  if (!state || typeof state !== 'object' || !Array.isArray(state.groups)) {
+    errors.push(qualificationBlocker('qualification_state_required', 'Qualification state is required.'));
+  }
+  const selections = tieSelections && typeof tieSelections === 'object' && !Array.isArray(tieSelections)
+    ? tieSelections
+    : null;
+  const requested = Array.isArray(participantIds) ? participantIds : null;
+  if (!requested) errors.push(qualificationBlocker('participant_ids_required', 'Participant IDs are required.'));
+  if (!selections) errors.push(qualificationBlocker('tie_selections_required', 'Tie selections are required.'));
+  const selectedIds = requested || [];
+  const selectedSet = new Set();
+  if (new Set(selectedIds).size !== selectedIds.length
+      || selectedIds.some((id) => typeof id !== 'string' || !id)) {
+    errors.push(qualificationBlocker('duplicate_participant', 'Participant IDs must be unique non-empty strings.'));
+  }
+  const knownTeams = new Set((state?.groups || []).flatMap((group) => (
+    group.standings || []
+  ).map((standing) => standing.teamId)));
+  selectedIds.forEach((id) => {
+    if (!knownTeams.has(id)) errors.push(qualificationBlocker('foreign_participant', `Participant ${id} is not a qualified group member.`));
+    selectedSet.add(id);
+  });
+  for (const group of state?.groups || []) {
+    const automatic = new Set(group.automaticIds || []);
+    const picked = selections?.[group.groupId];
+    const rawPicked = picked == null ? [] : picked;
+    if (!Array.isArray(rawPicked)) {
+      errors.push(qualificationBlocker('invalid_tie_selection', `Tie selection for ${group.groupId} must be a string array.`));
+      continue;
+    }
+    const uniquePicked = [...new Set(rawPicked)];
+    if (uniquePicked.length !== rawPicked.length || uniquePicked.some((id) => typeof id !== 'string' || !id)) {
+      errors.push(qualificationBlocker('duplicate_tie_selection', `Tie selections for ${group.groupId} must contain unique team IDs.`));
+    }
+    if (uniquePicked.length !== group.cutoffSlots) {
+      errors.push(qualificationBlocker('cutoff_slots_mismatch', `Cutoff selections for ${group.groupId} must fill exactly ${group.cutoffSlots} remaining seats.`));
+    }
+    const candidates = new Set(group.cutoffCandidateIds || []);
+    uniquePicked.forEach((id) => {
+      if (!candidates.has(id)) {
+        errors.push(qualificationBlocker('non_candidate_selection', `Selected team ${id} is not a cutoff candidate in ${group.groupId}.`));
+      }
+    });
+    automatic.forEach((id) => {
+      if (!selectedSet.has(id)) {
+        errors.push(qualificationBlocker('mandatory_qualifier_missing', `Mandatory qualifier ${id} is missing from ${group.groupId}.`));
+      }
+    });
+    uniquePicked.forEach((id) => {
+      if (!selectedSet.has(id)) {
+        errors.push(qualificationBlocker('cutoff_selection_missing', `Cutoff selection ${id} is missing from participants.`));
+      }
+    });
+    const allowed = new Set([...automatic, ...uniquePicked]);
+    const groupTeamIds = (group.standings || []).map((standing) => standing.teamId);
+    groupTeamIds.forEach((id) => {
+      if (selectedSet.has(id) && !allowed.has(id)) {
+        errors.push(qualificationBlocker('non_qualifier_selected', `Non-qualifier ${id} cannot be selected from ${group.groupId}.`));
+      }
+    });
+    if (selectedIds.filter((id) => groupTeamIds.includes(id)).length !== group.requiredCount) {
+      errors.push(qualificationBlocker('group_count_mismatch', `${group.groupId} requires exactly ${group.requiredCount} participants.`));
+    }
+  }
+  for (const key of selections ? Object.keys(selections) : []) {
+    if (!(state?.groups || []).some((group) => group.groupId === key)) {
+      errors.push(qualificationBlocker('unknown_tie_group', `Tie selection references unknown group ${key}.`));
+    }
+  }
+  // Any structural or score blocker is fatal even when the participant list
+  // happens to look valid. Cutoff seats are represented by cutoffSlots.
+  if ((state?.blockers || []).length) {
+    errors.push(qualificationBlocker('qualification_not_ready', 'Preliminary qualification inputs are not complete and current.'));
+  }
+  if (selectedIds.length < 2 || selectedIds.length > 32) {
+    errors.push(qualificationBlocker('participant_count', 'Final qualification requires between 2 and 32 participants.'));
+  }
+  if (errors.length) return { ok: false, errors };
+  return { ok: true, errors: [] };
+}
+
+/**
+ * Return deterministic JSON bytes for the snapshot. The function accepts
+ * only the canonical object produced by buildQualificationSnapshot, but
+ * canonicalises once more so callers cannot accidentally hash key-order
+ * differences.
+ */
+export function serializeQualificationSnapshot(snapshot) {
+  const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  // Names are useful to the caller's state renderer but are cosmetic and
+  // must not participate in the server/client qualification CAS.
+  const sanitized = {
+    ...source,
+    groups: (Array.isArray(source.groups) ? source.groups : []).map((group) => {
+      const { name: _name, label: _label, displayOrder: _displayOrder, ...rest } = group || {};
+      return rest;
+    }),
+    teams: (Array.isArray(source.teams) ? source.teams : []).map((team) => {
+      const { name: _name, label: _label, displayOrder: _displayOrder, ...rest } = team || {};
+      return rest;
+    }),
+    matches: (Array.isArray(source.matches) ? source.matches : []).map((match) => {
+      const {
+        name: _name, roundLabel: _roundLabel, courtId: _courtId, courtOrder: _courtOrder,
+        ...rest
+      } = match || {};
+      return rest;
+    }),
+  };
+  return JSON.stringify(canonicalQualification(sanitized));
+}
+
 // ---------- CSV 유틸 ----------
 
 export function toCsvRow(values) {

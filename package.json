@@ -2,7 +2,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:unit": "node js/test.mjs && node js/workflow-test.mjs && node functions/test/workflow-core.test.mjs && node functions/test/public-schedule.test.mjs",
+    "prepare:shared": "node scripts/prepare-shared.mjs",
+    "pretest:unit": "npm run prepare:shared",
+    "pretest:emulator": "npm run prepare:shared",
+    "test:unit": "node js/test.mjs && node js/workflow-test.mjs && node js/recorder-draft-test.mjs && node js/feed-recovery-test.mjs && node js/qualification-ui-test.mjs && node functions/test/workflow-core.test.mjs && node functions/test/public-schedule.test.mjs && node functions/test/qualification.test.mjs && node scripts/prepare-shared.mjs --check",
     "test:emulator": "firebase emulators:exec --project demo-bounce-volleyball --only auth,firestore,functions \"node test/emulator/run-all.mjs\"",
     "test:release": "npm run test:unit && npm run test:emulator"
   },

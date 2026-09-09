@@ -1,6 +1,216 @@
 import { courtMatchLabel, courtTeamNames } from "./court-display.js";
 
 const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+export const RECORDER_DRAFT_SCHEMA_VERSION = 2;
+
+function textValue(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function identityTeamId(value) {
+  if (typeof value === "string") return textValue(value) || null;
+  if (!isRecord(value)) return null;
+  return textValue(value.id || value.teamId) || null;
+}
+
+function identityTeamName(value) {
+  if (!isRecord(value)) return "";
+  return textValue(value.name || value.teamName);
+}
+
+function identityRevision(...values) {
+  const value = values.find((item) => Number.isInteger(item) && item >= 0);
+  return Number.isInteger(value) ? value : null;
+}
+
+function identityTransition(...values) {
+  const value = values.find((item) => item === null || typeof item === "string");
+  return value === null ? null : (textValue(value) || null);
+}
+
+function identityDivision(value) {
+  return textValue(value?.divisionId || value?.division);
+}
+
+/**
+ * Normalize the immutable identity of the official fixture represented by a
+ * recorder draft. Court and recorder selectors are deliberately absent:
+ * moving a fixture between courts must not create a new draft identity.
+ */
+export function normalizeRecorderFixtureIdentity(value) {
+  if (!isRecord(value)) return null;
+  const matchKey = textValue(value.matchKey);
+  const rawMatchType = textValue(value.matchType || value.type);
+  const matchType = rawMatchType === "finals" || rawMatchType === "tournament"
+    ? "final"
+    : rawMatchType;
+  const divisionId = identityDivision(value);
+  const teamAId = identityTeamId(value.teamAId ?? value.teamA);
+  const teamBId = identityTeamId(value.teamBId ?? value.teamB);
+  const officialRevision = identityRevision(value.officialRevision);
+  if (value.lastTransitionId !== undefined && value.lastTransitionId !== null
+      && typeof value.lastTransitionId !== "string") return null;
+  const lastTransitionId = identityTransition(value.lastTransitionId);
+  if (!matchKey || !matchType || !divisionId || !teamAId || !teamBId
+      || officialRevision === null) return null;
+  return {
+    matchKey,
+    matchType,
+    divisionId,
+    teamAId,
+    teamBId,
+    officialRevision,
+    lastTransitionId,
+    teamAName: textValue(value.teamAName || value.teamA?.name),
+    teamBName: textValue(value.teamBName || value.teamB?.name),
+  };
+}
+
+/**
+ * Capture current assignment/official fields as a stable local-draft
+ * identity. `previousIdentity` supplies fields that an unchanged official
+ * snapshot omits, preventing recorder claim/lease transitions from looking
+ * like a regenerated fixture.
+ */
+export function buildRecorderFixtureIdentity({
+  matchKey = "",
+  assignment = null,
+  official = null,
+  workflow = null,
+  teamAName = "",
+  teamBName = "",
+  previousIdentity = null,
+} = {}) {
+  const key = textValue(matchKey || assignment?.matchKey || assignment?.id
+    || official?.matchKey || official?.id);
+  const rawType = textValue(assignment?.matchType || assignment?.type || assignment?.phase
+    || official?.matchType || official?.type);
+  const matchType = rawType === "finals" || rawType === "tournament" ? "final" : rawType;
+  const divisionId = identityDivision(assignment) || identityDivision(official)
+    || identityDivision(workflow) || textValue(previousIdentity?.divisionId);
+  const teamA = official?.teamA ?? official?.teamAId ?? assignment?.teamA ?? assignment?.teamAId;
+  const teamB = official?.teamB ?? official?.teamBId ?? assignment?.teamB ?? assignment?.teamBId;
+  const teamAId = identityTeamId(teamA) || textValue(previousIdentity?.teamAId) || null;
+  const teamBId = identityTeamId(teamB) || textValue(previousIdentity?.teamBId) || null;
+  const officialRevision = identityRevision(
+    official?.officialRevision,
+    assignment?.officialRevision,
+    workflow?.officialRevision,
+    previousIdentity?.officialRevision,
+  );
+  const officialHasTransition = isRecord(official) && Object.hasOwn(official, "lastTransitionId");
+  const lastTransitionId = officialHasTransition
+    ? identityTransition(official.lastTransitionId)
+    : identityTransition(previousIdentity?.lastTransitionId);
+  const identity = normalizeRecorderFixtureIdentity({
+    matchKey: key,
+    matchType,
+    divisionId,
+    teamAId,
+    teamBId,
+    officialRevision,
+    lastTransitionId,
+    teamAName: teamAName || identityTeamName(teamA) || previousIdentity?.teamAName,
+    teamBName: teamBName || identityTeamName(teamB) || previousIdentity?.teamBName,
+  });
+  return identity;
+}
+
+export function cloneRecorderFixtureIdentity(value) {
+  const normalized = normalizeRecorderFixtureIdentity(value);
+  return normalized ? { ...normalized } : null;
+}
+
+function identityStructuralKey(value) {
+  const identity = normalizeRecorderFixtureIdentity(value);
+  if (!identity) return null;
+  return [
+    identity.matchKey,
+    identity.matchType,
+    identity.divisionId,
+    identity.teamAId,
+    identity.teamBId,
+  ].join("\u0001");
+}
+
+export function recorderFixtureIdentityEqual(left, right) {
+  const a = normalizeRecorderFixtureIdentity(left);
+  const b = normalizeRecorderFixtureIdentity(right);
+  if (!a || !b) return false;
+  return identityStructuralKey(a) === identityStructuralKey(b)
+    && a.officialRevision === b.officialRevision
+    && a.lastTransitionId === b.lastTransitionId;
+}
+
+export function recorderFixtureStructureEqual(left, right) {
+  return Boolean(identityStructuralKey(left) && identityStructuralKey(left) === identityStructuralKey(right));
+}
+
+/**
+ * Classify whether a stored record may be restored into the current official
+ * fixture. Names are returned solely for explanatory recovery UI; they never
+ * participate in identity equality.
+ */
+export function reconcileRecorderDraftIdentity({
+  storedIdentity = null,
+  currentIdentity = null,
+} = {}) {
+  const stored = normalizeRecorderFixtureIdentity(storedIdentity);
+  const current = normalizeRecorderFixtureIdentity(currentIdentity);
+  const teams = {
+    stored: { a: stored?.teamAName || "", b: stored?.teamBName || "" },
+    current: { a: current?.teamAName || "", b: current?.teamBName || "" },
+  };
+  if (!stored) {
+    return {
+      status: "missing_identity",
+      safe: false,
+      canRestore: false,
+      storedIdentity: null,
+      currentIdentity: cloneRecorderFixtureIdentity(current),
+      teams,
+    };
+  }
+  if (!current) {
+    return {
+      status: "current_identity_missing",
+      safe: false,
+      canRestore: false,
+      storedIdentity: cloneRecorderFixtureIdentity(stored),
+      currentIdentity: null,
+      teams,
+    };
+  }
+  const structuralMatch = recorderFixtureStructureEqual(stored, current);
+  const exact = recorderFixtureIdentityEqual(stored, current);
+  const mismatchFields = [];
+  if (stored.matchKey !== current.matchKey) mismatchFields.push("matchKey");
+  if (stored.matchType !== current.matchType) mismatchFields.push("matchType");
+  if (stored.divisionId !== current.divisionId) mismatchFields.push("divisionId");
+  if (stored.teamAId !== current.teamAId) mismatchFields.push("teamAId");
+  if (stored.teamBId !== current.teamBId) mismatchFields.push("teamBId");
+  if (stored.officialRevision !== current.officialRevision) mismatchFields.push("officialRevision");
+  if (stored.lastTransitionId !== current.lastTransitionId) mismatchFields.push("lastTransitionId");
+  return {
+    status: exact ? "same_fixture" : structuralMatch ? "stale_official" : "mismatch",
+    safe: exact,
+    canRestore: structuralMatch,
+    storedIdentity: cloneRecorderFixtureIdentity(stored),
+    currentIdentity: cloneRecorderFixtureIdentity(current),
+    mismatchFields,
+    teams,
+  };
+}
+
+export function recorderDraftRecoveryKey(key, identity = null) {
+  if (typeof key !== "string" || !key) return "";
+  const normalized = normalizeRecorderFixtureIdentity(identity);
+  const fields = normalized
+    ? [normalized.matchKey, normalized.matchType, normalized.divisionId, normalized.teamAId,
+      normalized.teamBId, normalized.officialRevision, normalized.lastTransitionId || ""]
+    : ["legacy"];
+  return `${key}:recovery:${fields.map((value) => encodeURIComponent(String(value))).join("~")}`;
+}
 
 function normalizeScoreValue(value) {
   if (value === "" || value === null || value === undefined) return "";
@@ -95,8 +305,8 @@ export function buildRecorderConfirmationModel({
 
 /**
  * Capture all values needed to retry an idempotent submit. In particular, the
- * storage key belongs to the submitted match, not whichever match a live queue
- * snapshot may display while the RPC is in flight.
+ * storage key and fixture identity belong to the submitted match, not
+ * whichever match a live queue snapshot may display while the RPC is in flight.
  */
 export function buildRecorderSubmitContext({
   matchKey,
@@ -108,13 +318,18 @@ export function buildRecorderSubmitContext({
   operationId,
   storageKey = "",
   submissionVersion = null,
+  fixtureIdentity = null,
+  contextVersion = null,
 } = {}) {
   const draft = cloneRecorderDraft(score);
+  const identity = cloneRecorderFixtureIdentity(fixtureIdentity);
   if (typeof matchKey !== "string" || !matchKey
       || typeof courtId !== "string" || !courtId
       || typeof token !== "string" || !token
       || !draft
-      || typeof operationId !== "string" || !operationId) {
+      || typeof operationId !== "string" || !operationId
+      || !identity
+      || !Number.isInteger(contextVersion) || contextVersion < 0) {
     return null;
   }
   return {
@@ -127,17 +342,43 @@ export function buildRecorderSubmitContext({
     operationId,
     storageKey: typeof storageKey === "string" ? storageKey : "",
     submissionVersion: Number.isInteger(submissionVersion) ? submissionVersion : null,
+    fixtureIdentity: identity,
+    contextVersion: Number.isInteger(contextVersion) ? contextVersion : null,
   };
 }
 
 /**
- * Resolve a submit response without losing the context of a newer queue match.
- * Ambiguous/lost responses retain the exact pending request for retry; a
- * successful response clears only the captured storage key.
+ * Resolve a submit response without losing the context of a newer queue match
+ * or regenerated fixture. Ambiguous/lost responses retain the exact pending
+ * request for retry; a successful response clears only a matching fixture key.
  */
-export function reconcileRecorderSubmit({ pendingSubmit, currentMatchKey = "", outcome = "pending" } = {}) {
+export function reconcileRecorderSubmit({
+  pendingSubmit,
+  currentMatchKey = "",
+  currentFixtureIdentity = null,
+  currentContextVersion = null,
+  outcome = "pending",
+} = {}) {
   if (!pendingSubmit) return { status: "none", pendingSubmit: null };
   if (outcome !== "success") return { status: "pending", pendingSubmit };
+  if (pendingSubmit.fixtureIdentity && currentFixtureIdentity
+      && !recorderFixtureIdentityEqual(pendingSubmit.fixtureIdentity, currentFixtureIdentity)) {
+    return {
+      status: "completed_stale",
+      pendingSubmit: null,
+      clearStorageKey: "",
+      resetCurrent: false,
+    };
+  }
+  if (Number.isInteger(pendingSubmit.contextVersion) && Number.isInteger(currentContextVersion)
+      && pendingSubmit.contextVersion !== currentContextVersion) {
+    return {
+      status: "completed_stale",
+      pendingSubmit: null,
+      clearStorageKey: "",
+      resetCurrent: false,
+    };
+  }
   return {
     status: "completed",
     pendingSubmit: null,
@@ -167,7 +408,29 @@ export function parseStoredRecorderDraft(raw) {
   if (!draft || !Array.isArray(value.touched) || value.touched.some((item) => typeof item !== "string")) {
     return { ok: false, reason: "malformed" };
   }
-  return { ok: true, value: { draft, touched: [...value.touched], revision: value.revision } };
+  if (value.schemaVersion !== undefined && value.schemaVersion !== RECORDER_DRAFT_SCHEMA_VERSION) {
+    return { ok: false, reason: "malformed" };
+  }
+  const identity = normalizeRecorderFixtureIdentity(
+    value.identity || value.fixtureIdentity || value.fixture,
+  );
+  if (!identity) {
+    return {
+      ok: true,
+      reason: "missing_identity",
+      legacy: true,
+      value: { draft, touched: [...value.touched], revision: value.revision, identity: null },
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      draft,
+      touched: [...value.touched],
+      revision: value.revision,
+      identity,
+    },
+  };
 }
 
 export function readStoredRecorderDraft(storage, key) {
@@ -185,21 +448,100 @@ export function readStoredRecorderDraft(storage, key) {
 export function writeStoredRecorderDraft(storage, key, value) {
   if (!key || !storage || typeof storage.setItem !== "function") return { ok: false, reason: "blocked" };
   const draft = cloneRecorderDraft(value?.draft);
+  const identity = cloneRecorderFixtureIdentity(
+    value?.identity || value?.fixtureIdentity || value?.fixture,
+  );
   if (!draft || !Number.isInteger(value?.revision) || value.revision < 0
-      || !Array.isArray(value?.touched) || value.touched.some((item) => typeof item !== "string")) {
-    return { ok: false, reason: "invalid" };
+      || !Array.isArray(value?.touched) || value.touched.some((item) => typeof item !== "string")
+      || !identity) {
+    return { ok: false, reason: identity ? "invalid" : "missing_identity" };
+  }
+  const serialized = JSON.stringify({
+    schemaVersion: RECORDER_DRAFT_SCHEMA_VERSION,
+    draft,
+    touched: [...value.touched],
+    revision: value.revision,
+    identity,
+  });
+  let preserved = false;
+  try {
+    const existingRaw = typeof storage.getItem === "function" ? storage.getItem(key) : null;
+    if (existingRaw !== null) {
+      const existing = parseStoredRecorderDraft(existingRaw);
+      const existingIdentity = existing.ok ? existing.value.identity : null;
+      if (!existing.ok || !recorderFixtureIdentityEqual(existingIdentity, identity)) {
+        const recoveryKey = recorderDraftRecoveryKey(key, existingIdentity);
+        try {
+          storage.setItem(recoveryKey, existingRaw);
+        } catch {
+          return { ok: false, reason: "preserve_failed" };
+        }
+        preserved = true;
+      }
+    }
+  } catch {
+    return { ok: false, reason: "blocked" };
   }
   try {
-    storage.setItem(key, JSON.stringify({ draft, touched: [...value.touched], revision: value.revision }));
-    return { ok: true };
+    storage.setItem(key, serialized);
+    return { ok: true, preserved };
   } catch {
     return { ok: false, reason: "blocked" };
   }
 }
 
-export function removeStoredRecorderDraft(storage, key) {
+export function preserveStoredRecorderDraft(storage, key, value) {
+  if (!key || !storage || typeof storage.setItem !== "function") return { ok: false, reason: "blocked" };
+  const draft = cloneRecorderDraft(value?.draft);
+  const identity = (value?.identity || value?.fixtureIdentity || value?.fixture)
+    ? cloneRecorderFixtureIdentity(value.identity || value.fixtureIdentity || value.fixture)
+    : null;
+  if (!draft || !Number.isInteger(value?.revision) || value.revision < 0
+      || !Array.isArray(value?.touched) || value.touched.some((item) => typeof item !== "string")) {
+    return { ok: false, reason: "invalid" };
+  }
+  const recoveryKey = recorderDraftRecoveryKey(key, identity);
+  if (!recoveryKey || recoveryKey === key) return { ok: false, reason: "invalid" };
+  const serialized = JSON.stringify({
+    schemaVersion: identity ? RECORDER_DRAFT_SCHEMA_VERSION : undefined,
+    draft,
+    touched: [...value.touched],
+    revision: value.revision,
+    ...(identity ? { identity } : {}),
+  });
+  return preserveStoredRecorderRaw(storage, key, serialized, identity);
+}
+
+function preserveStoredRecorderRaw(storage, key, raw, identity = null) {
+  const recoveryKey = recorderDraftRecoveryKey(key, identity);
+  if (!recoveryKey || recoveryKey === key || typeof raw !== "string") return { ok: false, reason: "invalid" };
+  try {
+    storage.setItem(recoveryKey, raw);
+    return { ok: true, key: recoveryKey };
+  } catch {
+    return { ok: false, reason: "blocked" };
+  }
+}
+
+export function removeStoredRecorderDraft(storage, key, expectedIdentity = null) {
   if (!key || !storage || typeof storage.removeItem !== "function") return { ok: false, reason: "blocked" };
   try {
+    if (expectedIdentity && typeof storage.getItem === "function") {
+      const raw = storage.getItem(key);
+      if (raw !== null) {
+        const parsed = parseStoredRecorderDraft(raw);
+        if (!parsed.ok || !recorderFixtureIdentityEqual(parsed.value.identity, expectedIdentity)) {
+          const preserved = preserveStoredRecorderRaw(
+            storage,
+            key,
+            raw,
+            parsed.ok ? parsed.value.identity : null,
+          );
+          if (preserved.ok) return { ok: true, preserved: true };
+          return { ok: false, reason: preserved.reason || "preserve_failed" };
+        }
+      }
+    }
     storage.removeItem(key);
     return { ok: true };
   } catch {
@@ -207,7 +549,16 @@ export function removeStoredRecorderDraft(storage, key) {
   }
 }
 
-export function reconcileRecorderSnapshot({ pendingSave, remoteDraft, remoteRevision }) {
+export function reconcileRecorderSnapshot({
+  pendingSave,
+  remoteDraft,
+  remoteRevision,
+  currentFixtureIdentity = null,
+} = {}) {
+  if (pendingSave?.context?.fixtureIdentity && currentFixtureIdentity
+      && !recorderFixtureIdentityEqual(pendingSave.context.fixtureIdentity, currentFixtureIdentity)) {
+    return { status: "ignore", stale: true };
+  }
   if (!pendingSave || !Number.isInteger(remoteRevision)
       || !Number.isInteger(pendingSave.expectedRevision)
       || remoteRevision <= pendingSave.expectedRevision) {
@@ -227,10 +578,12 @@ export function reconcileRecorderSnapshot({ pendingSave, remoteDraft, remoteRevi
   };
 }
 
-function matchesRecorderOperation(operation, matchKey, token) {
+function matchesRecorderOperation(operation, matchKey, token, currentFixtureIdentity = null) {
   return Boolean(operation
     && operation.matchKey === matchKey
-    && operation.token === token);
+    && operation.token === token
+    && (!currentFixtureIdentity || !operation.fixtureIdentity
+      || recorderFixtureIdentityEqual(operation.fixtureIdentity, currentFixtureIdentity)));
 }
 
 function terminalRecorderDraftState(workflow) {
@@ -303,6 +656,7 @@ export function reconcileRecorderOwnership({
   matchKey = "",
   token = "",
   uid = "",
+  currentFixtureIdentity = null,
   pendingSubmit = null,
   pendingEnd = null,
   pendingDiscard = null,
@@ -313,17 +667,28 @@ export function reconcileRecorderOwnership({
     return { status: "lost" };
   }
   const lock = workflow.lock;
-  if (lock?.token === token && lock?.sessionId !== undefined) {
-    return { status: "owned" };
-  }
   const operations = [
     ["submit", pendingSubmit],
     ["end", pendingEnd],
     ["discard", pendingDiscard],
-  ].filter(([, operation]) => matchesRecorderOperation(operation, matchKey, token));
+  ].filter(([kind, operation]) => operation
+    && operation.matchKey === matchKey
+    && operation.token === token
+    && currentFixtureIdentity
+    && operation.fixtureIdentity
+    && !recorderFixtureIdentityEqual(operation.fixtureIdentity, currentFixtureIdentity));
+  if (operations.length) return { status: "ignore", stale: true };
+  if (lock?.token === token && lock?.sessionId !== undefined) {
+    return { status: "owned" };
+  }
+  const matchingOperations = [
+    ["submit", pendingSubmit],
+    ["end", pendingEnd],
+    ["discard", pendingDiscard],
+  ].filter(([, operation]) => matchesRecorderOperation(operation, matchKey, token, currentFixtureIdentity));
   if (lock) return { status: "lost" };
-  if (!operations.length) return { status: "lost" };
-  const [kind, operation] = operations[0];
+  if (!matchingOperations.length) return { status: "lost" };
+  const [kind, operation] = matchingOperations[0];
   const evidence = operationEvidence(workflow, kind, operation, uid);
   if (evidence.matches) {
     return {

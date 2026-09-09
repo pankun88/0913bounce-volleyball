@@ -16,12 +16,14 @@ import {
   buildRecorderCourtSchedule, reconcileRecorderSubmit, recorderRouteState, sortRecorderCourts,
   cloneRecorderDraft, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
   recorderDataState, reconcileRecorderAssignment, reconcileRecorderOwnership, resolveRecorderConflict,
-  writeStoredRecorderDraft,
+  writeStoredRecorderDraft, buildRecorderFixtureIdentity, cloneRecorderFixtureIdentity,
+  recorderFixtureIdentityEqual, reconcileRecorderDraftIdentity, preserveStoredRecorderDraft,
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
 let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", pendingCourtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "", viewState = "selection";
+let fixtureIdentity = null;
 let courtAssignments = [], scheduleOfficial = new Map(), scheduleState = "idle";
 let stop = [], courtStops = [], matchStops = [], scheduleStops = [], scheduleMatchStops = [], officialStop = () => {}, heartbeat, heartbeatEpoch = 0, channel, reconcilingQueue = false;
 let readyContextVersion = 0, courtContextVersion = 0, matchContextVersion = 0, scheduleContextVersion = 0, scheduleDetailVersion = 0;
@@ -43,6 +45,8 @@ const storageFailureMessages = {
   blocked: "이 기기의 임시 점수 저장이 차단되었습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
   malformed: "이 기기의 임시 점수가 손상되어 불러오지 못했습니다. 현재 화면의 점수를 확인한 뒤 저장하세요.",
   invalid: "이 기기의 임시 점수를 저장할 수 없습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
+  missing_identity: "이 기기의 이전 임시 점수에는 경기 식별 정보가 없어 자동으로 불러오지 않았습니다.",
+  preserve_failed: "기존 임시 점수를 보존하지 못했습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
 };
 const ownershipLostMessage = "입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.";
 let ownershipWarning = null;
@@ -81,29 +85,86 @@ function setStorageStatus(reason) {
 function clearStorageStatus() {
   if (ui.storageStatus) { ui.storageStatus.textContent = ""; ui.storageStatus.hidden = true; }
 }
+function currentFixtureIdentity() {
+  return cloneRecorderFixtureIdentity(fixtureIdentity);
+}
 function readStored() {
   const result = readStoredRecorderDraft(getLocalStorage(), storageKeyForEdit());
   if (!result.ok) setStorageStatus(result.reason);
   return result;
 }
-function storeDraft() {
-  if (!edit.localDraft || !storageKeyForEdit()) return false;
-  const result = writeStoredRecorderDraft(getLocalStorage(), storageKeyForEdit(), {
+function storeDraft({ identity = currentFixtureIdentity(), storageKey = storageKeyForEdit() } = {}) {
+  if (!edit.localDraft || !storageKey || !identity) return false;
+  const result = writeStoredRecorderDraft(getLocalStorage(), storageKey, {
     draft: edit.localDraft, touched: [...edit.touched], revision: edit.savedRevision,
+    identity,
   });
   if (result.ok) clearStorageStatus();
   else setStorageStatus(result.reason);
   return result.ok;
 }
 function clearStored() {
-  return clearStoredKey(storageKeyForEdit());
+  return clearStoredKey(storageKeyForEdit(), currentFixtureIdentity());
 }
-function clearStoredKey(key) {
+function clearStoredKey(key, identity = null) {
   if (!key) return true;
-  const result = removeStoredRecorderDraft(getLocalStorage(), key);
+  const result = removeStoredRecorderDraft(getLocalStorage(), key, identity);
   if (!result.ok) setStorageStatus(result.reason);
   else if (key === storageKeyForEdit()) clearStorageStatus();
   return result.ok;
+}
+function draftTeamPair(identity) {
+  return `${identity?.teamAName || "A팀"} vs ${identity?.teamBName || "B팀"}`;
+}
+function draftScoreSummary(draft) {
+  return (draft?.sets || []).map((set, index) => {
+    const a = set.a === "" ? "-" : set.a;
+    const b = set.b === "" ? "-" : set.b;
+    return `${index + 1}세트 ${a}:${b}`;
+  }).join(" · ") || "입력된 세트 없음";
+}
+function preserveMismatchedStoredDraft(saved) {
+  if (!saved?.ok || !saved.value) return false;
+  const preserved = preserveStoredRecorderDraft(getLocalStorage(), storageKeyForEdit(), saved.value);
+  if (!preserved.ok) setStorageStatus(preserved.reason);
+  return preserved.ok;
+}
+function restoreStoredAfterClaim(saved, currentIdentity, serverRevision) {
+  if (!saved?.ok || !saved.found || !saved.value) return;
+  const assessment = reconcileRecorderDraftIdentity({
+    storedIdentity: saved.value.identity,
+    currentIdentity,
+  });
+  const storedPair = draftTeamPair(assessment.storedIdentity);
+  const currentPair = draftTeamPair(assessment.currentIdentity);
+  const useStored = (message) => {
+    edit.localDraft = draftCopy(saved.value.draft);
+    edit.touched = new Set(saved.value.touched);
+    edit.dirty = true;
+    status(message);
+  };
+  if (assessment.status === "same_fixture" && saved.value.revision === serverRevision) {
+    useStored("이 기기의 임시 점수를 이어서 입력합니다.");
+    return;
+  }
+  if (assessment.canRestore) {
+    const message = saved.value.revision === serverRevision
+      ? `이 기기의 ${storedPair} 점수를 이어서 입력할까요?`
+      : `이 기기의 ${storedPair} 점수가 서버 최신 ${currentPair} 기준보다 오래되었습니다. 이전 점수를 불러와 비교할까요?`;
+    if (window.confirm(message)) {
+      useStored("이전 기기 점수를 불러왔습니다. 확인 후 다시 저장하세요.");
+    } else {
+      status("서버의 최신 초안을 사용합니다.");
+    }
+    return;
+  }
+  const preserved = preserveMismatchedStoredDraft(saved);
+  const warning = assessment.status === "missing_identity"
+    ? `이전 기기 초안(${storedPair})에 경기 식별 정보가 없어 자동으로 불러오지 않았습니다. 현재 ${currentPair} 서버 초안을 사용합니다.`
+    : `이전 기기 초안(${storedPair})과 현재 경기(${currentPair})가 달라 자동으로 불러오지 않았습니다. 현재 서버 초안을 사용합니다.`;
+  const comparison = `보관 점수: ${draftScoreSummary(saved.value.draft)}`;
+  status(preserved ? warning : `${warning} 이전 초안 보존에 실패했습니다.`);
+  action(preserved ? `${warning} ${comparison}` : `${warning} ${comparison}`);
 }
 function renderCourtSelectors({ resetRecorder = false } = {}) {
   if (!ui.courtSelect || !ui.recorderSelect) return;
@@ -403,6 +464,7 @@ function clearCurrentMatch() {
   setDataState("workflow", "idle");
   setDataState("official", "idle");
   matchKey = "";
+  fixtureIdentity = null;
   assignment = workflow = official = null;
   renderedFormKey = "";
   clearConfirmation();
@@ -499,12 +561,14 @@ function isStaleTerminalCurrent() {
 let contextVersion = 0;
 function bumpContext() {
   const hadPendingSave = Boolean(edit.pendingSave);
+  const hadBusy = busy;
   if (edit.pendingSave?.context?.storageKey) {
     const pending = edit.pendingSave;
     const stored = writeStoredRecorderDraft(getLocalStorage(), pending.context.storageKey, {
       draft: pending.draft,
       touched: [...pending.touched],
       revision: pending.expectedRevision,
+      identity: pending.fixtureIdentity || pending.context.fixtureIdentity,
     });
     if (!stored.ok) setStorageStatus(stored.reason);
   }
@@ -512,7 +576,7 @@ function bumpContext() {
   contextVersion += 1;
   edit.pendingSave = null;
   edit.saveConflict = null;
-  if (hadPendingSave) setBusy(false);
+  if (hadPendingSave || hadBusy) setBusy(false);
 }
 function captureContext() {
   return {
@@ -521,13 +585,83 @@ function captureContext() {
     courtId,
     uid: auth.currentUser?.uid || authState?.user?.uid || null,
     storageKey: storageKeyForEdit(),
+    fixtureIdentity: currentFixtureIdentity(),
   };
 }
 function contextIsCurrent(context) {
   return context.version === contextVersion
     && context.matchKey === matchKey
     && context.courtId === courtId
-    && context.uid === (auth.currentUser?.uid || authState?.user?.uid || null);
+    && context.uid === (auth.currentUser?.uid || authState?.user?.uid || null)
+    && ((!context.fixtureIdentity && !fixtureIdentity)
+      || recorderFixtureIdentityEqual(context.fixtureIdentity, fixtureIdentity));
+}
+function operationContextIsCurrent(operation) {
+  if (operation?.context && !contextIsCurrent(operation.context)) return false;
+  if (Number.isInteger(operation?.contextVersion) && operation.contextVersion !== contextVersion) return false;
+  return Boolean(operation
+    && operation.matchKey === matchKey
+    && operation.courtId === courtId
+    && ((!operation.fixtureIdentity && !fixtureIdentity)
+      || recorderFixtureIdentityEqual(operation.fixtureIdentity, fixtureIdentity)));
+}
+function refreshFixtureIdentity() {
+  if (!assignment || !matchKey) return null;
+  if (!official) {
+    if (fixtureIdentity) fenceFixtureIdentity(null);
+    return null;
+  }
+  const names = courtTeamNames(official, teams) || {};
+  const next = buildRecorderFixtureIdentity({
+    matchKey,
+    assignment,
+    official,
+    workflow,
+    teamAName: names.a || "",
+    teamBName: names.b || "",
+    previousIdentity: fixtureIdentity,
+  });
+  if (!next) {
+    if (fixtureIdentity) fenceFixtureIdentity(null);
+    return null;
+  }
+  if (fixtureIdentity && !recorderFixtureIdentityEqual(fixtureIdentity, next)) {
+    fenceFixtureIdentity(next);
+    return fixtureIdentity;
+  }
+  fixtureIdentity = next;
+  return fixtureIdentity;
+}
+function fenceFixtureIdentity(nextIdentity) {
+  const previousIdentity = currentFixtureIdentity();
+  if (!previousIdentity || recorderFixtureIdentityEqual(previousIdentity, nextIdentity)) {
+    fixtureIdentity = cloneRecorderFixtureIdentity(nextIdentity);
+    return;
+  }
+  const hadPendingSave = Boolean(edit.pendingSave);
+  const hadDirtyDraft = Boolean(edit.dirty && edit.localDraft);
+  const oldStorageKey = edit.pendingSave?.context?.storageKey || storageKeyForEdit();
+  bumpContext();
+  fixtureIdentity = cloneRecorderFixtureIdentity(nextIdentity);
+  stopHeartbeat();
+  edit.token = null;
+  edit.serverDraft = null;
+  edit.localDraft = null;
+  edit.dirty = false;
+  edit.touched.clear();
+  edit.savedRevision = null;
+  edit.reviewedPayload = null;
+  edit.saveConflict = null;
+  renderedFormKey = "";
+  clearConfirmation();
+  if (hadPendingSave || hadDirtyDraft) {
+    const saved = hadPendingSave
+      ? Boolean(readStoredRecorderDraft(getLocalStorage(), oldStorageKey).found)
+      : true;
+    status(saved
+      ? "공식 대진이 변경되어 이전 입력을 보관했습니다. 현재 대진은 서버 초안으로 시작합니다."
+      : "공식 대진이 변경되었습니다. 이전 입력을 보관하지 못했으니 화면을 닫지 마세요.");
+  }
 }
 function pendingOperationFor(kind) {
   return kind === "submit" ? edit.pendingSubmit
@@ -537,7 +671,9 @@ function pendingOperationFor(kind) {
 function ownershipWarningMatches(operation) {
   return Boolean(ownershipWarning && operation
     && ownershipWarning.matchKey === operation.matchKey
-    && ownershipWarning.token === operation.token);
+    && ownershipWarning.token === operation.token
+    && (!ownershipWarning.fixtureIdentity || !operation.fixtureIdentity
+      || recorderFixtureIdentityEqual(ownershipWarning.fixtureIdentity, operation.fixtureIdentity)));
 }
 function ownershipLostFor(operation) {
   return ownershipWarning?.source === "loss" && ownershipWarningMatches(operation);
@@ -555,13 +691,24 @@ function preserveOwnershipWarning(operation) {
     && ownershipWarningMatches(operation)
     && ui.connectionStatus?.textContent === ownershipWarning.message;
 }
-function setOwnershipLostWarning(key, token, { force = false } = {}) {
+function setOwnershipLostWarning(key, token, {
+  force = false,
+  identity = currentFixtureIdentity(),
+  storageKey = storageKeyForEdit(),
+} = {}) {
   if (force || edit.dirty) {
-    const stored = storeDraft();
+    const stored = storeDraft({ identity, storageKey });
     const message = stored
       ? ownershipLostMessage
       : "입력 권한을 잃었습니다. 로컬 초안을 저장할 수 없습니다. 화면을 닫지 마세요.";
-    ownershipWarning = { matchKey: key, token, source: "loss", message };
+    ownershipWarning = {
+      matchKey: key,
+      token,
+      source: "loss",
+      message,
+      fixtureIdentity: cloneRecorderFixtureIdentity(identity),
+      storageKey,
+    };
     status(message);
     return;
   }
@@ -569,6 +716,10 @@ function setOwnershipLostWarning(key, token, { force = false } = {}) {
 }
 function fenceAssignmentContext(key) {
   const lostToken = edit.token;
+  const lostIdentity = cloneRecorderFixtureIdentity(
+    edit.pendingSave?.fixtureIdentity || edit.pendingSave?.context?.fixtureIdentity || fixtureIdentity,
+  );
+  const lostStorageKey = edit.pendingSave?.context?.storageKey || storageKeyForEdit();
   const pendingSaveDraft = draftCopy(edit.pendingSave?.draft);
   const pendingSaveTouched = edit.pendingSave?.touched ? [...edit.pendingSave.touched] : [];
   const pendingSaveRevision = edit.pendingSave?.expectedRevision;
@@ -589,7 +740,11 @@ function fenceAssignmentContext(key) {
     clearConfirmation();
   }
   if (hadDirtyDraft || hadPendingSave) {
-    setOwnershipLostWarning(key, lostToken, { force: hadPendingSave });
+    setOwnershipLostWarning(key, lostToken, {
+      force: hadPendingSave,
+      identity: lostIdentity,
+      storageKey: lostStorageKey,
+    });
   } else {
     ownershipWarning = null;
   }
@@ -610,6 +765,7 @@ function reconcileWorkflowOwnership(value, metadata, key = matchKey) {
     matchKey: key,
     token: edit.token,
     uid: auth.currentUser?.uid || authState?.user?.uid || "",
+    currentFixtureIdentity: currentFixtureIdentity(),
     pendingSubmit: edit.pendingSubmit,
     pendingEnd: edit.pendingEnd,
     pendingDiscard: edit.pendingDiscard,
@@ -624,7 +780,12 @@ function reconcileWorkflowOwnership(value, metadata, key = matchKey) {
   stopHeartbeat();
   edit.token = null;
   renderedFormKey = "";
-  if (edit.dirty) setOwnershipLostWarning(key, lostToken);
+  if (edit.dirty) {
+    setOwnershipLostWarning(key, lostToken, {
+      identity: currentFixtureIdentity(),
+      storageKey: storageKeyForEdit(),
+    });
+  }
   return result;
 }
 function reconcileFailedOperationOwnership(kind, operation, ambiguous) {
@@ -635,6 +796,7 @@ function reconcileFailedOperationOwnership(kind, operation, ambiguous) {
     matchKey: operation.matchKey,
     token: edit.token,
     uid: auth.currentUser?.uid || authState?.user?.uid || "",
+    currentFixtureIdentity: currentFixtureIdentity(),
     pendingSubmit: kind === "submit" ? operation : null,
     pendingEnd: kind === "end" ? operation : null,
     pendingDiscard: kind === "discard" ? operation : null,
@@ -652,7 +814,12 @@ function reconcileFailedOperationOwnership(kind, operation, ambiguous) {
   stopHeartbeat();
   edit.token = null;
   renderedFormKey = "";
-  if (edit.dirty) setOwnershipLostWarning(operation.matchKey, lostToken);
+  if (edit.dirty) {
+    setOwnershipLostWarning(operation.matchKey, lostToken, {
+      identity: operation.fixtureIdentity || currentFixtureIdentity(),
+      storageKey: operation.storageKey || storageKeyForEdit(),
+    });
+  }
 }
 function applyWorkflowSnapshot(value, metadata = null) {
   const remote = value?.draft ? draftCopy(value.draft) : null;
@@ -664,6 +831,7 @@ function applyWorkflowSnapshot(value, metadata = null) {
       pendingSave,
       remoteDraft: remote,
       remoteRevision,
+      currentFixtureIdentity: currentFixtureIdentity(),
     });
     if (reconciliation.status === "confirmed" && contextIsCurrent(pendingSave.context)) {
       edit.serverDraft = reconciliation.draft;
@@ -722,8 +890,8 @@ async function reconcileFreshWorkflow(pendingSave) {
 }
 function syncScreenVisibility() {
   const confirmationActive = Boolean(
-    (edit.reviewedPayload && (!edit.pendingSubmit || edit.pendingSubmit.matchKey === matchKey))
-      || edit.pendingSubmit?.matchKey === matchKey,
+    (edit.reviewedPayload && (!edit.pendingSubmit || operationContextIsCurrent(edit.pendingSubmit)))
+      || operationContextIsCurrent(edit.pendingSubmit),
   );
   const authenticatedScreen = ui.authPanel.hidden;
   ui.courtPanel.hidden = !authenticatedScreen || viewState !== "selection";
@@ -787,6 +955,7 @@ function attachMatch(key) {
     if (submittedMatch) resetMatchEditor({ preservePendingSubmit: true });
     bumpContext();
     activeStorageKey = "";
+    fixtureIdentity = null;
   }
   matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {}; matchKey = key; renderedFormKey = "";
   setDataState("assignment", "loading");
@@ -848,6 +1017,7 @@ function attachOfficial(expectedMatchVersion = matchContextVersion) {
     if (expectedMatchVersion !== matchContextVersion || viewState !== "operations") return;
     setSnapshotState("official", snap.metadata);
     official = snap.exists() ? { id:snap.id,...snap.data() } : null;
+    if (!snap.metadata?.fromCache || !fixtureIdentity) refreshFixtureIdentity();
     render();
   }, (error) => {
     if (expectedMatchVersion !== matchContextVersion || viewState !== "operations") return;
@@ -963,6 +1133,7 @@ function attachCourt(value) {
   matchContextVersion += 1;
   bumpContext();
   activeStorageKey = "";
+  fixtureIdentity = null;
   courtId = value || "";
   if (value) pendingCourtId = value;
   queue = null;
@@ -1001,7 +1172,9 @@ function subscribeReadyCollections() {
   stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"teams"), { includeMetadataChanges: true }, (snap) => {
     if (expectedReadyVersion !== readyContextVersion || authState?.kind !== "ready") return;
     setSnapshotState("teams", snap.metadata);
-    teams=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render();
+    teams=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}]));
+    if (!snap.metadata?.fromCache || !fixtureIdentity) refreshFixtureIdentity();
+    render();
   }, (error) => {
     if (expectedReadyVersion !== readyContextVersion) return;
     setDataState("teams", "error", error); status(`팀 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
@@ -1048,7 +1221,12 @@ function beginHeartbeat() {
       if (["ownership_lost", "lease_expired"].includes(reasonCode(error))) {
         edit.token = null;
         renderedFormKey = "";
-        if (edit.dirty) setOwnershipLostWarning(context.matchKey, token);
+        if (edit.dirty) {
+          setOwnershipLostWarning(context.matchKey, token, {
+            identity: context.fixtureIdentity,
+            storageKey: context.storageKey,
+          });
+        }
         else status(recorderReason(error));
         render();
       } else status(recorderReason(error));
@@ -1102,6 +1280,7 @@ watchRecorderAuthState((state) => {
       pendingCourtId = "";
       queue = null;
       matchKey = "";
+      fixtureIdentity = null;
       assignment = workflow = official = null;
       courts = [];
       teams = new Map();
@@ -1121,6 +1300,7 @@ watchRecorderAuthState((state) => {
       edit.pendingDiscard = null;
       edit.dirty = false;
       activeStorageKey = "";
+      fixtureIdentity = null;
     }
     edit.token=null;
     viewState = "selection";
@@ -1128,6 +1308,7 @@ watchRecorderAuthState((state) => {
     pendingCourtId = "";
     queue = null;
     matchKey = "";
+    fixtureIdentity = null;
     assignment = workflow = official = null;
     courts = [];
     teams = new Map();
@@ -1219,6 +1400,7 @@ async function persistDraft(score, context = captureContext()) {
     expectedRevision: edit.savedRevision,
     inputVersion: edit.inputVersion,
     touched: new Set(edit.touched),
+    fixtureIdentity: cloneRecorderFixtureIdentity(context.fixtureIdentity),
   };
   edit.pendingSave = pending;
   edit.saveConflict = null;
@@ -1278,6 +1460,7 @@ async function persistDraft(score, context = captureContext()) {
       draft: localDraft,
       touched,
       revision: pending.expectedRevision,
+      identity: context.fixtureIdentity,
     });
     if (!stored.ok) setStorageStatus(stored.reason);
     else clearStorageStatus();
@@ -1315,6 +1498,10 @@ ui.claimButton.onclick=async()=>{
     return;
   }
   const context = captureContext();
+  if (!context.fixtureIdentity) {
+    action("현재 경기의 공식 식별 정보를 확인한 뒤 다시 시도하세요.");
+    return;
+  }
   setBusy(true);
   try {
     const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft;
@@ -1336,17 +1523,10 @@ ui.claimButton.onclick=async()=>{
     edit.saveConflict=null;
     edit.touched.clear();
     edit.dirty=false;
+    fixtureIdentity = cloneRecorderFixtureIdentity(context.fixtureIdentity);
     activeStorageKey = scoreKey();
     const saved=readStored();
-    if(saved.ok && saved.found) {
-      const parsed=saved.value;
-      if(parsed.revision===result.draftRevision){
-        edit.localDraft=parsed.draft; edit.touched=new Set(parsed.touched); edit.dirty=true;
-      } else if(window.confirm("이 기기의 임시 점수가 서버의 최신 초안보다 오래되었습니다. 이전 기기 점수를 불러와 비교할까요?")){
-        edit.localDraft=parsed.draft; edit.touched=new Set(parsed.touched); edit.dirty=true;
-        status("이전 기기 점수를 불러왔습니다. 확인 후 다시 저장하세요.");
-      } else status("서버의 최신 초안을 불러왔습니다.");
-    }
+    restoreStoredAfterClaim(saved, fixtureIdentity, result.draftRevision);
     channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId});
     beginHeartbeat(); renderedFormKey=""; render(); navigateToWorkflowEntry(context, edit.token);
   } catch(error) {
@@ -1455,6 +1635,8 @@ ui.submitButton.onclick=async()=>{
       operationId: operationId(),
       storageKey: storageKeyForEdit(),
       submissionVersion: workflow?.submissionVersion,
+      fixtureIdentity: currentFixtureIdentity(),
+      contextVersion,
     });
     if (!pending) return;
     edit.pendingSubmit = pending;
@@ -1467,10 +1649,23 @@ ui.submitButton.onclick=async()=>{
     const completion = reconcileRecorderSubmit({
       pendingSubmit: pending,
       currentMatchKey: matchKey,
+      currentFixtureIdentity: currentFixtureIdentity(),
+      currentContextVersion: contextVersion,
       outcome: "success",
     });
     edit.pendingSubmit = completion.pendingSubmit;
-    const cleared = clearStoredKey(completion.clearStorageKey);
+    if (completion.status === "completed_stale") {
+      const preserved = preserveStoredRecorderDraft(getLocalStorage(), pending.storageKey, {
+        draft: pending.score,
+        touched: [],
+        revision: 0,
+        identity: pending.fixtureIdentity,
+      });
+      if (!preserved.ok) setStorageStatus(preserved.reason);
+      status("이전 경기 제출 응답을 확인했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      return;
+    }
+    const cleared = clearStoredKey(completion.clearStorageKey, pending.fixtureIdentity);
     if (completion.resetCurrent) {
       resetMatchEditor();
       if (!queue?.currentMatchKey) clearCurrentMatch();
@@ -1490,6 +1685,13 @@ ui.submitButton.onclick=async()=>{
     focus(ui.successTitle);
   } catch(error) {
     const ambiguous = ambiguousNetworkResult(error);
+    if (!operationContextIsCurrent(pending)) {
+      if (!ambiguous && edit.pendingSubmit === pending) edit.pendingSubmit = null;
+      if (!preserveOwnershipWarning(pending)) {
+        status("이전 경기 제출 응답을 확인하지 못했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      }
+      return;
+    }
     reconcileFailedOperationOwnership("submit", pending, ambiguous);
     if (!ambiguous && edit.pendingSubmit === pending) {
       edit.pendingSubmit = null;
@@ -1520,12 +1722,20 @@ ui.endButton.onclick=async()=>{
     discardDraft: false,
     operationId: operationId(),
     draft: draftCopy(edit.serverDraft),
+    storageKey: storageKeyForEdit(),
+    fixtureIdentity: currentFixtureIdentity(),
+    context: captureContext(),
   };
   const pending = edit.pendingEnd;
   setBusy(true);
   try {
     await cancelRecorderDraft(pending);
     if (edit.pendingEnd !== pending) return;
+    if (!operationContextIsCurrent(pending)) {
+      edit.pendingEnd = null;
+      status("이전 경기 입력 종료 응답을 확인했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      return;
+    }
     clearVerifiedOperationWarning(pending);
     const keepOwnershipWarning = preserveOwnershipWarning(pending);
     edit.pendingEnd = null;
@@ -1537,6 +1747,11 @@ ui.endButton.onclick=async()=>{
     focus(ui.workflowTitle);
   } catch (error) {
     const ambiguous = ambiguousNetworkResult(error);
+    if (!operationContextIsCurrent(pending)) {
+      if (!ambiguous && edit.pendingEnd === pending) edit.pendingEnd = null;
+      status("이전 경기 입력 종료 응답을 확인했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      return;
+    }
     reconcileFailedOperationOwnership("end", pending, ambiguous);
     if (!ambiguous && edit.pendingEnd === pending) edit.pendingEnd = null;
     if (!preserveOwnershipWarning(pending)) {
@@ -1562,12 +1777,20 @@ ui.confirmDiscardButton.onclick=async()=>{
     discardDraft: true,
     operationId: operationId(),
     draft: draftCopy(edit.serverDraft),
+    storageKey: storageKeyForEdit(),
+    fixtureIdentity: currentFixtureIdentity(),
+    context: captureContext(),
   };
   const pending = edit.pendingDiscard;
   setBusy(true);
   try {
     await cancelRecorderDraft(pending);
     if (edit.pendingDiscard !== pending) return;
+    if (!operationContextIsCurrent(pending)) {
+      edit.pendingDiscard = null;
+      status("이전 경기 초안 폐기 응답을 확인했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      return;
+    }
     clearVerifiedOperationWarning(pending);
     const keepOwnershipWarning = preserveOwnershipWarning(pending);
     edit.pendingDiscard = null;
@@ -1589,6 +1812,11 @@ ui.confirmDiscardButton.onclick=async()=>{
     focus(ui.workflowTitle);
   } catch (error) {
     const ambiguous = ambiguousNetworkResult(error);
+    if (!operationContextIsCurrent(pending)) {
+      if (!ambiguous && edit.pendingDiscard === pending) edit.pendingDiscard = null;
+      status("이전 경기 초안 폐기 응답을 확인했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      return;
+    }
     reconcileFailedOperationOwnership("discard", pending, ambiguous);
     if (!ambiguous && edit.pendingDiscard === pending) edit.pendingDiscard = null;
     if (!preserveOwnershipWarning(pending)) {

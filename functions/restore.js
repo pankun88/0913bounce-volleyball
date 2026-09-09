@@ -506,7 +506,9 @@ export async function pruneRestore(request) {
     await assertRestoreTransaction(tx, manifest.id);
     const current = await tx.get(manifest);
     if (current.data().prunedAt) return { manifestId: manifest.id, pruned: true };
-    const updates = { updatedAt: FieldValue.serverTimestamp() };
+    // Qualification proof is derived from the current competition, never a
+    // portable backup field. Restored brackets require explicit revalidation.
+    const updates = { updatedAt: FieldValue.serverTimestamp(), finalQualification: FieldValue.delete() };
     for (const field of ROOT_FIELDS) {
       updates[field] = Object.hasOwn(meta.data().rootData, field)
         ? restoreFirestoreValue(meta.data().rootData[field])
@@ -533,7 +535,8 @@ export async function verifyRestore(request) {
     .filter((field) => Object.hasOwn(meta.data().rootData, field))
     .map((field) => [field, portableFirestoreValue(rootSnapshot[field])]));
   if (
-    [...ROOT_FIELDS].some((field) => !Object.hasOwn(meta.data().rootData, field) && Object.hasOwn(rootSnapshot, field))
+    Object.hasOwn(rootSnapshot, 'finalQualification')
+    || [...ROOT_FIELDS].some((field) => !Object.hasOwn(meta.data().rootData, field) && Object.hasOwn(rootSnapshot, field))
     || checksum(actualRoot) !== meta.data().rootDataChecksum
   ) throw new HttpsError('failed-precondition', 'Restore root checksum mismatch.');
   const queues = await root().collection('courtQueues').get();

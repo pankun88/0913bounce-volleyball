@@ -326,15 +326,16 @@
       </div>
     </div>
     <div class="card">
-      <h2>본선 진출팀 선택 &amp; 시드 배정 <button type="button" class="help-trigger" aria-label="본선 시드 배정 설명" data-help="예선 순위 기준으로 진출팀이 자동 선택됩니다. 체크박스로 팀을 바꾸거나 화살표로 시드 순서를 조정할 수 있습니다.">설명</button></h2>
+      <h2>본선 진출팀 선택 &amp; 시드 배정 <button type="button" class="help-trigger" aria-label="본선 시드 배정 설명" data-help="예선이 완료되면 자동 진출팀은 잠깁니다. 진출선에 걸친 동률 추첨 후보만 남은 자리 수만큼 선택할 수 있습니다. 대진표가 생성된 뒤 시드·자리는 대진표에서 조정합니다.">설명</button></h2>
       <div class="settings-box row" style="margin-bottom:12px; align-items:center; justify-content:space-between;">
         <label style="font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px;">
           조별 본선 진출 팀 수
-          <input type="number" id="qualifyPerGroupInput" min="1" max="16" value="2" style="width:64px;" />
+          <input type="number" id="qualifyPerGroupInput" min="1" max="32" value="2" style="width:64px;" />
           팀
         </label>
         <button class="btn primary small" id="saveQualifyPerGroupBtn" title="저장해야 적용돼요">저장</button>
       </div>
+      <div id="qualificationProofBanner" class="qualification-proof-banner is-review" role="status" aria-live="polite" hidden></div>
       <div id="finalTeamPicker"></div>
       <div class="row" style="margin-top:14px;">
         <button class="btn primary" id="generateBracketBtn">대진표 생성</button>

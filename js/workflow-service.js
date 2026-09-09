@@ -25,6 +25,7 @@ const reasonMessages = {
   recorder_name_changed: "담당 기록관 이름이 변경되었습니다. 코트를 다시 선택하세요.",
   operation_mismatch: "이 요청은 이전 작업과 일치하지 않습니다. 현재 경기 상태를 다시 확인하세요.",
   stale_revision: "다른 저장 내용이 먼저 반영되었습니다. 최신 초안을 다시 확인하세요.",
+  qualification_unverified: "본선 진출팀을 다시 확인해야 합니다. 관리자에게 확인을 요청하세요.",
 };
 
 function tabSessionId() {
@@ -57,7 +58,7 @@ export function rotateRecorderSessionId() {
 }
 export function operationId() { return crypto.randomUUID(); }
 export function recorderReason(error) {
-  const reason = error?.details?.reason || error?.details?.code || error?.message?.match(/\b(unresolved_teams|stale_queue|ownership_lost|lease_expired|submitted|maintenance|recorder_access_required|recorder_name_changed|operation_mismatch)\b/)?.[1];
+  const reason = error?.details?.reason || error?.details?.code || error?.message?.match(/\b(unresolved_teams|stale_queue|ownership_lost|lease_expired|submitted|maintenance|recorder_access_required|recorder_name_changed|operation_mismatch|qualification_unverified)\b/)?.[1];
   return reasonMessages[reason] || error?.message || "처리 중 오류가 발생했습니다.";
 }
 export function subscribeCourt(courtId, callback, onError) {

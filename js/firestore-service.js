@@ -1,5 +1,5 @@
 import {
-  collection, doc, setDoc, addDoc, updateDoc, getDoc, getDocs,
+  collection, doc, setDoc, updateDoc, getDoc, getDocs,
   onSnapshot, query, orderBy, writeBatch, serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
@@ -22,18 +22,168 @@ const publicScheduleDoc = () => doc(db, "tournaments", TID, "publicSchedule", "c
 /** onSnapshot 오류를 콘솔뿐 아니라 화면(firestore-error 이벤트)으로도 알린다 */
 function reportSnapshotError(label, err) {
   console.error(`[Firestore] ${label} 오류:`, err);
-  window.dispatchEvent(new CustomEvent("firestore-error", { detail: { label, err } }));
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function"
+      && typeof CustomEvent === "function") {
+    window.dispatchEvent(new CustomEvent("firestore-error", { detail: { label, err } }));
+  }
 }
 
-/** 실시간 구독이 일정 시간 안에 한 번도 응답하지 않으면 firestore-timeout 이벤트를 보낸다 */
-function watchForTimeout(label, ms = 8000) {
-  let done = false;
-  const timer = setTimeout(() => {
-    if (!done) {
-      window.dispatchEvent(new CustomEvent("firestore-timeout", { detail: { label } }));
+const RECOVERY_TIMEOUT_MS = 8000;
+const RECOVERY_RETRY_BASE_MS = 1000;
+const RECOVERY_RETRY_MAX_MS = 30000;
+
+function reportSnapshotTimeout(label) {
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function"
+      && typeof CustomEvent === "function") {
+    window.dispatchEvent(new CustomEvent("firestore-timeout", { detail: { label } }));
+  }
+}
+
+/**
+ * Owns one Firestore listener and its retry lifecycle.
+ *
+ * A Firestore listener is considered recovered only after a server-confirmed
+ * snapshot. Cache snapshots are still delivered to the caller, but do not
+ * reset the timeout or retry backoff. Every listener generation gets a token
+ * so callbacks from a stopped listener cannot affect a newer generation.
+ *
+ * @param {{
+ *   subscribe: (next: (snapshot: object) => void, error: (error: unknown) => void) => (() => void),
+ *   onSnapshot: (snapshot: object) => void,
+ *   timeoutLabel: string,
+ *   errorLabel?: string,
+ *   timeoutMs?: number,
+ *   retryBaseMs?: number,
+ *   retryMaxMs?: number,
+ *   scheduler?: { setTimeout?: Function, clearTimeout?: Function },
+ * }} options
+ * @returns {(() => void) & { retry?: () => void, retryNow?: () => void }}
+ */
+export function createRecoverableSubscription({
+  subscribe,
+  onSnapshot,
+  timeoutLabel,
+  errorLabel = `${timeoutLabel} 구독`,
+  timeoutMs = RECOVERY_TIMEOUT_MS,
+  retryBaseMs = RECOVERY_RETRY_BASE_MS,
+  retryMaxMs = RECOVERY_RETRY_MAX_MS,
+  scheduler = globalThis,
+}) {
+  const schedule = scheduler?.setTimeout || setTimeout;
+  const unschedule = scheduler?.clearTimeout || clearTimeout;
+  const baseRetryDelay = Math.max(1, Number.isFinite(retryBaseMs) ? retryBaseMs : RECOVERY_RETRY_BASE_MS);
+  const maxRetryDelay = Math.max(
+    baseRetryDelay,
+    Number.isFinite(retryMaxMs) ? retryMaxMs : RECOVERY_RETRY_MAX_MS,
+  );
+  let cancelled = false;
+  let generation = 0;
+  let activeStop = null;
+  let responseTimer = null;
+  let retryTimer = null;
+  let retryAttempt = 0;
+
+  const clearResponseTimer = () => {
+    if (responseTimer === null) return;
+    unschedule(responseTimer);
+    responseTimer = null;
+  };
+
+  const clearRetryTimer = () => {
+    if (retryTimer === null) return;
+    unschedule(retryTimer);
+    retryTimer = null;
+  };
+
+  const stopActiveListener = () => {
+    generation += 1;
+    const stop = activeStop;
+    activeStop = null;
+    if (typeof stop === "function") stop();
+  };
+
+  const retryDelay = () => {
+    const exponent = Math.min(retryAttempt, 30);
+    const delay = Math.min(maxRetryDelay, baseRetryDelay * (2 ** exponent));
+    retryAttempt += 1;
+    return delay;
+  };
+
+  let start;
+  const scheduleRetry = () => {
+    if (cancelled || retryTimer !== null) return;
+    retryTimer = schedule(() => {
+      retryTimer = null;
+      start();
+    }, retryDelay());
+  };
+
+  const restartAfterFailure = () => {
+    clearResponseTimer();
+    stopActiveListener();
+    scheduleRetry();
+  };
+
+  const handleTimeout = (token) => {
+    if (cancelled || token !== generation || responseTimer === null) return;
+    responseTimer = null;
+    reportSnapshotTimeout(timeoutLabel);
+    restartAfterFailure();
+  };
+
+  start = () => {
+    if (cancelled || activeStop || retryTimer !== null) return;
+    const token = ++generation;
+    if (Number.isFinite(timeoutMs) && timeoutMs >= 0) {
+      responseTimer = schedule(() => handleTimeout(token), timeoutMs);
     }
-  }, ms);
-  return () => { done = true; clearTimeout(timer); };
+
+    const next = (snapshot) => {
+      if (cancelled || token !== generation) return;
+      if (serverConfirmed(snapshot)) {
+        clearResponseTimer();
+        retryAttempt = 0;
+      }
+      onSnapshot(snapshot);
+    };
+    const error = (err) => {
+      if (cancelled || token !== generation) return;
+      reportSnapshotError(errorLabel, err);
+      restartAfterFailure();
+    };
+
+    try {
+      const stop = subscribe(next, error);
+      if (cancelled || token !== generation) {
+        if (typeof stop === "function") stop();
+        return;
+      }
+      activeStop = typeof stop === "function" ? stop : () => {};
+    } catch (err) {
+      error(err);
+    }
+  };
+
+  const retryNow = () => {
+    if (cancelled) return;
+    clearRetryTimer();
+    clearResponseTimer();
+    retryAttempt = 0;
+    stopActiveListener();
+    start();
+  };
+
+  const unsubscribe = () => {
+    if (cancelled) return;
+    cancelled = true;
+    clearResponseTimer();
+    clearRetryTimer();
+    stopActiveListener();
+  };
+  unsubscribe.retry = retryNow;
+  unsubscribe.retryNow = retryNow;
+  start();
+  return unsubscribe;
 }
 
 // ---------- 대회 설정 ----------
@@ -43,24 +193,36 @@ export async function saveTournamentInfo(data) {
 }
 
 function serverConfirmed(snapshot) {
-  return !snapshot.metadata.fromCache && !snapshot.metadata.hasPendingWrites;
+  return Boolean(snapshot?.metadata
+    && !snapshot.metadata.fromCache
+    && !snapshot.metadata.hasPendingWrites);
 }
 
 export function subscribeTournamentInfo(cb) {
-  const clearWatch = watchForTimeout("대회정보");
-  return onSnapshot(tDoc(), { includeMetadataChanges: true }, (snap) => {
-    if (serverConfirmed(snap)) clearWatch();
-    cb(snap.exists() ? snap.data() : null, snap.metadata);
-  }, (err) => {
-    clearWatch();
-    reportSnapshotError("대회정보 구독", err);
+  return createRecoverableSubscription({
+    timeoutLabel: "대회정보",
+    subscribe: (next, error) => onSnapshot(
+      tDoc(),
+      { includeMetadataChanges: true },
+      next,
+      error,
+    ),
+    onSnapshot: (snap) => {
+      cb(snap.exists() ? snap.data() : null, snap.metadata);
+    },
   });
 }
 
 // ---------- 조 ----------
 
 export async function addGroup(name, division) {
-  await addDoc(groupsCol(), { name, division, order: Date.now() });
+  const groupRef = doc(groupsCol());
+  return editParticipantStructure([{
+    collection: "groups",
+    id: groupRef.id,
+    create: true,
+    data: { name, division, order: Date.now() },
+  }]);
 }
 
 export async function renameGroup(groupId, name) {
@@ -87,56 +249,99 @@ export async function mutatePrelimStructure(operation, division, data = {}) {
   return result.data;
 }
 
+async function editParticipantStructure(changes) {
+  const result = await httpsCallable(functions, "mutatePrelimStructure")({
+    tournamentId: TID,
+    operation: "edit_participants",
+    changes,
+  });
+  return result.data;
+}
+
 /** 조의 예선 진행 방식을 라운드로빈/링크제로 전환한다 */
 export async function setGroupMatchMode(groupId, mode) {
-  await updateDoc(doc(groupsCol(), groupId), { matchMode: mode });
+  return editParticipantStructure([{
+    collection: "groups",
+    id: groupId,
+    create: false,
+    data: { matchMode: mode },
+  }]);
 }
 
 /** 조의 링크제 꼭짓점 배치(팀 id 배열, 빈 자리는 null)를 저장한다 */
 export async function setGroupRingOrder(groupId, ringOrder) {
-  await updateDoc(doc(groupsCol(), groupId), { ringOrder });
+  return editParticipantStructure([{
+    collection: "groups",
+    id: groupId,
+    create: false,
+    data: { ringOrder: [...ringOrder] },
+  }]);
 }
 
 export function subscribeGroups(cb) {
-  const clearWatch = watchForTimeout("조 목록");
-  return onSnapshot(query(groupsCol(), orderBy("order")), { includeMetadataChanges: true }, (snap) => {
-    if (serverConfirmed(snap)) clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
-  }, (err) => {
-    clearWatch();
-    reportSnapshotError("조 목록 구독", err);
+  return createRecoverableSubscription({
+    timeoutLabel: "조 목록",
+    subscribe: (next, error) => onSnapshot(
+      query(groupsCol(), orderBy("order")),
+      { includeMetadataChanges: true },
+      next,
+      error,
+    ),
+    onSnapshot: (snap) => {
+      cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
+    },
   });
 }
 
 // ---------- 팀 ----------
 
 export async function addTeam(name, groupId, division) {
-  await addDoc(teamsCol(), { name, groupId: groupId || null, division, order: Date.now(), advanced: false });
+  const teamRef = doc(teamsCol());
+  return editParticipantStructure([{
+    collection: "teams",
+    id: teamRef.id,
+    create: true,
+    data: {
+      name, groupId: groupId || null, division, order: Date.now(),
+    },
+  }]);
 }
 
 export async function updateTeam(id, data) {
-  await updateDoc(doc(teamsCol(), id), data);
+  return editParticipantStructure([{
+    collection: "teams",
+    id,
+    create: false,
+    data,
+  }]);
 }
 
 /** 팀을 대상 조로 옮기면서 그 조 안의 카드 순서를 한 번에 저장한다. */
 export async function moveAndReorderTeam(teamId, targetGroupId, orderedTeamIds) {
-  const batch = writeBatch(db);
-  orderedTeamIds.forEach((orderedTeamId, index) => {
+  return editParticipantStructure(orderedTeamIds.map((orderedTeamId, index) => {
     const data = { order: index };
     if (orderedTeamId === teamId) data.groupId = targetGroupId || null;
-    batch.update(doc(teamsCol(), orderedTeamId), data);
-  });
-  await batch.commit();
+    return {
+      collection: "teams",
+      id: orderedTeamId,
+      create: false,
+      data,
+    };
+  }));
 }
 
 export function subscribeTeams(cb) {
-  const clearWatch = watchForTimeout("팀 목록");
-  return onSnapshot(query(teamsCol(), orderBy("order")), { includeMetadataChanges: true }, (snap) => {
-    if (serverConfirmed(snap)) clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
-  }, (err) => {
-    clearWatch();
-    reportSnapshotError("팀 목록 구독", err);
+  return createRecoverableSubscription({
+    timeoutLabel: "팀 목록",
+    subscribe: (next, error) => onSnapshot(
+      query(teamsCol(), orderBy("order")),
+      { includeMetadataChanges: true },
+      next,
+      error,
+    ),
+    onSnapshot: (snap) => {
+      cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
+    },
   });
 }
 
@@ -152,13 +357,17 @@ export async function reorderPrelimMatches(groupId, orderedMatchIds) {
 }
 
 export function subscribePrelimMatches(cb) {
-  const clearWatch = watchForTimeout("예선경기");
-  return onSnapshot(prelimCol(), { includeMetadataChanges: true }, (snap) => {
-    if (serverConfirmed(snap)) clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
-  }, (err) => {
-    clearWatch();
-    reportSnapshotError("예선경기 구독", err);
+  return createRecoverableSubscription({
+    timeoutLabel: "예선경기",
+    subscribe: (next, error) => onSnapshot(
+      prelimCol(),
+      { includeMetadataChanges: true },
+      next,
+      error,
+    ),
+    onSnapshot: (snap) => {
+      cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
+    },
   });
 }
 
@@ -174,8 +383,6 @@ export function subscribePublicSchedule(cb) {
   let closed = false;
   let ensureAttempted = false;
   let ensurePending = false;
-  let clearWatch = watchForTimeout("공개 경기 일정");
-  let stopSnapshot = () => {};
 
   const ensure = async () => {
     if (closed || ensureAttempted || ensurePending) return;
@@ -190,19 +397,15 @@ export function subscribePublicSchedule(cb) {
     }
   };
 
-  const retry = () => {
-    if (closed) return;
-    ensureAttempted = false;
-    stopSnapshot();
-    clearWatch();
-    clearWatch = watchForTimeout("공개 경기 일정");
-    listen();
-    ensure();
-  };
-
-  const listen = () => {
-    stopSnapshot = onSnapshot(publicScheduleDoc(), { includeMetadataChanges: true }, (snap) => {
-      if (serverConfirmed(snap)) clearWatch();
+  const subscription = createRecoverableSubscription({
+    timeoutLabel: "공개 경기 일정",
+    subscribe: (next, error) => onSnapshot(
+      publicScheduleDoc(),
+      { includeMetadataChanges: true },
+      next,
+      error,
+    ),
+    onSnapshot: (snap) => {
       if (snap.exists()) {
         ensureAttempted = false;
         cb(snap.data(), snap.metadata);
@@ -210,26 +413,33 @@ export function subscribePublicSchedule(cb) {
       }
       cb(null, snap.metadata);
       ensure();
-    }, (err) => {
-      clearWatch();
-      if (!closed) reportSnapshotError("공개 경기 일정 구독", err);
-    });
-  };
-  listen();
-
+    },
+  });
+  const recover = subscription.retry;
   const unsubscribe = () => {
+    if (closed) return;
     closed = true;
-    clearWatch();
-    stopSnapshot();
+    subscription();
   };
-  unsubscribe.retry = retry;
+  unsubscribe.retry = () => {
+    if (closed) return;
+    ensureAttempted = false;
+    recover();
+    ensure();
+  };
   return unsubscribe;
 }
 
 // ---------- 본선 ----------
 
-/** Publish a local final draft with its exact authoritative CAS baseline. */
-export async function publishFinalBracket(division, expectedMatches, matches, scoreDrafts) {
+/** Publish a local final draft with its exact authoritative CAS baseline and qualification proof. */
+export async function publishFinalBracket(
+  division,
+  expectedMatches,
+  matches,
+  scoreDrafts,
+  qualificationContext = {},
+) {
   const callable = httpsCallable(functions, "publishFinalStructure");
   const result = await callable({
     tournamentId: TID,
@@ -237,19 +447,24 @@ export async function publishFinalBracket(division, expectedMatches, matches, sc
     expectedMatches,
     matches,
     scoreDrafts,
+    ...(qualificationContext || {}),
   });
   return result.data;
 }
 
 export function subscribeFinalMatches(division, cb) {
   const label = `${division} 본선경기`;
-  const clearWatch = watchForTimeout(label);
-  return onSnapshot(finalCol(division), { includeMetadataChanges: true }, (snap) => {
-    if (serverConfirmed(snap)) clearWatch();
-    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
-  }, (err) => {
-    clearWatch();
-    reportSnapshotError(`${label} 구독`, err);
+  return createRecoverableSubscription({
+    timeoutLabel: label,
+    subscribe: (next, error) => onSnapshot(
+      finalCol(division),
+      { includeMetadataChanges: true },
+      next,
+      error,
+    ),
+    onSnapshot: (snap) => {
+      cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata);
+    },
   });
 }
 

@@ -239,7 +239,8 @@ a { color: var(--red); text-decoration: none; }
    실제 카드들이 남는 공간을 나눠 가지므로 항상 가로폭을 꽉 채운다. */
 .grid-auto { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
 
-.maintenance-notice {
+.maintenance-notice,
+.qualification-stale-notice {
   background: #fff4df;
   border: 1px solid #e5ae58;
   border-radius: var(--radius);
@@ -247,6 +248,12 @@ a { color: var(--red); text-decoration: none; }
   padding: 22px;
   margin-bottom: 20px;
   text-align: center;
+}
+
+.qualification-stale-notice {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-weight: 700;
 }
 
 .maintenance-notice h2 {

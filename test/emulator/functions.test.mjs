@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { initializeApp, deleteApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator, signInAnonymously } from 'firebase/auth';
 import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/functions';
-import { collection, deleteDoc, doc, getDoc, getDocs, setDoc, Timestamp } from 'firebase/firestore';
+import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, setDoc, Timestamp, updateDoc } from 'firebase/firestore';
 import { createFixture, IDS, PROJECT_ID, path } from './fixtures.mjs';
 import { activateDependencyEntries, consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
 
@@ -18,6 +18,137 @@ export async function runFunctionsSuite() {
     const auth = getAuth(app); connectAuthEmulator(auth, `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST || '127.0.0.1:9099'}`, { disableWarnings: true });
     const credential = await signInAnonymously(auth);
     const functions = getFunctions(app, 'asia-northeast3'); connectFunctionsEmulator(functions, functionsHost, Number(functionsPort));
+    const qualificationFixtureGroupId = 'emulator-qualification-fixture-group';
+    let qualificationFixtureTeamIds = [];
+    let qualificationOriginalRoot;
+    let qualificationOriginalRootRead = false;
+    let qualificationOriginalGroup;
+    let qualificationOriginalGroupRead = false;
+    const qualificationOriginalTeams = new Map();
+    const qualificationMatches = new Set();
+    const publishWithQualification = async (payload) => {
+      const entrants = [];
+      for (const match of payload.matches || []) {
+        if ((match.round || 1) !== 1) continue;
+        for (const side of ['A', 'B']) {
+          if (match[`team${side}`]?.id) entrants.push(match[`team${side}`].id);
+        }
+        if (match.byeCandidate?.team?.id) entrants.push(match.byeCandidate.team.id);
+      }
+      const ids = [...new Set(entrants)];
+      if (ids.length < 2) {
+        throw new Error('Test publication fixture must contain at least two final entrants.');
+      }
+      await f.seed(async (db) => {
+        if (!qualificationOriginalRootRead) {
+          const rootSnap = await getDoc(doc(db, 'tournaments/main'));
+          qualificationOriginalRoot = rootSnap.exists() ? rootSnap.data() : null;
+          qualificationOriginalRootRead = true;
+        }
+        if (!qualificationOriginalGroupRead) {
+          const groupSnap = await getDoc(doc(db, path('groups', qualificationFixtureGroupId)));
+          qualificationOriginalGroup = groupSnap.exists() ? groupSnap.data() : null;
+          qualificationOriginalGroupRead = true;
+        }
+        for (const id of [...new Set([...qualificationFixtureTeamIds, ...ids])]) {
+          if (!qualificationOriginalTeams.has(id)) {
+            const teamSnap = await getDoc(doc(db, path('teams', id)));
+            qualificationOriginalTeams.set(id, teamSnap.exists() ? teamSnap.data() : null);
+          }
+        }
+        for (const matchId of qualificationMatches) {
+          await deleteDoc(doc(db, path('prelimMatches', matchId)));
+        }
+        qualificationMatches.clear();
+        await setDoc(doc(db, path('groups', qualificationFixtureGroupId)), {
+          id: qualificationFixtureGroupId,
+          division: payload.division,
+          matchMode: 'roundrobin',
+          ringOrder: [],
+        });
+        for (const id of [...new Set([...qualificationFixtureTeamIds, ...ids])]) {
+          const original = qualificationOriginalTeams.get(id);
+          if (!ids.includes(id)) {
+            if (original) await setDoc(doc(db, path('teams', id)), original);
+            else await deleteDoc(doc(db, path('teams', id)));
+            continue;
+          }
+          await setDoc(doc(db, path('teams', id)), {
+            ...(original || {}),
+            id,
+            division: payload.division,
+            groupId: qualificationFixtureGroupId,
+            name: original?.name || id,
+          });
+        }
+        for (let i = 0; i < ids.length; i += 1) {
+          for (let j = i + 1; j < ids.length; j += 1) {
+            const matchId = `emulator-qualification-${i}-${j}`;
+            qualificationMatches.add(matchId);
+            await setDoc(doc(db, path('prelimMatches', matchId)), {
+              id: matchId,
+              division: payload.division,
+              groupId: qualificationFixtureGroupId,
+              teamA: ids[i],
+              teamB: ids[j],
+              sets: score,
+              status: 'done',
+              result: 'A',
+              officialCurrent: true,
+              officialRevision: 1,
+            });
+          }
+        }
+        qualificationFixtureTeamIds = ids;
+        await setDoc(doc(db, 'tournaments/main'), {
+          qualifyPerGroup: {
+            ...(qualificationOriginalRoot?.qualifyPerGroup || {}),
+            [payload.division]: ids.length,
+          },
+        }, { merge: true });
+      });
+      const prepared = await call(functions, 'prepareFinalQualification', {
+        tournamentId: 'main', division: payload.division,
+      });
+      assert.equal(prepared.state.ready, true, `Invalid publication fixture: ${JSON.stringify(prepared.state.blockers)}`);
+      return call(functions, 'publishFinalStructure', {
+        ...payload,
+        expectedPrelimFingerprint: prepared.fingerprint,
+        tieSelections: {},
+      });
+    };
+    const clearQualificationFixture = async () => {
+      await f.seed(async (db) => {
+        for (const matchId of qualificationMatches) {
+          await deleteDoc(doc(db, path('prelimMatches', matchId)));
+        }
+        qualificationMatches.clear();
+        for (const id of qualificationFixtureTeamIds) {
+          const original = qualificationOriginalTeams.get(id);
+          if (original) await setDoc(doc(db, path('teams', id)), original);
+          else await deleteDoc(doc(db, path('teams', id)));
+        }
+        if (qualificationOriginalGroup) {
+          await setDoc(doc(db, path('groups', qualificationFixtureGroupId)), qualificationOriginalGroup);
+        } else {
+          await deleteDoc(doc(db, path('groups', qualificationFixtureGroupId)));
+        }
+        if (qualificationOriginalRoot?.qualifyPerGroup) {
+          await setDoc(doc(db, 'tournaments/main'), {
+            qualifyPerGroup: qualificationOriginalRoot.qualifyPerGroup,
+            finalQualification: {
+              men: deleteField(),
+            },
+          }, { merge: true });
+        } else {
+          await setDoc(doc(db, 'tournaments/main'), {
+            qualifyPerGroup: deleteField(),
+            finalQualification: { men: deleteField() },
+          }, { merge: true });
+        }
+      });
+      qualificationFixtureTeamIds = [];
+    };
     const data = { tournamentId: 'main' };
     const resetData = { ...data, expectedName: '바운스발리볼' };
     await assert.rejects(call(functions, 'resetTournament', data), /Seeded administrator required/, 'reset-non-admin-rejected');
@@ -285,13 +416,23 @@ export async function runFunctionsSuite() {
         if (!rejected.noWorkflow) await deleteDoc(doc(db, path('scoreWorkflows', key)));
       });
     }
+    // The clear-only survivor intentionally has no qualification group.
+    // Its preservation assertions are complete; do not leak this incomplete
+    // fixture into the independent publication scenarios.
+    await f.seed(async (db) => {
+      for (const collectionName of ['prelimMatches', 'courtAssignments', 'scoreWorkflows']) {
+        await deleteDoc(doc(db, path(collectionName, 'final-clear-survivor')));
+      }
+      await deleteDoc(doc(db, path('courtQueues', 'final-clear-court')));
+      await deleteDoc(doc(db, path('courts', 'final-clear-court')));
+    });
     try {
       await f.seed(async (db) => {
         for (const id of ['bye-team', 'opponent-team', 'other-team']) {
           await setDoc(doc(db, path('teams', id)), { id, division: 'men', name: id });
         }
       });
-      await call(functions, 'publishFinalStructure', {
+      await publishWithQualification({
         tournamentId: 'main',
         division: 'men',
         expectedMatches: [],
@@ -382,18 +523,21 @@ export async function runFunctionsSuite() {
     await f.seed((db) => setDoc(doc(db, 'tournaments/main/divisions/men/finalMatches/publish-empty-clear'), {
       id: 'publish-empty-clear', status: 'empty', officialRevision: 0, lastTransitionId: 'seed:empty-clear',
     }));
-    await call(functions, 'publishFinalStructure', {
+    await call(functions, 'clearFinalStructure', {
       tournamentId: 'main', division: 'men',
-      expectedMatches: [{ id: 'publish-empty-clear', lastTransitionId: 'seed:empty-clear', officialRevision: 0 }],
-      matches: [], scoreDrafts: [],
     });
     assert.equal((await f.seed((db) => getDoc(
       doc(db, 'tournaments/main/divisions/men/finalMatches/publish-empty-clear'),
     ))).exists(), false, 'final-publish-empty-cas-clears-pristine-structure');
-    await f.seed((db) => setDoc(doc(db, path('teams', 'pending-bye-team')), {
-      id: 'pending-bye-team', division: 'men', name: 'Pending BYE',
-    }));
-    const pendingByePublish = await call(functions, 'publishFinalStructure', {
+    await f.seed(async (db) => {
+      await setDoc(doc(db, path('teams', 'pending-bye-team')), {
+        id: 'pending-bye-team', division: 'men', name: 'Pending BYE',
+      });
+      await setDoc(doc(db, path('teams', 'pending-bye-other')), {
+        id: 'pending-bye-other', division: 'men', name: 'Pending BYE Other',
+      });
+    });
+    const pendingByePublish = await publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: [], scoreDrafts: [],
       matches: [
         {
@@ -405,6 +549,11 @@ export async function runFunctionsSuite() {
         {
           id: 'pending-bye-root-other', round: 1, index: 1, status: 'empty',
           teamA: null, teamB: null, teamASource: null, teamBSource: null,
+          byeCandidate: {
+            team: { id: 'pending-bye-other', name: 'Pending BYE Other' },
+            source: { type: 'seed', teamId: 'pending-bye-other' },
+            side: 'A',
+          },
           nextMatchId: 'pending-bye-final', nextSlot: 'B',
         },
         {
@@ -419,6 +568,7 @@ export async function runFunctionsSuite() {
         await deleteDoc(doc(db, 'tournaments/main/divisions/men/finalMatches', id));
       }
       await deleteDoc(doc(db, path('teams', 'pending-bye-team')));
+      await deleteDoc(doc(db, path('teams', 'pending-bye-other')));
     });
     await f.seed(async (db) => {
       for (const id of ['recorded-a', 'recorded-b', 'recorded-c']) {
@@ -431,7 +581,7 @@ export async function runFunctionsSuite() {
       teamASource: { type: 'seed', teamId: 'recorded-a' }, teamBSource: { type: 'seed', teamId: teamB },
       nextMatchId: null, nextSlot: null,
     }];
-    const recordedPublished = await call(functions, 'publishFinalStructure', {
+    const recordedPublished = await publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: [], matches: recordedStructure(),
       scoreDrafts: [{ matchId: 'recorded-final', sets: score, reason: '', expectedSubmissionVersion: 0 }],
     });
@@ -450,7 +600,7 @@ export async function runFunctionsSuite() {
         lock: null,
       }, { merge: true });
     });
-    const identicalResubmission = await call(functions, 'publishFinalStructure', {
+    const identicalResubmission = await publishWithQualification({
       tournamentId: 'main',
       division: 'men',
       expectedMatches: recordedBase,
@@ -467,17 +617,17 @@ export async function runFunctionsSuite() {
     const identicalBase = identicalResubmission.matches.map((match) => ({
       id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
     })).sort((a, b) => a.id.localeCompare(b.id));
-    const unchangedRecorded = await call(functions, 'publishFinalStructure', {
+    const unchangedRecorded = await publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: identicalBase, matches: recordedStructure(), scoreDrafts: [],
     });
     assert.equal(unchangedRecorded.scoreRevisions['recorded-final'], 1, 'final-publish-preserves-unchanged-approved-score');
     const unchangedBase = unchangedRecorded.matches.map((match) => ({
       id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
     })).sort((a, b) => a.id.localeCompare(b.id));
-    await assert.rejects(call(functions, 'publishFinalStructure', {
+    await assert.rejects(publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: unchangedBase, matches: recordedStructure('recorded-c'), scoreDrafts: [],
-    }), /Recorded final/, 'final-publish-rejects-recorded-entrant-retarget');
-    const correctedRecorded = await call(functions, 'publishFinalStructure', {
+    }), /Recorded final|Played final/, 'final-publish-rejects-recorded-entrant-retarget');
+    const correctedRecorded = await publishWithQualification({
       tournamentId: 'main',
       division: 'men',
       expectedMatches: unchangedBase,
@@ -549,14 +699,14 @@ export async function runFunctionsSuite() {
         teamA: null, teamB: null, teamASource: null, teamBSource: null, nextMatchId: null, nextSlot: null,
       },
     ];
-    const dependencyFirst = await call(functions, 'publishFinalStructure', {
+    const dependencyFirst = await publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: [], matches: dependencyStructure,
       scoreDrafts: [{ matchId: 'dependency-semi-a', sets: score, reason: '', expectedSubmissionVersion: 0 }],
     });
     const dependencyBaseline = dependencyFirst.matches.map((match) => ({
       id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
     })).sort((a, b) => a.id.localeCompare(b.id));
-    await call(functions, 'publishFinalStructure', {
+    await publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: dependencyBaseline, matches: dependencyStructure,
       scoreDrafts: [{ matchId: 'dependency-semi-b', sets: score, reason: '', expectedSubmissionVersion: 0 }],
     });
@@ -579,6 +729,7 @@ export async function runFunctionsSuite() {
       for (const id of dependencyTeams) await deleteDoc(doc(db, path('teams', id)));
     });
 
+    await clearQualificationFixture();
     await f.seed(async (db) => {
       await setDoc(doc(db, path('groups', 'clean-group')), { division: 'men', name: 'Clean' });
       await setDoc(doc(db, path('prelimMatches', 'clean-remove')), {
@@ -709,7 +860,7 @@ export async function runFunctionsSuite() {
     const bulkTeamReset = await call(functions, 'mutatePrelimStructure', {
       ...data, operation: 'delete_all_teams', division: 'men',
     });
-    assert.ok(bulkTeamReset.counts.removedMatches >= 3, 'bulk-team-reset-removes-pristine-matches');
+    assert.equal(bulkTeamReset.counts.removedMatches, 2, 'bulk-team-reset-removes-its-two-surviving-pristine-matches');
     assert.equal((await f.seed((db) => getDoc(doc(db, path('teams', 'pair-a'))))).exists(), false, 'bulk-team-reset-deletes-teams');
     assert.equal((await f.seed((db) => getDoc(doc(db, path('courtAssignments', 'clean-before'))))).exists(), false, 'bulk-team-reset-deletes-pristine-assignments');
     assert.equal((await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', 'clean-survivor'))))).exists(), false, 'bulk-team-reset-deletes-pristine-workflows');
@@ -1196,6 +1347,12 @@ export async function runFunctionsSuite() {
       ['BP'],
     );
     assert.equal(activatedBlocked.currentMatchKey, 'BP', 'reassigned-blocked-correction-activates');
+    await f.seed(async (db) => {
+      await deleteDoc(doc(db, path('courtAssignments', 'BP')));
+      await deleteDoc(doc(db, path('scoreWorkflows', 'BP')));
+      await deleteDoc(doc(db, path('courtQueues', 'blocked-court')));
+      await deleteDoc(doc(db, path('courts', 'blocked-court')));
+    });
 
     // Queue planning is the same pure core used by callable review/recovery handlers.
     const assignments = { C1: { publicStatus: 'under_review', courtOrder: 1, nextCourtMatchKey: 'C2' }, C2: { publicStatus: 'scheduled', courtOrder: 2, nextCourtMatchKey: null }, R1: { publicStatus: 'replay_required', courtOrder: 3, nextCourtMatchKey: null } };
@@ -1741,6 +1898,57 @@ export async function runFunctionsSuite() {
 
     // Keep the recorder contract isolated from the topology scenarios above.
     const contractCourt = 'recorder-contract-court';
+    const recorderQualificationCollections = ['groups', 'teams', 'prelimMatches', 'divisions/men/finalMatches'];
+    let recorderQualificationBackup;
+    const isolateRecorderQualification = async () => f.seed(async (db) => {
+      const originalRoot = (await getDoc(doc(db, 'tournaments/main'))).data();
+      const collections = [];
+      for (const collectionPath of recorderQualificationCollections) {
+        const snapshot = await getDocs(collection(db, `tournaments/main/${collectionPath}`));
+        collections.push({ collectionPath, documents: snapshot.docs.map((snap) => ({ id: snap.id, data: snap.data() })) });
+        for (const snap of snapshot.docs) await deleteDoc(snap.ref);
+      }
+      recorderQualificationBackup = { originalRoot, collections };
+      await updateDoc(doc(db, 'tournaments/main'), { 'qualifyPerGroup.men': 2 });
+      await setDoc(doc(db, path('groups', 'recorder-qualification-group')), {
+        division: 'men', name: 'Recorder qualification', order: 0, matchMode: 'roundrobin', ringOrder: [],
+      });
+      for (const id of ['A', 'B']) {
+        await setDoc(doc(db, path('teams', id)), {
+          division: 'men', groupId: 'recorder-qualification-group', name: id, order: 0,
+        });
+      }
+      await setDoc(doc(db, path('prelimMatches', 'recorder-qualification-match')), {
+        division: 'men', groupId: 'recorder-qualification-group', teamA: 'A', teamB: 'B',
+        sets: score, status: 'done', result: 'A', officialCurrent: true,
+        officialRevision: 1, lastTransitionId: 'seed:recorder-qualification',
+      });
+    });
+    const confirmRecorderQualification = async () => {
+      const prepared = await call(functions, 'prepareFinalQualification', { ...data, division: 'men' });
+      assert.equal(prepared.state.ready, true, 'recorder-final-fixture-has-complete-approved-prelims');
+      await f.seed((db) => updateDoc(doc(db, 'tournaments/main'), {
+        'finalQualification.men': {
+          status: 'current', fingerprint: prepared.fingerprint,
+          participantIds: ['A', 'B'], tieSelections: {}, reason: 'qualified-recorder-fixture',
+        },
+      }));
+    };
+    const restoreRecorderQualification = async () => f.seed(async (db) => {
+      for (const { collectionPath, documents } of recorderQualificationBackup.collections) {
+        const current = await getDocs(collection(db, `tournaments/main/${collectionPath}`));
+        for (const snap of current.docs) await deleteDoc(snap.ref);
+        for (const saved of documents) await setDoc(doc(db, `tournaments/main/${collectionPath}/${saved.id}`), saved.data);
+      }
+      for (const id of ['contract-final-straight', 'contract-final-three']) {
+        await deleteDoc(doc(db, path('courtAssignments', id)));
+        await deleteDoc(doc(db, path('scoreWorkflows', id)));
+      }
+      await updateDoc(doc(db, 'tournaments/main'), {
+        qualifyPerGroup: recorderQualificationBackup.originalRoot.qualifyPerGroup || deleteField(),
+        finalQualification: recorderQualificationBackup.originalRoot.finalQualification || deleteField(),
+      });
+    });
     const seedRecorderMatch = async (id, {
       matchType = 'prelim', divisionId = null, dependencyReady = true, draftState = 'idle',
       resumeDraftState = 'idle', lock = null, draft = { sets: [] },
@@ -1759,7 +1967,10 @@ export async function runFunctionsSuite() {
       });
       const official = { id, status: 'scheduled', teamA: 'A', teamB: 'B' };
       if (matchType === 'final') {
-        await setDoc(doc(db, `tournaments/main/divisions/${divisionId}/finalMatches/${id}`), official);
+        await setDoc(doc(db, `tournaments/main/divisions/${divisionId}/finalMatches/${id}`), {
+          ...official, division: divisionId, round: 1, index: 0,
+          teamA: { id: 'A', name: 'A' }, teamB: { id: 'B', name: 'B' },
+        });
       } else {
         await setDoc(doc(db, path('prelimMatches', id)), official);
       }
@@ -1893,7 +2104,9 @@ export async function runFunctionsSuite() {
     assert.equal(reclaimedWorkflow.data().resumeDraftState, 'rejected', 'expired-lock-reclaim-preserves-resume-state');
     assert.ok(reclaimed.token, 'expired-lock-is-reclaimable');
 
+    await isolateRecorderQualification();
     await seedRecorderMatch('contract-final-straight', { matchType: 'final', divisionId: 'men' });
+    await confirmRecorderQualification();
     const straightClaim = await call(functions, 'claimRecorderDraft', {
       ...data, matchKey: 'contract-final-straight', courtId: contractCourt, recorderName: 'Recorder One',
       sessionId: 'contract-final-straight-session', queueRevision: 0,
@@ -1931,7 +2144,13 @@ export async function runFunctionsSuite() {
       doc(db, path('courtQueues', contractCourt)),
     ))).data().queueRevision, straightResult.queueRevision, 'submit-replay-does-not-double-advance-queue');
 
+    await f.seed(async (db) => {
+      await deleteDoc(doc(db, 'tournaments/main/divisions/men/finalMatches/contract-final-straight'));
+      await deleteDoc(doc(db, path('courtAssignments', 'contract-final-straight')));
+      await deleteDoc(doc(db, path('scoreWorkflows', 'contract-final-straight')));
+    });
     await seedRecorderMatch('contract-final-three', { matchType: 'final', divisionId: 'men' });
+    await confirmRecorderQualification();
     const threeClaim = await call(functions, 'claimRecorderDraft', {
       ...data, matchKey: 'contract-final-three', courtId: contractCourt, recorderName: 'Recorder One',
       sessionId: 'contract-final-three-session', queueRevision: 0,
@@ -1946,6 +2165,7 @@ export async function runFunctionsSuite() {
       doc(db, path('scoreWorkflows', 'contract-final-three')),
     ))).data().submittedSnapshot.sets.length, 3, 'three-set-final-persists-three-sets');
 
+    await restoreRecorderQualification();
     const cancelCase = async (id, discardDraft) => {
       await seedRecorderMatch(id);
       const claimed = await call(functions, 'claimRecorderDraft', {
@@ -2100,6 +2320,17 @@ export async function runFunctionsSuite() {
     );
 
     await f.seed(async (db) => {
+      await setDoc(doc(db, 'tournaments/main'), {
+        finalQualification: {
+          men: {
+            status: 'current',
+            fingerprint: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            participantIds: ['legacy-finalist-a', 'legacy-finalist-b'],
+            tieSelections: {},
+            reason: 'legacy-proof',
+          },
+        },
+      }, { merge: true });
       await setDoc(doc(db, path('teams', 'restore-stale-team')), { stale: true });
       await setDoc(doc(db, path('prelimMatches', 'restore-stale-match')), { stale: true });
       await setDoc(doc(db, path('scoreWorkflows', 'restore-stale-workflow')), { stale: true });
@@ -2379,6 +2610,7 @@ export async function runFunctionsSuite() {
     ]));
     assert.equal(pruned[0].data().name, '복원된 대회', 'restore-restores-root-name');
     assert.deepEqual(pruned[0].data().qualifyPerGroup, { men: 3, women: 1 }, 'restore-restores-root-settings');
+    assert.equal(Object.hasOwn(pruned[0].data(), 'finalQualification'), false, 'restore-does-not-retain-derived-qualification-proof');
     assert.equal(Object.hasOwn(pruned[0].data(), 'courtTopologyRevision'), false, 'restore-deletes-absent-root-setting');
     assert.equal(pruned[0].data().maintenance?.enabled, true, 'restore-prune-keeps-maintenance-lease');
     assert.equal(pruned[0].data().maintenance?.restoreManifestId, 'exact-restore-replacement', 'restore-prune-keeps-manifest-lease');

@@ -1,6 +1,6 @@
 import { isFirebaseConfigured, db } from "./firebase-init.js";
 import {
-  collection, doc, getDoc, getDocs, onSnapshot, serverTimestamp, updateDoc,
+  collection, doc, getDoc, getDocs, onSnapshot,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { watchAuthState, login, logout, requestPasswordReset, changePassword, describeAuthError } from "./auth-service.js";
 import {
@@ -12,7 +12,16 @@ import {
   publishFinalBracket, subscribeFinalMatches,
   exportAllData, importAllData,
 } from "./firestore-service.js";
-import { evaluatePrelimMatch, evaluateFinalMatch, computeGroupStandings, computeAutomaticQualifiers, validateSetScore } from "./match-logic.js";
+import {
+  evaluatePrelimMatch,
+  evaluateFinalMatch,
+  computeGroupStandings,
+  computeAutomaticQualifiers,
+  validateSetScore,
+  buildQualificationSnapshot,
+  computeQualificationState,
+  validateQualificationSelection,
+} from "./match-logic.js";
 import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
 import { renderBracket } from "./bracket-render.js";
 import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
@@ -60,6 +69,22 @@ let finalDraftBaseline = [];
 let finalScoreDrafts = new Map();
 let seedSelection = []; // 본선 진출팀 id 순서 (시드순)
 let seedAutoMode = true; // true면 예선 순위 기준 추천 진출팀을 매 렌더마다 자동으로 채움 (체크박스/화살표를 직접 조작하면 false로 바뀜)
+let qualificationState = null;
+let qualificationServerState = null;
+let qualificationServerFingerprint = "";
+let qualificationTieSelections = {};
+let qualificationProof = null;
+let qualificationRevalidatedLocally = false;
+let qualificationSourceKey = "";
+let qualificationSourceInitialized = false;
+let qualificationGroupsLoaded = false;
+let qualificationTeamsLoaded = false;
+let qualificationMatchesLoaded = false;
+let qualificationDraftStale = false;
+let qualificationPreparationInFlight = false;
+let qualificationReplacement = null;
+let qualificationPreparationError = "";
+let qualificationCountInputOverride = null;
 let pendingAutoSelectGroupName = null; // 방금 추가한 조 이름 — 팀 등록 select에 자동 선택용
 let ringSelection = null; // 링크제 클릭배치 중 선택 상태: { type:'pool'|'vertex', teamId|index, groupId }
 let isAddingGroup = false; // 저장 응답 전 중복 클릭/Enter로 같은 조가 두 번 생성되는 것을 막는다
@@ -187,6 +212,276 @@ function cloneFinalMatches(matches) {
   return structuredClone(matches || []);
 }
 
+function qualificationSnapshotForCurrentData() {
+  const selectedGroups = allGroups.filter((group) => group.division === activeDivision);
+  const selectedGroupIds = new Set(selectedGroups.map((group) => group.id));
+  const selectedTeams = allTeams.filter((team) => (
+    team.division === activeDivision || selectedGroupIds.has(team.groupId)
+  ));
+  const selectedMatches = allPrelimMatches.filter((match) => (
+    match.division === activeDivision || selectedGroupIds.has(match.groupId)
+  ));
+  return buildQualificationSnapshot({
+    division: activeDivision,
+    qualifyPerGroup: tournamentInfo.qualifyPerGroup?.[activeDivision],
+    groups: selectedGroups,
+    teams: selectedTeams,
+    matches: selectedMatches,
+  });
+}
+
+function qualificationBlockerCode(blocker) {
+  if (typeof blocker === "string") return blocker.split(":", 1)[0];
+  return blocker?.code || "";
+}
+
+function qualificationBlockerMessage(blocker) {
+  const value = typeof blocker === "string"
+    ? blocker
+    : `${blocker?.code || "qualification_unknown"}:${blocker?.message || ""}`;
+  const [code] = value.split(":");
+  const guidance = {
+    invalid_division: "선택한 부문을 확인하세요.",
+    invalid_qualification_count: "조별 진출 팀 수는 허용 범위의 정수여야 합니다.",
+    duplicate_group: "조 식별자가 중복되었습니다. 조 구성을 확인하세요.",
+    duplicate_team: "팀 식별자가 중복되었습니다. 팀 구성을 확인하세요.",
+    duplicate_match: "예선 경기 식별자가 중복되었습니다. 예선 대진을 확인하세요.",
+    foreign_group: "선택한 부문에 속하지 않는 조가 있습니다.",
+    foreign_team: "선택한 부문에 속하지 않는 팀이 있습니다.",
+    foreign_match: "선택한 부문에 속하지 않는 예선 경기가 있습니다.",
+    unknown_team_group: "팀이 존재하지 않는 조를 가리킵니다.",
+    unknown_match_group: "예선 경기가 존재하지 않는 조를 가리킵니다.",
+    orphan_match: "팀이 없는 조를 가리키는 예선 경기가 있습니다.",
+    invalid_schedule_mode: "예선 방식이 올바르지 않습니다.",
+    invalid_ring_order: "링크제 배치가 모든 팀을 정확히 한 번씩 포함해야 합니다.",
+    insufficient_group_members: "조에는 최소 두 팀이 필요합니다.",
+    foreign_match_team: "예선 경기의 팀이 해당 조의 팀과 일치하지 않습니다.",
+    duplicate_game: "같은 팀 조합의 예선 경기가 중복되었습니다.",
+    unexpected_game: "조 편성에 없는 예선 경기가 포함되었습니다.",
+    retracted_match: "철회된 예선 경기가 있어 최신 공식 결과가 필요합니다.",
+    incomplete_match: "모든 예선 경기에 현재의 완전한 결과가 필요합니다.",
+    missing_game: "예상된 예선 경기가 빠져 있습니다.",
+    schedule_size: "예선 대진 수가 조 구성과 일치하지 않습니다.",
+    no_groups: "참가팀이 배정된 조가 없습니다.",
+    empty_group_games: "참가팀이 없는 조에 경기 기록이 남아 있습니다. 조 구성과 기록을 확인하세요.",
+    qualification_state_required: "예선 진출 상태를 먼저 확인하세요.",
+    participant_ids_required: "진출팀 목록을 확인하세요.",
+    tie_selections_required: "추첨 대상 선택을 확인하세요.",
+    duplicate_participant: "진출팀이 중복되었거나 올바른 팀 ID가 아닙니다.",
+    foreign_participant: "선택한 팀이 해당 부문의 팀이 아닙니다.",
+    invalid_tie_selection: "추첨 선택은 팀 ID 배열이어야 합니다.",
+    duplicate_tie_selection: "추첨 선택에서 팀을 중복 선택할 수 없습니다.",
+    cutoff_slots_mismatch: "추첨 대상은 남은 자리 수만큼 정확히 선택해야 합니다.",
+    non_candidate_selection: "진출선 추첨 후보만 선택할 수 있습니다.",
+    mandatory_qualifier_missing: "자동 진출팀은 반드시 포함해야 합니다.",
+    cutoff_selection_missing: "추첨으로 선택한 팀을 진출팀 목록에도 포함해야 합니다.",
+    non_qualifier_selected: "진출 조건을 충족하지 않는 팀은 선택할 수 없습니다.",
+    group_count_mismatch: "각 조의 진출팀 수가 정원과 일치해야 합니다.",
+    unknown_tie_group: "존재하지 않는 조의 추첨 선택이 포함되었습니다.",
+    qualification_not_ready: "참가팀이 있는 모든 조의 예선 결과를 먼저 완료하세요.",
+    participant_count: "본선 진출팀은 2~32팀이어야 합니다.",
+    qualification_validation_failed: "진출팀 선택 검증에 실패했습니다.",
+  }[code];
+  return guidance || "예선 진출 조건을 확인하고 최신 상태에서 다시 시도하세요.";
+}
+
+function qualificationGroupTeamIds(group) {
+  return (group?.standings || []).map((standing) => standing.teamId).filter(Boolean);
+}
+
+function qualificationStateRequiredCount(state) {
+  return Number.isInteger(state?.requiredCount) ? state.requiredCount : 0;
+}
+
+function qualificationStateBlockers(state) {
+  return Array.isArray(state?.blockers) ? state.blockers : [];
+}
+
+function qualificationStateHasStructuralBlockers(state) {
+  if (!state || !(state.groups || []).length) return true;
+  return qualificationStateBlockers(state).length > 0;
+}
+
+function qualificationStateReadyForSelection(state) {
+  return Boolean(state?.ready) && !qualificationStateHasStructuralBlockers(state);
+}
+
+function qualificationStateForCurrentData() {
+  qualificationState = computeQualificationState(qualificationSnapshotForCurrentData());
+  return qualificationState;
+}
+
+function canonicalQualificationTieSelections(state, selections = qualificationTieSelections) {
+  const result = {};
+  (state?.groups || []).forEach((group) => {
+    const candidates = new Set(group.cutoffCandidateIds || []);
+    const slots = Math.max(0, Number(group.cutoffSlots) || 0);
+    const picked = Array.isArray(selections?.[group.groupId]) ? selections[group.groupId] : [];
+    result[group.groupId] = [...new Set(picked)]
+      .filter((id) => candidates.has(id))
+      .slice(0, slots)
+      .sort();
+  });
+  return result;
+}
+
+function qualificationSelectionIds(state, tieSelections = qualificationTieSelections) {
+  return (state?.groups || []).flatMap((group) => [
+    ...(group.automaticIds || []),
+    ...(canonicalQualificationTieSelections(state, tieSelections)[group.groupId] || []),
+  ]);
+}
+
+function qualificationSeedOrder(state, tieSelections = qualificationTieSelections) {
+  const canonicalTies = canonicalQualificationTieSelections(state, tieSelections);
+  const tiers = [];
+  const maxRank = Math.max(
+    0,
+    ...(state?.groups || []).flatMap((group) => (
+      (group.standings || []).map((standing) => Number(standing.rank) || 0)
+    )),
+  );
+  for (let rank = 1; rank <= maxRank; rank += 1) {
+    const tier = [];
+    (state?.groups || []).forEach((group) => {
+      const qualified = new Set([
+        ...(group.automaticIds || []),
+        ...(canonicalTies[group.groupId] || []),
+      ]);
+      (group.standings || [])
+        .filter((standing) => standing.rank === rank && qualified.has(standing.teamId))
+        .forEach((standing) => tier.push({
+          teamId: standing.teamId,
+          groupId: group.groupId,
+          groupSize: qualificationGroupTeamIds(group).length,
+        }));
+    });
+    if (tier.length) tiers.push(tier);
+  }
+  return buildCrossGroupSeedOrder(tiers);
+}
+
+function syncQualificationSelection(state) {
+  const nextTies = canonicalQualificationTieSelections(state);
+  qualificationTieSelections = nextTies;
+  const ids = new Set(qualificationSelectionIds(state, nextTies));
+  const previousOrder = seedSelection.filter((id) => ids.has(id));
+  const recommended = qualificationSeedOrder(state, nextTies);
+  seedSelection = previousOrder.length === ids.size
+    ? previousOrder
+    : recommended.filter((id) => ids.has(id));
+  if (seedSelection.length !== ids.size) {
+    ids.forEach((id) => {
+      if (!seedSelection.includes(id)) seedSelection.push(id);
+    });
+  }
+}
+
+function qualificationHasFinalBracket() {
+  return authoritativeFinalMatches.length > 0
+    || finalMatches.length > 0
+    || bracketPublishPending;
+}
+
+function qualificationHasFinalPlay() {
+  if (finalScoreDrafts.size > 0) return true;
+  const records = [
+    ...authoritativeFinalMatches,
+    ...finalMatches,
+    ...reviewAssignments,
+    ...reviewWorkflows.values(),
+  ];
+  return records.some((record) => (
+    Number(record?.officialRevision || 0) > 0
+    || Number(record?.attemptCount || 0) > 0
+    || Number(record?.draftRevision || 0) > 0
+    || Number(record?.submissionVersion || 0) > 0
+    || ["done", "completed", "in_progress", "under_review"].includes(record?.status)
+    || ["completed", "in_progress", "under_review", "replay_required", "rework_required"].includes(record?.publicStatus)
+    || (Array.isArray(record?.sets) && record.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0))
+    || (Array.isArray(record?.draft?.sets) && record.draft.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0))
+  ));
+}
+
+function finalEntrantIds(matches = finalMatches) {
+  const ids = [];
+  (matches || [])
+    .filter((match) => (match.round || 1) === 1)
+    .forEach((match) => {
+      [match.teamA?.id, match.teamB?.id, match.byeCandidate?.team?.id]
+        .filter(Boolean)
+        .forEach((id) => { if (!ids.includes(id)) ids.push(id); });
+    });
+  return ids;
+}
+
+function qualificationSourceChanged() {
+  const snapshot = qualificationSnapshotForCurrentData();
+  const nextKey = JSON.stringify(snapshot);
+  if (!qualificationGroupsLoaded || !qualificationTeamsLoaded || !qualificationMatchesLoaded) {
+    qualificationSourceKey = nextKey;
+    return false;
+  }
+  if (!qualificationSourceInitialized) {
+    qualificationSourceInitialized = true;
+    qualificationSourceKey = nextKey;
+    return false;
+  }
+  if (qualificationSourceKey === nextKey) return false;
+  qualificationSourceKey = nextKey;
+  if (qualificationHasFinalBracket()) {
+    qualificationDraftStale = true;
+    qualificationRevalidatedLocally = false;
+  }
+  return true;
+}
+
+function syncQualificationProofFromTournamentInfo() {
+  const next = tournamentInfo.finalQualification?.[activeDivision] || null;
+  const previous = qualificationProof;
+  qualificationProof = next;
+  if (!qualificationServerFingerprint && typeof next?.fingerprint === "string") {
+    qualificationServerFingerprint = next.fingerprint;
+  }
+  if (!previous && next?.tieSelections && typeof next.tieSelections === "object") {
+    qualificationTieSelections = Object.fromEntries(
+      Object.entries(next.tieSelections)
+        .filter(([, values]) => Array.isArray(values))
+        .map(([groupId, values]) => [groupId, [...values]]),
+    );
+  }
+}
+
+function qualificationProofStatus() {
+  if (!qualificationHasFinalBracket()) return "none";
+  if (qualificationDraftStale) return "stale";
+  if (qualificationProof?.status === "stale" && !qualificationRevalidatedLocally) return "stale";
+  if (qualificationProof?.status !== "current") return "unverified";
+  if (!qualificationProof.fingerprint) return "unverified";
+  return "current";
+}
+
+function qualificationStructureLocked() {
+  return authoritativeFinalMatches.length > 0
+    && (qualificationProof != null || qualificationProofStatus() !== "none");
+}
+
+function blockQualificationStructureEdit() {
+  if (!qualificationStructureLocked()) return false;
+  showToast(
+    "본선이 공개된 뒤 조·팀의 추가/삭제·조 이동·예선 재생성은 Rules로 차단됩니다. 표시 이름과 순서만 조정하고, 진출 근거는 다시 확인하세요.",
+    7000,
+  );
+  return true;
+}
+
+function qualificationGuidanceForBlockers(state) {
+  const messages = qualificationStateBlockers(state)
+    .filter((blocker) => !["cutoff_lottery_required", "cutoff_selection_required"].includes(qualificationBlockerCode(blocker)))
+    .map(qualificationBlockerMessage);
+  return [...new Set(messages)];
+}
+
 function finalBaselineDescriptor(matches) {
   return (matches || [])
     .map((match) => ({
@@ -253,6 +548,8 @@ function refreshActiveDivisionData() {
   groups = allGroups.filter((group) => group.division === activeDivision);
   teams = allTeams.filter((team) => team.division === activeDivision);
   prelimMatches = allPrelimMatches.filter((match) => match.division === activeDivision);
+  qualificationSourceChanged();
+  qualificationStateForCurrentData();
   document.getElementById("teamCount").textContent = teams.length;
   renderGroupList();
   renderTeamGroupSelect();
@@ -262,6 +559,7 @@ function refreshActiveDivisionData() {
   renderWorkflowCourtPlanner();
   renderScoreReviews();
   updatePrelimMutationGuardUi();
+  updateQualificationStructureControls();
 }
 
 function updatePrelimMutationGuardUi() {
@@ -310,6 +608,7 @@ function rebindFinalMatches() {
     renderFinalBracket();
     renderFinalTeamPicker();
     renderWorkflowCourtPlanner();
+    updateQualificationStructureControls();
   });
 }
 
@@ -337,10 +636,13 @@ subscribeTournamentInfo((info) => {
   hideErrorBanner();
   setConnStatus(true);
   tournamentInfo = info || {};
+  syncQualificationProofFromTournamentInfo();
   const nameInput = document.getElementById("tournamentNameInput");
   if (nameInput && !nameInput.value) nameInput.value = tournamentInfo.name || "";
   const qualifyInput = document.getElementById("qualifyPerGroupInput");
-  if (qualifyInput && document.activeElement !== qualifyInput) {
+  if (qualifyInput && qualificationCountInputOverride != null) {
+    qualifyInput.value = qualificationCountInputOverride;
+  } else if (qualifyInput && document.activeElement !== qualifyInput) {
     qualifyInput.value = tournamentInfo.qualifyPerGroup?.[activeDivision] || 2;
   }
   const venueDisplay = tournamentInfo.venueDisplay || {};
@@ -348,11 +650,15 @@ subscribeTournamentInfo((info) => {
   document.getElementById("venueDisplayInterval").value = venueDisplay.intervalSeconds || 15;
   const bracketTitle = document.getElementById("bracketTitle");
   if (bracketTitle) bracketTitle.textContent = `${tournamentInfo.name || "바운스발리볼"} ${divisionLabel()} 본선 대진표`;
+  qualificationSourceChanged();
+  qualificationStateForCurrentData();
   renderFinalTeamPicker();
+  updateQualificationStructureControls();
 });
 
 subscribeGroups((data) => {
   allGroups = data;
+  qualificationGroupsLoaded = true;
   invalidateCorrectionPreview("조 정보가 바뀌었습니다. 변경 내용을 다시 확인하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
@@ -361,6 +667,7 @@ subscribeGroups((data) => {
 
 subscribeTeams((data) => {
   allTeams = data;
+  qualificationTeamsLoaded = true;
   invalidateCorrectionPreview("팀 정보가 바뀌었습니다. 변경 내용을 다시 확인하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
@@ -369,6 +676,7 @@ subscribeTeams((data) => {
 
 subscribePrelimMatches((data, metadata) => {
   allPrelimMatches = data;
+  qualificationMatchesLoaded = true;
   prelimHistoryReadiness = metadata?.fromCache === false && metadata?.hasPendingWrites === false
     ? { status: "ready", error: null }
     : { status: "loading", error: null };
@@ -2774,6 +3082,38 @@ function stageSubmittedFinalReview(assignment, workflow) {
 
 // ---------------- 대회설정: 대회명 ----------------
 
+async function saveQualificationCount() {
+  const input = document.getElementById("qualifyPerGroupInput");
+  const rawValue = input.value;
+  const qualifyPerGroup = Number(rawValue);
+  if (!Number.isInteger(qualifyPerGroup) || qualifyPerGroup < 1 || qualifyPerGroup > 32) {
+    return showToast("조별 진출 팀 수는 1~32 사이 정수여야 합니다.", 5000);
+  }
+  qualificationCountInputOverride = rawValue;
+  try {
+    await adminWorkflowCallable("setQualificationCount", {
+      division: activeDivision,
+      count: qualifyPerGroup,
+    });
+    qualificationCountInputOverride = null;
+    tournamentInfo = {
+      ...tournamentInfo,
+      qualifyPerGroup: {
+        ...(tournamentInfo.qualifyPerGroup || {}),
+        [activeDivision]: qualifyPerGroup,
+      },
+    };
+    qualificationSourceChanged();
+    qualificationStateForCurrentData();
+    renderFinalTeamPicker();
+    seedAutoMode = true; // 진출 팀 수 설정을 바꿨으니 추천 진출팀을 다시 계산해서 보여준다
+    showToast(`${divisionLabel()} 조별 진출 팀 수를 저장했습니다`);
+  } catch (err) {
+    input.value = rawValue;
+    reportError("조별 진출 팀 수 저장", err);
+  }
+}
+
 function bindStaticHandlers() {
   document.querySelectorAll("[data-division]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -2787,6 +3127,18 @@ function bindStaticHandlers() {
       bracketPublishPending = false;
       seedSelection = [];
       seedAutoMode = true;
+      qualificationState = null;
+      qualificationServerState = null;
+      qualificationServerFingerprint = "";
+      qualificationTieSelections = {};
+      qualificationProof = null;
+      qualificationRevalidatedLocally = false;
+      qualificationSourceInitialized = false;
+      qualificationSourceKey = "";
+      qualificationDraftStale = false;
+      qualificationReplacement = null;
+      qualificationPreparationError = "";
+      qualificationCountInputOverride = null;
       ringSelection = null;
       // 대회설정·예선·본선에 각각 같은 부문 스위치가 있으므로 모두 같은 상태로 맞춘다.
       document.querySelectorAll("[data-division]").forEach((item) => {
@@ -2811,28 +3163,14 @@ function bindStaticHandlers() {
     }
   });
 
-  document.getElementById("saveQualifyPerGroupBtn").addEventListener("click", async () => {
-    const qualifyPerGroup = Math.max(1, Number(document.getElementById("qualifyPerGroupInput").value) || 2);
-    try {
-      await updateDoc(
-        doc(db, "tournaments", TOURNAMENT_ID),
-        {
-          [`qualifyPerGroup.${activeDivision}`]: qualifyPerGroup,
-          updatedAt: serverTimestamp(),
-        },
-      );
-      seedAutoMode = true; // 진출 팀 수 설정을 바꿨으니 추천 진출팀을 다시 계산해서 보여준다
-      showToast(`${divisionLabel()} 조별 진출 팀 수를 저장했습니다`);
-    } catch (err) {
-      reportError("조별 진출 팀 수 저장", err);
-    }
-  });
+  document.getElementById("saveQualifyPerGroupBtn").addEventListener("click", saveQualificationCount);
 
   document.getElementById("addGroupBtn").addEventListener("click", addGroupFromForm);
   document.getElementById("groupNameInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); addGroupFromForm(); }
   });
   document.getElementById("resetGroupsBtn").addEventListener("click", async () => {
+    if (blockQualificationStructureEdit()) return;
     if (blockPrelimMutationUntilReady()) return;
     if (!groups.length) return showToast("이미 등록된 조가 없습니다");
     if (blockPrelimMutationWithHistory("delete_all_groups")) return;
@@ -2851,6 +3189,7 @@ function bindStaticHandlers() {
   });
   document.getElementById("teamGroupSelect").addEventListener("change", updateTeamNameInputContext);
   document.getElementById("resetTeamsBtn").addEventListener("click", async () => {
+    if (blockQualificationStructureEdit()) return;
     if (blockPrelimMutationUntilReady()) return;
     if (!teams.length) return showToast("이미 등록된 팀이 없습니다");
     if (blockPrelimMutationWithHistory("delete_all_teams")) return;
@@ -2864,6 +3203,7 @@ function bindStaticHandlers() {
   });
 
   document.getElementById("resetPrelimBtn").addEventListener("click", async () => {
+    if (blockQualificationStructureEdit()) return;
     if (blockPrelimMutationUntilReady()) return;
     const hasRingPlacement = groups.some((g) => (g.ringOrder || []).some(Boolean));
     if (!prelimMatches.length && !hasRingPlacement) return showToast("초기화할 예선 경기가 없습니다");
@@ -2882,14 +3222,29 @@ function bindStaticHandlers() {
   document.getElementById("publishBracketBtn").addEventListener("click", handlePublishBracket);
   document.getElementById("clearBracketBtn").addEventListener("click", async () => {
     if (!finalMutationAllowed()) return;
+    if (qualificationHasFinalPlay()) {
+      return showToast("실제 진행된 본선은 대진표 초기화로 우회할 수 없습니다.", 6000);
+    }
     if (!confirm(`${divisionLabel()}의 아직 시작하지 않은 본선 대진표를 초기화할까요? 기록이 시작된 경기가 있으면 안전을 위해 초기화가 거부됩니다.`)) return;
-    finalMatches = [];
-    finalScoreDrafts = new Map();
-    bracketPublishPending = true;
-    bracketPublishConflict = false;
-    renderFinalBracket();
-    renderFinalTeamPicker();
-    showToast(`${divisionLabel()} 대진표 초기화를 준비했습니다. 관객 화면에 공개해야 반영됩니다.`);
+    try {
+      if (authoritativeFinalMatches.length) {
+        await adminWorkflowCallable("clearFinalStructure", { division: activeDivision });
+      }
+      resetFinalDraft([]);
+      qualificationProof = null;
+      qualificationServerState = null;
+      qualificationServerFingerprint = "";
+      qualificationTieSelections = {};
+      qualificationDraftStale = false;
+      qualificationRevalidatedLocally = false;
+      qualificationReplacement = null;
+      renderFinalBracket();
+      renderFinalTeamPicker();
+      updateQualificationStructureControls();
+      showToast(`${divisionLabel()} 본선 대진표를 초기화했습니다.`);
+    } catch (err) {
+      reportError("본선 대진표 초기화", err);
+    }
   });
 
   document.getElementById("exportCsvBtn").addEventListener("click", () => {
@@ -3188,6 +3543,7 @@ function normalizeEntryName(name) {
 
 /** 조 추가 — 성공하면 방금 만든 조 이름을 기억해서 팀 등록 select에 자동으로 선택되게 한다 */
 async function addGroupFromForm() {
+  if (blockQualificationStructureEdit()) return;
   if (isAddingGroup) return;
   const input = document.getElementById("groupNameInput");
   const addBtn = document.getElementById("addGroupBtn");
@@ -3217,6 +3573,7 @@ async function addGroupFromForm() {
 /** 팀 추가 — 조를 먼저 선택해야만 추가할 수 있다 (미배정 팀이 새로 생기지 않도록).
  *  추가 후에도 선택된 조는 그대로 유지하고 입력칸에 다시 포커스해서 연속 입력이 쉽게 한다 */
 async function addTeamFromForm() {
+  if (blockQualificationStructureEdit()) return;
   if (isAddingTeam) return;
   const nameInput = document.getElementById("teamNameInput");
   const groupSelect = document.getElementById("teamGroupSelect");
@@ -3257,8 +3614,24 @@ function updateTeamNameInputContext() {
   const selectedOption = sel.options[sel.selectedIndex];
   const groupName = sel.value && selectedOption ? selectedOption.textContent : "";
   nameInput.placeholder = groupName ? `'${groupName}'에 추가할 팀 이름 (Enter)` : "먼저 조를 선택하세요";
-  nameInput.disabled = !sel.value;
-  if (addBtn) addBtn.disabled = !sel.value;
+  const locked = qualificationStructureLocked();
+  nameInput.disabled = locked || !sel.value;
+  if (addBtn) {
+    addBtn.disabled = locked || !sel.value;
+    if (locked) addBtn.title = "본선 공개 후 팀 추가는 Rules로 차단됩니다.";
+  }
+}
+
+function updateQualificationStructureControls() {
+  const locked = qualificationStructureLocked();
+  const addGroup = document.getElementById("addGroupBtn");
+  const groupInput = document.getElementById("groupNameInput");
+  if (addGroup) {
+    addGroup.disabled = locked || isAddingGroup;
+    if (locked) addGroup.title = "본선 공개 후 조 추가는 Rules로 차단됩니다.";
+  }
+  if (groupInput) groupInput.disabled = locked;
+  updateTeamNameInputContext();
 }
 
 function renderGroupList() {
@@ -3310,13 +3683,16 @@ function renderGroupList() {
     deleteButton.textContent = "✕";
     const ready = prelimHistoryIsReady();
     const groupHistory = ready ? officialPrelimHistoryForMutation("delete_group", g.id) : [];
-    const groupBlocked = !ready || groupHistory.length > 0;
+    const groupBlocked = qualificationStructureLocked() || !ready || groupHistory.length > 0;
     deleteButton.disabled = groupBlocked;
     deleteButton.setAttribute("aria-disabled", String(groupBlocked));
     deleteButton.title = !ready
       ? prelimHistoryReadinessGuidance()
+      : qualificationStructureLocked()
+      ? "본선 공개 후 조 삭제는 Rules로 차단됩니다. 표시 이름·순서만 조정하세요."
       : groupHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : "삭제";
     deleteButton.addEventListener("click", async () => {
+      if (blockQualificationStructureEdit()) return;
       if (blockPrelimMutationWithHistory("delete_group", g.id)) return;
       if (!confirm(`${divisionLabel()} '${g.name}' 조를 삭제할까요? (공식 이력이 없는 예선 대진만 함께 삭제되고 소속 팀은 무소속이 됩니다)`)) return;
       try {
@@ -3433,10 +3809,13 @@ function createTeamPill(t, groupId) {
   pill.innerHTML = `${escapeHtml(t.name)} <button title="삭제">✕</button>`;
   const deleteButton = pill.querySelector("button");
   const ready = prelimHistoryIsReady();
-  deleteButton.disabled = !ready;
-  deleteButton.setAttribute("aria-disabled", String(!ready));
-  if (!ready) deleteButton.title = prelimHistoryReadinessGuidance();
+  const structureLocked = qualificationStructureLocked();
+  deleteButton.disabled = structureLocked || !ready;
+  deleteButton.setAttribute("aria-disabled", String(structureLocked || !ready));
+  if (structureLocked) deleteButton.title = "본선 공개 후 팀 삭제는 Rules로 차단됩니다. 표시 이름·순서만 조정하세요.";
+  else if (!ready) deleteButton.title = prelimHistoryReadinessGuidance();
   deleteButton.addEventListener("click", async () => {
+    if (blockQualificationStructureEdit()) return;
     if (blockPrelimMutationUntilReady()) return;
     if (!confirm(`${divisionLabel()} '${t.name}' 팀을 삭제할까요?`)) return;
     try {
@@ -3534,6 +3913,10 @@ async function persistTeamDrop(draggedId, targetGroupId, targetId = null, insert
   const draggedTeam = teams.find((team) => team.id === draggedId);
   if (!draggedTeam) return;
   const sameGroup = draggedTeam.groupId === targetGroupId;
+  if (qualificationStructureLocked() && !sameGroup) {
+    blockQualificationStructureEdit();
+    return;
+  }
   if (!sameGroup && prelimMatches.some((match) => (
     match.groupId === draggedTeam.groupId || match.groupId === targetGroupId
   ))) {
@@ -3581,6 +3964,7 @@ function confirmIfResultsWillReset(groupId, groupName, message) {
 
 /** 한 조의 예선 대진/결과와 링크제 도형 배치를 모두 초기화한다 (조별 '초기화' 버튼용) */
 async function handleResetGroupPrelim(group) {
+  if (blockQualificationStructureEdit()) return;
   const hasMatches = groupHasPrelimMatches(group.id);
   const hasRingPlacement = (group.ringOrder || []).some(Boolean);
   if (!hasMatches && !hasRingPlacement) return showToast(`${group.name}에 초기화할 내용이 없습니다`);
@@ -3599,6 +3983,7 @@ async function handleResetGroupPrelim(group) {
 // 건드리지 않는다. (실제로 데이터가 바뀌는 시점은 "대진 생성" 버튼을 누르거나 링크제 배치를
 // 다 채웠을 때뿐이다.)
 async function handleSetMatchMode(group, mode) {
+  if (blockQualificationStructureEdit()) return;
   const current = group.matchMode || "ring";
   if (mode === current) return;
   try {
@@ -3611,6 +3996,7 @@ async function handleSetMatchMode(group, mode) {
 }
 
 async function applyRingOrderChange(group, nextRingOrder) {
+  if (blockQualificationStructureEdit()) return;
   if (blockPrelimMutationUntilReady()) {
     renderPrelimSetupGroups();
     return;
@@ -3647,6 +4033,7 @@ async function applyRingOrderChange(group, nextRingOrder) {
 }
 
 async function handleRingShuffle(group, groupTeams) {
+  if (blockQualificationStructureEdit()) return;
   if (blockPrelimMutationWithHistory("generate_group_ring", group.id)) return;
   if (!confirmIfResultsWillReset(group.id, group.name, `'${group.name}'을 무작위로 다시 배치하면 공식 이력이 없는 기존 대진만 대체됩니다. 계속할까요?`)) return;
   const ids = groupTeams.map((t) => t.id);
@@ -3719,13 +4106,16 @@ function buildRoundRobinControls(g, groupTeams) {
   btn.textContent = groupHasPrelimMatches(g.id) ? "라운드로빈 대진 다시 생성" : "라운드로빈 대진 생성";
   const ready = prelimHistoryIsReady();
   const groupHistory = ready ? officialPrelimHistoryForMutation("generate_group_round_robin", g.id) : [];
-  const blocked = !ready || groupHistory.length > 0;
+  const blocked = qualificationStructureLocked() || !ready || groupHistory.length > 0;
   btn.disabled = blocked;
   btn.setAttribute("aria-disabled", String(blocked));
   btn.title = !ready
     ? prelimHistoryReadinessGuidance()
+    : qualificationStructureLocked()
+    ? "본선 공개 후 예선 대진 재생성은 Rules로 차단됩니다."
     : groupHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : "공식 이력이 없는 경우 라운드로빈 대진을 생성합니다.";
   btn.addEventListener("click", async () => {
+    if (blockQualificationStructureEdit()) return;
     if (blockPrelimMutationWithHistory("generate_group_round_robin", g.id)) return;
     if (!confirmIfResultsWillReset(g.id, g.name, `'${g.name}' 예선 대진을 (재)생성할까요? 공식 이력이 없는 기존 대진만 대체됩니다.`)) return;
     try {
@@ -3753,7 +4143,7 @@ function buildRingControls(g, groupTeams) {
   const placedCount = ringOrder.filter(Boolean).length;
   const ready = prelimHistoryIsReady();
   const groupHistory = ready ? officialPrelimHistoryForMutation("generate_group_ring", g.id) : [];
-  const blocked = !ready || groupHistory.length > 0;
+  const blocked = qualificationStructureLocked() || !ready || groupHistory.length > 0;
 
   // 안내 + 무작위 배치
   const toolbar = document.createElement("div");
@@ -3764,7 +4154,9 @@ function buildRingControls(g, groupTeams) {
   hint.className = "empty-hint";
   hint.style.padding = "0";
   hint.textContent = blocked
-    ? !ready ? prelimHistoryReadinessGuidance() : prelimMutationGuidance(groupHistory)
+    ? qualificationStructureLocked()
+      ? "본선 공개 후 링크제 배치 변경은 Rules로 차단됩니다."
+      : !ready ? prelimHistoryReadinessGuidance() : prelimMutationGuidance(groupHistory)
     : filled
     ? "대진이 확정되었습니다. 공식 이력이 없는 경우 다시 배치하면 기존 대진이 초기화됩니다."
     : `팀을 도형의 꼭짓점으로 드래그하거나, 팀을 클릭한 뒤 꼭짓점을 클릭하세요 (${placedCount}/${ringOrder.length} 배치됨)`;
@@ -3773,8 +4165,15 @@ function buildRingControls(g, groupTeams) {
   shuffleBtn.textContent = "무작위 배치";
   shuffleBtn.disabled = blocked;
   shuffleBtn.setAttribute("aria-disabled", String(blocked));
-  if (blocked) shuffleBtn.title = PRELIM_HISTORY_DISABLED_TITLE;
-  shuffleBtn.addEventListener("click", () => handleRingShuffle(g, groupTeams));
+  if (blocked) {
+    shuffleBtn.title = qualificationStructureLocked()
+      ? "본선 공개 후 링크제 배치 변경은 Rules로 차단됩니다."
+      : PRELIM_HISTORY_DISABLED_TITLE;
+  }
+  shuffleBtn.addEventListener("click", () => {
+    if (blockQualificationStructureEdit()) return;
+    handleRingShuffle(g, groupTeams);
+  });
   toolbar.appendChild(hint);
   toolbar.appendChild(shuffleBtn);
   wrap.appendChild(toolbar);
@@ -3960,7 +4359,7 @@ function renderPrelimSetupGroups() {
     const mode = g.matchMode || "ring";
     const ready = prelimHistoryIsReady();
     const groupHistory = ready ? officialPrelimHistoryForMutation("clear_group_prelim", g.id) : [];
-    const groupBlocked = !ready || groupHistory.length > 0;
+    const groupBlocked = qualificationStructureLocked() || !ready || groupHistory.length > 0;
 
     const box = document.createElement("div");
     box.className = "settings-box";
@@ -3982,6 +4381,10 @@ function renderPrelimSetupGroups() {
       <button type="button" class="mode-btn ${mode === "ring" ? "active" : ""}" data-mode="ring">링크제</button>
       <button type="button" class="mode-btn ${mode === "roundrobin" ? "active" : ""}" data-mode="roundrobin">라운드로빈</button>`;
     modeToggle.querySelectorAll(".mode-btn").forEach((btn) => {
+      btn.disabled = qualificationStructureLocked();
+      if (qualificationStructureLocked()) {
+        btn.title = "본선 공개 후 예선 방식 변경은 Rules로 차단됩니다.";
+      }
       btn.addEventListener("click", () => handleSetMatchMode(g, btn.dataset.mode));
     });
     headRight.appendChild(modeToggle);
@@ -3991,6 +4394,8 @@ function renderPrelimSetupGroups() {
     resetGroupBtn.className = "btn danger small";
     resetGroupBtn.title = !ready
       ? prelimHistoryReadinessGuidance()
+      : qualificationStructureLocked()
+        ? "본선 공개 후 예선 초기화는 Rules로 차단됩니다."
       : groupHistory.length
         ? PRELIM_HISTORY_DISABLED_TITLE
         : `${g.name}의 공식 이력이 없는 예선 대진과 도형(링크제) 배치를 삭제합니다`;
@@ -4008,6 +4413,8 @@ function renderPrelimSetupGroups() {
       guardHint.style.padding = "0 0 10px";
       guardHint.textContent = !ready
         ? prelimHistoryReadinessGuidance()
+        : qualificationStructureLocked()
+        ? "본선 공개 후 조·팀·예선 구조 변경은 Rules로 차단됩니다. 표시 이름과 순서만 조정하세요."
         : prelimMutationGuidance(groupHistory);
       box.appendChild(guardHint);
     }
@@ -4397,26 +4804,211 @@ function buildQualifyReasonText(standings, s) {
   return `${base} → ${tiedNames}와 동률, 상대전적(승자승)으로 ${s.rank}위 결정`;
 }
 
+function qualificationSelectionValidation(state, participantIds = seedSelection, tieSelections = qualificationTieSelections) {
+  try {
+    return validateQualificationSelection(
+      state,
+      participantIds,
+      canonicalQualificationTieSelections(state, tieSelections),
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      errors: [{ code: "qualification_validation_failed", message: error?.message || String(error) }],
+    };
+  }
+}
+
+function qualificationValidationMessages(result) {
+  return (result?.errors || []).map(qualificationBlockerMessage);
+}
+
+function qualificationPublishContext(state, participantIds = finalEntrantIds(finalMatches)) {
+  const context = {
+    expectedPrelimFingerprint: qualificationServerFingerprint,
+    tieSelections: canonicalQualificationTieSelections(state, qualificationTieSelections),
+  };
+  if (qualificationReplacement?.mode === "replace_unplayed") {
+    context.replacementMode = "replace_unplayed";
+    context.replacementReason = qualificationReplacement.reason;
+  }
+  return context;
+}
+
+function updateQualificationProofUi() {
+  const banner = document.getElementById("qualificationProofBanner");
+  if (!banner) return;
+  const status = qualificationProofStatus();
+  const messages = qualificationGuidanceForBlockers(qualificationState);
+  banner.hidden = (!qualificationHasFinalBracket() && !messages.length && !qualificationPreparationError)
+    || (status === "current" && !messages.length && !qualificationPreparationError);
+  banner.style.padding = "8px 10px";
+  banner.style.margin = "0 0 10px";
+  banner.style.borderRadius = "6px";
+  banner.style.background = status === "current" ? "var(--surface-2, #eef8f0)" : "var(--surface-warn, #fff4e5)";
+  banner.style.color = status === "current" ? "var(--green-dark, #176b35)" : "var(--red-dark, #8a2d1f)";
+  banner.className = `qualification-proof-banner ${status === "current" ? "is-current" : "is-review"}`;
+  if (status === "stale") {
+    banner.textContent = qualificationHasFinalPlay()
+      ? "예선 원본이 바뀌어 본선 진출 근거가 오래되었습니다. 실제 진행 경기가 있어 대진 교체로 우회할 수 없습니다. ‘진출팀 다시 확인’으로 같은 진출팀이 여전히 유효한지 확인하세요."
+      : "예선 원본이 바뀌어 본선 초안의 진출 근거가 오래되었습니다. 점수·초안은 보존되어 있습니다. ‘진출팀 다시 확인’으로 같은 진출팀을 재검증하거나, 사유를 남겨 미진행 초안을 교체하세요.";
+  } else if (status === "unverified") {
+    banner.textContent = "기존 본선에 검증된 예선 진출 근거가 없습니다. 진출팀을 다시 확인한 뒤 공개하세요.";
+  } else if (messages.length) {
+    banner.textContent = messages.join(" ");
+  } else if (qualificationPreparationError) {
+    banner.textContent = qualificationPreparationError;
+  } else {
+    banner.textContent = "예선 진출 근거가 최신입니다.";
+  }
+  if (qualificationPreparationError && status !== "stale") {
+    banner.textContent += ` ${qualificationPreparationError}`;
+  }
+}
+
+async function prepareFinalQualificationFromServer() {
+  if (qualificationPreparationInFlight) return null;
+  qualificationPreparationInFlight = true;
+  qualificationPreparationError = "";
+  try {
+    const response = await adminWorkflowCallable("prepareFinalQualification", {
+      division: activeDivision,
+    });
+    const data = response?.data || response;
+    if (!data || typeof data.fingerprint !== "string" || !data.state) {
+      throw new Error("서버에서 예선 진출 검증 결과를 받지 못했습니다.");
+    }
+    qualificationServerFingerprint = data.fingerprint;
+    qualificationServerState = data.state;
+    qualificationTieSelections = canonicalQualificationTieSelections(
+      data.state,
+      qualificationTieSelections,
+    );
+    const localState = qualificationStateForCurrentData();
+    syncQualificationSelection(localState);
+    updateQualificationProofUi();
+    return data;
+  } catch (error) {
+    qualificationPreparationError = error?.message || String(error);
+    updateQualificationProofUi();
+    throw error;
+  } finally {
+    qualificationPreparationInFlight = false;
+  }
+}
+
+async function handleQualificationRevalidation() {
+  if (qualificationPreparationInFlight) return;
+  const beforeParticipants = finalEntrantIds(finalMatches);
+  try {
+    const prepared = await prepareFinalQualificationFromServer();
+    const serverState = prepared.state;
+    const localSelection = qualificationSelectionValidation(
+      serverState,
+      beforeParticipants.length ? beforeParticipants : seedSelection,
+      qualificationTieSelections,
+    );
+    if (!localSelection.ok) {
+      qualificationPreparationError = qualificationValidationMessages(localSelection).join(" ");
+      updateQualificationProofUi();
+      renderFinalTeamPicker();
+      showToast(qualificationPreparationError, 6000);
+      return;
+    }
+    qualificationTieSelections = canonicalQualificationTieSelections(
+      serverState,
+      localSelection.tieSelections || qualificationTieSelections,
+    );
+    qualificationServerState = serverState;
+    qualificationDraftStale = false;
+    qualificationRevalidatedLocally = true;
+    qualificationPreparationError = "";
+    renderFinalTeamPicker();
+    renderFinalBracket();
+    showToast("예선 진출팀을 다시 확인했습니다. 기존 본선 점수와 초안은 보존됩니다.", 5000);
+  } catch (error) {
+    reportError("진출팀 다시 확인", error);
+  }
+}
+
+async function handleQualificationReplacement() {
+  if (qualificationHasFinalPlay()) {
+    showToast("실제 진행된 본선은 초안 교체로 우회할 수 없습니다. 진출팀을 다시 확인하거나 정정 절차를 진행하세요.", 6000);
+    return;
+  }
+  const reasonInput = document.getElementById("qualificationReplacementReason");
+  const reason = (reasonInput?.value || "").trim();
+  if (!reason) {
+    reasonInput?.focus();
+    showToast("미진행 본선 초안을 교체하려면 사유를 입력하세요.", 5000);
+    return;
+  }
+  qualificationReplacement = { reason, mode: "replace_unplayed" };
+  const prepared = await prepareFinalQualificationFromServer().catch((error) => {
+    reportError("본선 초안 교체 준비", error);
+    return null;
+  });
+  if (!prepared) return;
+  const state = prepared.state;
+  const localSelection = qualificationSelectionValidation(state, seedSelection, qualificationTieSelections);
+  if (!localSelection.ok) {
+    qualificationPreparationError = qualificationValidationMessages(localSelection).join(" ");
+    renderFinalTeamPicker();
+    showToast(qualificationPreparationError, 6000);
+    return;
+  }
+  const warning = `${divisionLabel()} 미진행 본선 초안을 예선 최신 진출팀으로 교체합니다.
+사유: ${reason}
+현재 입력된 점수·자리 조정은 이 초안 교체로 사라질 수 있습니다. 계속할까요?`;
+  if (!confirm(warning)) return;
+  const teamsInSeedOrder = seedSelection.map((id) => ({ id, name: teamName(id) }));
+  const { matches } = generateBracket(teamsInSeedOrder);
+  finalMatches = matches;
+  qualificationReplacement = { reason, mode: "replace_unplayed" };
+  qualificationDraftStale = false;
+  qualificationRevalidatedLocally = true;
+  bracketPublishPending = true;
+  renderFinalBracket();
+  renderFinalTeamPicker();
+  showToast("미진행 본선 초안을 교체했습니다. 사유와 함께 관객 화면에 공개해야 서버에 확정됩니다.", 6000);
+}
+
 function renderFinalTeamPicker() {
   const el = document.getElementById("finalTeamPicker");
   el.innerHTML = "";
-  const qualifyCount = Math.max(1, Number(tournamentInfo.qualifyPerGroup?.[activeDivision]) || 2);
+  const state = qualificationStateForCurrentData();
+  syncQualificationSelection(state);
+  el.dataset.qualificationReady = String(Boolean(state?.ready && qualificationStateReadyForSelection(state)));
+  el.dataset.qualificationRequiredCount = String(qualificationStateRequiredCount(state));
+  updateQualificationProofUi();
+  updateBracketPublishBar();
 
-  // 예선 순위 기준 추천 진출팀을 그대로 쓰는 중이면 매 렌더마다 최신 결과로 다시 계산한다
-  if (seedAutoMode) {
-    seedSelection = computeRecommendedSeeds();
-  }
-
-  // 좌측: 전체 팀 체크리스트
   const left = document.createElement("div");
-  const statusText = seedAutoMode ? "" : '<span class="empty-hint" style="padding:0;">체크박스를 직접 조정한 상태입니다.</span>';
   left.innerHTML = `<h3>진출팀 선택</h3>
     <div class="row" style="justify-content:space-between; margin-bottom:8px;">
-      ${statusText || "<span></span>"}
-      <button type="button" class="btn small ghost" id="resetSeedAutoBtn">추천대로 다시 채우기</button>
+      <span class="empty-hint" style="padding:0;">자동 진출팀은 잠겨 있고, 추첨 컷오프 후보만 선택할 수 있습니다.</span>
+      <button type="button" class="btn small ghost" id="resetSeedAutoBtn">예선 기준 다시 계산</button>
     </div>`;
   if (!teams.length) {
     left.innerHTML += '<div class="empty-hint">등록된 팀이 없습니다.</div>';
+  }
+  if (qualificationStateHasStructuralBlockers(state)) {
+    const guidance = qualificationGuidanceForBlockers(state);
+    const block = document.createElement("div");
+    block.className = "empty-hint";
+    block.style.padding = "6px 0";
+    block.textContent = guidance.length
+      ? `참가팀이 있는 모든 조의 예선을 완료해야 합니다. ${guidance.join(" ")}`
+      : "참가팀이 있는 모든 조의 예선 경기와 결과를 완료해야 합니다.";
+    left.appendChild(block);
+  }
+  const required = qualificationStateRequiredCount(state);
+  if (required > 0) {
+    const countHint = document.createElement("div");
+    countHint.className = "empty-hint";
+    countHint.style.padding = "0 0 8px";
+    countHint.textContent = `전체 진출 정원 ${required}팀 · 현재 선택 ${seedSelection.length}팀`;
+    left.appendChild(countHint);
   }
 
   // 조가 여러 개일 때 세로로 길게 한 줄씩 늘어놓으면 화면 오른쪽이 비어 보이므로,
@@ -4426,25 +5018,21 @@ function renderFinalTeamPicker() {
   left.appendChild(groupsWrap);
 
   groups.forEach((g) => {
+    const groupState = (state.groups || []).find((item) => item.groupId === g.id);
     const groupTeams = teams.filter((t) => t.groupId === g.id);
     if (!groupTeams.length) return;
     const groupMatches = prelimMatches.filter((m) => m.groupId === g.id).sort((a, b) => (a.round || 0) - (b.round || 0));
-    const standings = computeGroupStandings(groupTeams, groupMatches);
+    const standings = groupState?.standings || computeGroupStandings(groupTeams, groupMatches);
     const standingById = Object.fromEntries(standings.map((s) => [s.teamId, s]));
-    const cutoffLotteryRanks = [...new Set(
-      standings
-        .filter((s) => s.needsLottery)
-        .filter((s) => {
-          const sameRank = standings.filter((other) => other.rank === s.rank);
-          return s.rank <= qualifyCount && s.rank + sameRank.length - 1 > qualifyCount;
-        })
-        .map((s) => s.rank)
-    )];
+    const automaticIds = new Set(groupState?.automaticIds || []);
+    const cutoffCandidateIds = new Set(groupState?.cutoffCandidateIds || []);
+    const cutoffSlots = Math.max(0, Number(groupState?.cutoffSlots) || 0);
+    const selectedCutoff = qualificationTieSelections[g.id] || [];
 
     const sub = document.createElement("div");
     sub.style.marginBottom = "10px";
-    const cutoffWarning = cutoffLotteryRanks.length
-      ? '<div class="lottery-flag">추첨 대상 동률이 진출선에 걸쳐 있어 자동 선택이 완료되지 않았습니다. 오프라인 추첨 승자를 직접 선택하세요.</div>'
+    const cutoffWarning = cutoffSlots
+      ? `<div class="lottery-flag">추첨 후보 중 ${cutoffSlots}팀을 선택하세요 (현재 ${selectedCutoff.length}/${cutoffSlots}).</div>`
       : "";
     sub.innerHTML = `<div style="font-weight:700; font-size:13px; margin-bottom:6px;">${escapeHtml(g.name)}</div>${cutoffWarning}`;
     groupTeams
@@ -4458,24 +5046,46 @@ function renderFinalTeamPicker() {
         row.style.gap = "8px";
         row.style.padding = "5px 0";
         row.style.borderBottom = "1px solid var(--line)";
-        const checked = seedSelection.includes(t.id);
+        const automatic = automaticIds.has(t.id);
+        const cutoffCandidate = cutoffCandidateIds.has(t.id);
+        const checked = automatic || selectedCutoff.includes(t.id);
         const rankBadge = s ? `<span class="badge">예선 ${s.rank}위</span>` : "";
         // 예선 경기를 하나도 치르지 않았으면(전부 0점) 동률 설명이 무의미하므로, 실제로 경기를 치른 뒤에만 보여준다
         const hasPlayed = s && s.played > 0;
         const lotteryBadge = hasPlayed && s.needsLottery ? '<span class="badge lottery">동률·추첨필요</span>' : "";
         const reasonText = !s ? "팀 정보 없음" : hasPlayed ? buildQualifyReasonText(standings, s) : "";
-        row.innerHTML = `<input type="checkbox" ${checked ? "checked" : ""} />
+        const editable = cutoffCandidate
+          && cutoffSlots > 0
+          && qualificationStateReadyForSelection(state);
+        const disabledReason = automatic
+          ? "자동 진출팀은 필수 선택입니다."
+          : editable
+          ? ""
+          : "예선 미완료 또는 진출선 밖의 팀입니다.";
+        row.innerHTML = `<input type="checkbox" ${checked ? "checked" : ""} ${editable ? "" : "disabled"} />
           <span style="flex:1;">
             <span>${escapeHtml(t.name)} ${rankBadge} ${lotteryBadge}</span>
             ${reasonText ? `<div class="empty-hint" style="padding:2px 0 0; font-size:11.5px; line-height:1.5;">${escapeHtml(reasonText)}</div>` : ""}
           </span>`;
-        row.querySelector("input").addEventListener("change", (e) => {
-          seedAutoMode = false; // 직접 조작하면 추천 자동갱신은 멈추고, 이후엔 관리자가 직접 관리
+        const input = row.querySelector("input");
+        input.dataset.teamId = t.id;
+        input.dataset.groupId = g.id;
+        input.dataset.qualificationRole = automatic ? "automatic" : cutoffCandidate ? "cutoff" : "blocked";
+        input.title = disabledReason;
+        input.addEventListener("change", (e) => {
+          const next = new Set(qualificationTieSelections[g.id] || []);
           if (e.target.checked) {
-            if (!seedSelection.includes(t.id)) seedSelection.push(t.id);
+            if (next.size >= cutoffSlots) {
+              showToast(`'${g.name}'은(는) 남은 ${cutoffSlots}자리만 선택할 수 있습니다.`);
+              renderFinalTeamPicker();
+              return;
+            }
+            next.add(t.id);
           } else {
-            seedSelection = seedSelection.filter((id) => id !== t.id);
+            next.delete(t.id);
           }
+          qualificationTieSelections[g.id] = [...next];
+          seedAutoMode = true;
           renderFinalTeamPicker();
         });
         sub.appendChild(row);
@@ -4487,15 +5097,69 @@ function renderFinalTeamPicker() {
   const resetBtn = left.querySelector("#resetSeedAutoBtn");
   if (resetBtn) {
     resetBtn.addEventListener("click", () => {
+      qualificationTieSelections = {};
       seedAutoMode = true;
       renderFinalTeamPicker();
     });
   }
 
-  // 선택목록에서 더이상 존재하지 않는 팀 제거. (예전엔 우측에 "대진목록" 미리보기를 따로 두고
-  // 거기서 자리를 조정했지만, 대진표 생성 이후의 자리 조정은 항상 대진표트리에서 드래그앤드랍으로
-  // 하기로 정리되어 더 이상 필요하지 않다 - 진출팀 선택 칸이 그 공간까지 전체 너비로 쓴다.)
-  seedSelection = seedSelection.filter((id) => teams.some((t) => t.id === id));
+  if (finalScoreDrafts.size) {
+    const exportDraft = document.createElement("button");
+    exportDraft.type = "button";
+    exportDraft.className = "btn small ghost";
+    exportDraft.textContent = "본선 점수 초안 JSON 내보내기";
+    exportDraft.title = "예선 원본 변경이나 명시적 교체 전에 현재 점수 초안을 보관합니다.";
+    exportDraft.addEventListener("click", () => {
+      const stamp = dateStamp();
+      downloadJson(
+        `본선_점수초안_${activeDivision}_${stamp}.json`,
+        JSON.stringify({
+          version: 1,
+          division: activeDivision,
+          expectedPrelimFingerprint: qualificationServerFingerprint || null,
+          matches: cloneFinalMatches(finalMatches),
+          scoreDrafts: [...finalScoreDrafts.values()].map((draft) => structuredClone(draft)),
+        }, null, 2),
+      );
+      showToast("본선 점수 초안을 JSON으로 내보냈습니다.", 4000);
+    });
+    left.appendChild(exportDraft);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "row";
+  actions.style.marginTop = "12px";
+  actions.style.gap = "8px";
+  const revalidate = document.createElement("button");
+  revalidate.type = "button";
+  revalidate.className = "btn small ghost";
+  revalidate.id = "revalidateQualificationBtn";
+  revalidate.textContent = qualificationPreparationInFlight ? "확인 중…" : "진출팀 다시 확인";
+  revalidate.disabled = qualificationPreparationInFlight;
+  revalidate.addEventListener("click", handleQualificationRevalidation);
+  actions.appendChild(revalidate);
+  if (qualificationDraftStale && !qualificationHasFinalPlay()) {
+    const replacement = document.createElement("button");
+    replacement.type = "button";
+    replacement.className = "btn small danger";
+    replacement.id = "replaceQualificationBtn";
+    replacement.textContent = "미진행 초안 교체";
+    replacement.addEventListener("click", handleQualificationReplacement);
+    actions.appendChild(replacement);
+
+    const reason = document.createElement("textarea");
+    reason.id = "qualificationReplacementReason";
+    reason.rows = 2;
+    reason.maxLength = 500;
+    reason.setAttribute("aria-label", "미진행 본선 초안 교체 사유");
+    reason.placeholder = "초안 교체 사유 (필수)";
+    reason.value = qualificationReplacement?.reason || "";
+    reason.style.width = "100%";
+    reason.style.marginTop = "6px";
+    left.appendChild(reason);
+  }
+  left.appendChild(actions);
+  el.appendChild(left);
 }
 
 /** teamId가 속한 조에서의 예선 순위를 "A조 1위" 형태 문구로 만든다 */
@@ -4517,9 +5181,57 @@ function teamGroupRankLabel(teamId) {
  * 눌러야 비로소 관객 화면(대시보드)에 한 번에 반영된다. */
 async function onGenerateBracket() {
   if (!finalMutationAllowed()) return;
-  if (seedSelection.length < 2) return showToast("본선 진출팀을 2팀 이상 선택하세요");
-  if (seedSelection.length > 32) return showToast("본선 진출팀은 최대 32팀까지 지원합니다");
-  if (!confirm(`${divisionLabel()} ${seedSelection.length}팀으로 본선 대진표를 생성할까요? 기존 대진표는 초기화됩니다.`)) return;
+  const localState = qualificationStateForCurrentData();
+  if (!qualificationStateReadyForSelection(localState)) {
+    const messages = qualificationGuidanceForBlockers(localState);
+    return showToast(
+      messages.length
+        ? `모든 조의 예선을 완료해야 합니다. ${messages.join(" ")}`
+        : "참가팀이 있는 모든 조의 예선 경기와 결과를 완료하세요.",
+      6000,
+    );
+  }
+  const localSelection = qualificationSelectionValidation(localState, seedSelection, qualificationTieSelections);
+  if (!localSelection.ok) {
+    const message = qualificationValidationMessages(localSelection).join(" ");
+    return showToast(message || "진출팀 선택을 확인하세요.", 6000);
+  }
+  if (qualificationDraftStale && qualificationHasFinalBracket()) {
+    return showToast("예선 원본이 바뀌었습니다. 먼저 ‘진출팀 다시 확인’ 또는 미진행 초안 교체를 진행하세요.", 6000);
+  }
+  if (qualificationHasFinalPlay() && qualificationHasFinalBracket()) {
+    return showToast("실제 진행된 본선은 새 대진표 생성으로 우회할 수 없습니다.", 6000);
+  }
+  if (!confirm(
+    `${divisionLabel()} ${seedSelection.length}팀으로 본선 대진표를 생성할까요?\n`
+    + "기존 본선 초안과 입력된 점수·자리 조정은 확인 후 교체됩니다.",
+  )) return;
+  let prepared;
+  try {
+    prepared = await prepareFinalQualificationFromServer();
+  } catch (error) {
+    reportError("본선 대진표 생성 전 진출팀 확인", error);
+    return;
+  }
+  const serverSelection = qualificationSelectionValidation(
+    prepared.state,
+    seedSelection,
+    qualificationTieSelections,
+  );
+  if (!serverSelection.ok) {
+    qualificationPreparationError = qualificationValidationMessages(serverSelection).join(" ");
+    renderFinalTeamPicker();
+    showToast(qualificationPreparationError || "서버 기준 진출팀 선택을 확인하세요.", 6000);
+    return;
+  }
+  qualificationTieSelections = canonicalQualificationTieSelections(
+    prepared.state,
+    serverSelection.tieSelections || qualificationTieSelections,
+  );
+  qualificationServerState = prepared.state;
+  qualificationDraftStale = false;
+  qualificationRevalidatedLocally = true;
+  qualificationReplacement = null;
   const teamsInSeedOrder = seedSelection.map((id) => ({ id, name: teamName(id) }));
   const { matches } = generateBracket(teamsInSeedOrder);
   finalMatches = matches;
@@ -4555,16 +5267,34 @@ function updateBracketPublishBar() {
   const hasBracket = finalMatches.length > 0 || authoritativeFinalMatches.length > 0 || bracketPublishPending;
   bar.style.display = hasBracket ? "flex" : "none";
   bar.classList.toggle("is-pending", bracketPublishPending || bracketPublishConflict);
+  const qualificationStateForPublish = qualificationServerState || qualificationStateForCurrentData();
+  const qualificationValidation = qualificationSelectionValidation(
+    qualificationStateForPublish,
+    finalEntrantIds(finalMatches),
+    qualificationTieSelections,
+  );
+  const qualificationNeedsReview = qualificationDraftStale
+    || !qualificationServerFingerprint
+    || qualificationStateHasStructuralBlockers(qualificationStateForPublish)
+    || !qualificationValidation.ok
+    || (authoritativeFinalMatches.length > 0
+      && qualificationProofStatus() !== "current")
+    || (!authoritativeFinalMatches.length && !bracketPublishPending
+      && qualificationProofStatus() !== "current");
 
   if (msg) {
     msg.textContent = bracketPublishConflict
       ? "공개 기준이 변경되었습니다. 로컬 초안을 버린 뒤 최신 대진표를 확인하세요."
+      : qualificationNeedsReview
+      ? "예선 진출 근거를 다시 확인해야 공개할 수 있습니다. 현재 초안과 점수는 보존됩니다."
       : bracketPublishPending
       ? "공개하지 않은 변경/기록이 있습니다. 버튼을 눌러야 관객 화면에 반영됩니다."
       : "모든 변경사항이 관객 화면에 공개되어 있습니다.";
   }
   if (btn) {
-    btn.disabled = (!bracketPublishPending && !bracketPublishConflict) || bracketPublishInFlight;
+    btn.disabled = (!bracketPublishPending && !bracketPublishConflict)
+      || bracketPublishInFlight
+      || (qualificationNeedsReview && !bracketPublishConflict);
     btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : bracketPublishPending ? "관객 화면에 공개" : "공개 완료";
   }
 }
@@ -4580,21 +5310,68 @@ async function handlePublishBracket() {
     showToast("로컬 본선 초안을 버리고 최신 공개본을 불러왔습니다.");
     return;
   }
+  const qualificationStateForPublish = qualificationServerState || qualificationStateForCurrentData();
+  const finalParticipants = finalEntrantIds(finalMatches);
+  const qualificationValidation = qualificationSelectionValidation(
+    qualificationStateForPublish,
+    finalParticipants,
+    qualificationTieSelections,
+  );
+  if (qualificationDraftStale) {
+    showToast("예선 원본이 바뀌었습니다. 먼저 ‘진출팀 다시 확인’을 완료하세요.", 6000);
+    return;
+  }
+  if (!qualificationServerFingerprint) {
+    showToast("공개 전에 ‘진출팀 다시 확인’으로 서버 검증을 받아야 합니다.", 6000);
+    return;
+  }
+  if (authoritativeFinalMatches.length > 0 && qualificationProofStatus() !== "current") {
+    showToast("기존 본선의 진출 근거가 오래되었습니다. 먼저 ‘진출팀 다시 확인’을 완료하세요.", 6000);
+    return;
+  }
+  if (qualificationStateHasStructuralBlockers(qualificationStateForPublish)) {
+    const messages = qualificationGuidanceForBlockers(qualificationStateForPublish);
+    showToast(messages.join(" ") || "참가팀이 있는 모든 조의 예선을 완료해야 공개할 수 있습니다.", 6000);
+    return;
+  }
+  if (!qualificationValidation.ok) {
+    const message = qualificationValidationMessages(qualificationValidation).join(" ");
+    showToast(message || "본선 진출팀을 다시 확인하세요.", 6000);
+    return;
+  }
   bracketPublishInFlight = true;
   updateBracketPublishBar();
   try {
+    const qualificationContext = qualificationPublishContext(
+      qualificationStateForPublish,
+      finalParticipants,
+    );
     const response = await publishFinalBracket(
       activeDivision,
       finalDraftBaseline,
       finalMatches.map(finalStructureMatch),
       [...finalScoreDrafts.values()],
+      qualificationContext,
     );
     const canonicalMatches = response.matches || response.finalMatches;
     if (!Array.isArray(canonicalMatches)) throw new Error("공개 결과에 표준 본선 대진표가 없습니다.");
     resetFinalDraft(canonicalMatches);
+    qualificationProof = {
+      ...(qualificationProof || {}),
+      status: "current",
+      fingerprint: qualificationServerFingerprint,
+      participantIds: [...new Set(finalParticipants)].sort(),
+      tieSelections: qualificationContext.tieSelections,
+    };
+    qualificationRevalidatedLocally = false;
+    qualificationDraftStale = false;
+    qualificationReplacement = null;
+    qualificationPreparationError = "";
     updateBracketPublishBar();
     showToast(`${divisionLabel()} 대진표를 관객 화면에 공개했습니다`);
   } catch (err) {
+    qualificationPreparationError = err?.message || String(err);
+    updateQualificationProofUi();
     reportError("관객 화면 공개", err);
   } finally {
     bracketPublishInFlight = false;
@@ -4902,6 +5679,11 @@ function showToast(msg, duration = 2200) {
 /** Firestore 등 비동기 작업 실패 시 화면에 원인을 보이게 표시 (콘솔에도 상세 로그) */
 function reportError(action, err) {
   console.error(`[${action} 실패]`, err);
+  if (err?.details?.reason === "qualification_unverified"
+      || String(err?.message || "") === "qualification_unverified") {
+    showToast(`${action}을(를) 중단했습니다. 본선 진출팀을 다시 확인한 뒤 진행하세요. 기존 기록은 유지됩니다.`, 7000);
+    return;
+  }
   if (/preliminary match has official history/i.test(String(err?.message || ""))) {
     showToast(`${action}을(를) 중단했습니다. ${PRELIM_HISTORY_GUIDANCE}`, 7000);
     return;

@@ -37,7 +37,8 @@
     "indexes": "firestore.indexes.json"
   },
   "functions": {
-    "source": "functions"
+    "source": "functions",
+    "predeploy": ["npm --prefix \"$PROJECT_DIR\" run prepare:shared"]
   },
   "emulators": {
     "auth": {

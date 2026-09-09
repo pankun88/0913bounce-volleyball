@@ -35,8 +35,12 @@ let venueAutoIntervalMs = null;
 let venueAutoStartDivision = null;
 let dashboardFitFrame = null;
 let dashboardFitObserver = null;
+let rootAuthorityState = "unavailable";
+let rootAuthorityConfirmed = false;
 const FEED_IDS = ["tournament", "groups", "teams", "prelim", "men-final", "women-final", "public-schedule"];
-const feedHealth = Object.fromEntries(FEED_IDS.map((id) => [id, { state: "pending", message: "" }]));
+const feedHealth = Object.fromEntries(FEED_IDS.map((id) => (
+  [id, { state: "pending", message: "", hasConfirmedSnapshot: false }]
+)));
 const feedIdByLabel = {
   "대회정보": "tournament",
   "대회정보 구독": "tournament",
@@ -63,6 +67,7 @@ initDashboardViewportFit();
 activateTab(activeTab, false);
 document.body.classList.toggle("venue-mode", venueDisplayLocked);
 applyVenueDisplaySettings();
+setMaintenanceMode();
 scheduleDashboardFit();
 document.addEventListener("visibilitychange", () => {
   if (!isVenueMode) return;
@@ -75,8 +80,11 @@ document.addEventListener("visibilitychange", () => {
 
 subscribeTournamentInfo((info, metadata) => {
   setFeedSnapshot("tournament", metadata);
-  tournamentInfo = info || {};
-  maintenanceActive = tournamentInfo.maintenance?.enabled === true;
+  const confirmed = isServerConfirmed(metadata);
+  if (confirmed || !rootAuthorityConfirmed) {
+    tournamentInfo = info || {};
+    maintenanceActive = tournamentInfo.maintenance?.enabled === true;
+  }
   document.getElementById("dashTitle").textContent = tournamentInfo.name || "바운스발리볼";
   setMaintenanceMode();
   applyVenueDisplaySettings();
@@ -84,26 +92,26 @@ subscribeTournamentInfo((info, metadata) => {
 });
 
 subscribeGroups((data, metadata) => {
-  setFeedSnapshot("groups", metadata);
+  if (!setFeedSnapshot("groups", metadata)) return;
   allGroups = data;
   renderActiveDivision();
 });
 
 subscribeTeams((data, metadata) => {
-  setFeedSnapshot("teams", metadata);
+  if (!setFeedSnapshot("teams", metadata)) return;
   allTeams = data;
   renderActiveDivision();
 });
 
 subscribePrelimMatches((data, metadata) => {
-  setFeedSnapshot("prelim", metadata);
+  if (!setFeedSnapshot("prelim", metadata)) return;
   allPrelimMatches = data;
   renderActiveDivision();
 });
 
 DIVISIONS.forEach((division) => {
   subscribeFinalMatches(division, (data, metadata) => {
-    setFeedSnapshot(`${division}-final`, metadata);
+    if (!setFeedSnapshot(`${division}-final`, metadata)) return;
     finalMatchesByDivision[division] = data;
     if (division === activeDivision) renderFinalBracket();
   });
@@ -111,11 +119,18 @@ DIVISIONS.forEach((division) => {
 
 const publicScheduleSubscription = subscribePublicSchedule((data, metadata) => {
   if (data === null) {
+    const accepted = setFeedPending("public-schedule", metadata, "저장된 코트 순서를 확인하는 중입니다.");
+    if (!accepted) {
+      if (!isServerConfirmed(metadata)) {
+        publicScheduleIsCached = true;
+        renderActiveDivision();
+      }
+      return;
+    }
     publicSchedule = null;
     publicScheduleState = "loading";
     publicScheduleMessage = "순서 확인 중";
     publicScheduleIsCached = false;
-    setFeedPending("public-schedule", metadata, "저장된 코트 순서를 확인하는 중입니다.");
     renderActiveDivision();
     return;
   }
@@ -128,13 +143,15 @@ const publicScheduleSubscription = subscribePublicSchedule((data, metadata) => {
     setFeedError("public-schedule", "공개 코트 일정 형식이 올바르지 않습니다.");
     return;
   }
+  const accepted = setFeedSnapshot("public-schedule", metadata);
+  const cached = metadata?.fromCache === true || metadata?.hasPendingWrites === true;
+  if (!accepted && !cached) return;
   publicSchedule = normalized;
   publicScheduleState = normalized.status;
   publicScheduleMessage = normalized.status === "ready"
     ? ""
     : normalized.status === "maintenance" ? "순서 점검 중" : "순서 사용 불가";
-  publicScheduleIsCached = metadata?.fromCache === true || metadata?.hasPendingWrites === true;
-  setFeedSnapshot("public-schedule", metadata);
+  publicScheduleIsCached = cached;
   renderActiveDivision();
 });
 publicScheduleRetry = typeof publicScheduleSubscription?.retry === "function"
@@ -224,7 +241,7 @@ function setActiveDivision(division, { updateUrl = false, announce = true } = {}
 }
 
 function renderActiveDivision() {
-  if (maintenanceActive) return;
+  if (maintenanceActive || rootAuthorityState === "unavailable") return;
   const label = DIVISION_LABELS[activeDivision];
   document.getElementById("dashDivisionBadge").textContent = label;
   document.getElementById("dashBracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${label} 본선 대진표`;
@@ -238,20 +255,32 @@ function setMaintenanceMode() {
   const liveContent = document.getElementById("dashboardLiveContent");
   const controls = document.getElementById("dashboardControls");
   const liveStatus = document.querySelector(".live-dot");
-  notice.hidden = !maintenanceActive;
-  liveContent.hidden = maintenanceActive;
-  if (controls) controls.hidden = maintenanceActive;
+  const rootUnavailable = rootAuthorityState === "unavailable";
+  notice.hidden = !(maintenanceActive || rootUnavailable);
+  notice.dataset.authorityState = rootUnavailable
+    ? "unavailable"
+    : maintenanceActive ? "maintenance" : "live";
+  liveContent.hidden = maintenanceActive || rootUnavailable;
+  if (controls) controls.hidden = maintenanceActive || rootUnavailable;
+  notice.innerHTML = rootUnavailable
+    ? "<h2>대회 상태 확인 중</h2><p>공식 대회 상태를 확인할 수 없어 경기 결과를 숨겼습니다. 연결을 다시 시도하는 중입니다.</p>"
+    : "<h2>대회 시스템 점검 중</h2><p>점검이 끝난 뒤 경기 결과를 다시 안내합니다.</p>";
   if (liveStatus) {
-    liveStatus.classList.toggle("is-maintenance", maintenanceActive);
+    liveStatus.classList.toggle("is-maintenance", maintenanceActive || rootUnavailable);
     liveStatus.setAttribute("role", "status");
     liveStatus.setAttribute("aria-live", "polite");
-    liveStatus.setAttribute("aria-label", maintenanceActive ? "점검 중" : "실시간 데이터 상태");
-    if (maintenanceActive) {
+    liveStatus.setAttribute("aria-label", rootUnavailable
+      ? "대회 상태 확인 중"
+      : maintenanceActive ? "점검 중" : "실시간 데이터 상태");
+    if (rootUnavailable) {
+      liveStatus.dataset.feedHealth = "reconnecting";
+      liveStatus.textContent = "상태 확인 중";
+    } else if (maintenanceActive) {
       liveStatus.dataset.feedHealth = "maintenance";
       liveStatus.textContent = "점검 중";
     }
   }
-  if (maintenanceActive) {
+  if (maintenanceActive || rootUnavailable) {
     stopVenueTimer();
     venueConfigKey = "";
     document.getElementById("venueSwitcher").hidden = true;
@@ -290,7 +319,7 @@ function applyVenueDisplaySettings() {
   venueDisplayLocked = isVenueMode;
   document.body.classList.toggle("venue-mode", venueDisplayLocked);
   updateDivisionSwitchState();
-  if (maintenanceActive) {
+  if (maintenanceActive || rootAuthorityState === "unavailable") {
     stopVenueTimer();
     document.getElementById("venueSwitcher").hidden = true;
     venueConfigKey = "";
@@ -368,7 +397,8 @@ function syncVenueCycle(now = venueNow()) {
 }
 
 function resumeVenueAuto() {
-  if (!isVenueMode || maintenanceActive || document.visibilityState === "hidden") return;
+  if (!isVenueMode || maintenanceActive || rootAuthorityState === "unavailable"
+      || document.visibilityState === "hidden") return;
   if (!Number.isFinite(venueAutoStartedAt) || !Number.isFinite(venueAutoIntervalMs)) return;
   syncVenueCycle();
   if (venueTimer !== null) return;
@@ -398,29 +428,64 @@ function placeVenueStatus() {
 function initConnectionWatch() {
   window.addEventListener("firestore-error", (e) => {
     const { label, err } = e.detail;
-    setFeedError(feedIdByLabel[label], `${label} 실패${err?.code ? ` (${err.code})` : ""}`);
+    setFeedError(
+      feedIdByLabel[label],
+      `${label} 실패${err?.code ? ` (${err.code})` : ""} · 재연결 중`,
+    );
   });
   window.addEventListener("firestore-timeout", (e) => {
-    setFeedError(feedIdByLabel[e.detail.label], `"${e.detail.label}" 실시간 연결이 응답하지 않습니다.`);
+    setFeedError(
+      feedIdByLabel[e.detail.label],
+      `"${e.detail.label}" 실시간 연결이 응답하지 않습니다. 재연결 중입니다.`,
+    );
   });
+}
+
+function isServerConfirmed(metadata) {
+  return Boolean(metadata
+    && metadata.fromCache === false
+    && metadata.hasPendingWrites === false);
 }
 
 function setFeedSnapshot(id, metadata) {
   const feed = feedHealth[id];
-  if (!feed) return;
-  const confirmed = metadata && metadata.fromCache === false && metadata.hasPendingWrites === false;
-  feed.state = confirmed ? (feed.state === "error" || feed.state === "cache" ? "recovered" : "healthy") : "cache";
-  feed.message = confirmed ? "" : `${id} 데이터가 서버에서 확인되지 않았습니다.`;
+  if (!feed) return false;
+  const confirmed = isServerConfirmed(metadata);
+  const accepted = confirmed || !feed.hasConfirmedSnapshot;
+  if (confirmed) {
+    feed.hasConfirmedSnapshot = true;
+    feed.state = feed.state === "error" || feed.state === "cache" ? "recovered" : "healthy";
+  } else if (feed.state !== "error") {
+    feed.state = "cache";
+  }
+  if (confirmed || feed.state !== "error") {
+    feed.message = confirmed ? "" : `${id} 데이터가 서버에서 확인되지 않았습니다.`;
+  }
+  if (id === "tournament") {
+    if (confirmed) {
+      rootAuthorityConfirmed = true;
+      rootAuthorityState = "confirmed";
+    } else if (!rootAuthorityConfirmed || rootAuthorityState === "unavailable") {
+      rootAuthorityState = "unavailable";
+    } else {
+      rootAuthorityState = "cache";
+    }
+  }
   updateFeedHealth();
+  return accepted;
 }
 
 function setFeedPending(id, metadata, message) {
   const feed = feedHealth[id];
-  if (!feed) return;
-  const confirmed = metadata && metadata.fromCache === false && metadata.hasPendingWrites === false;
-  feed.state = confirmed ? "pending" : "cache";
-  feed.message = message || `${id} 데이터가 아직 준비되지 않았습니다.`;
+  if (!feed) return false;
+  const confirmed = isServerConfirmed(metadata);
+  const accepted = confirmed || !feed.hasConfirmedSnapshot;
+  feed.state = confirmed ? "pending" : feed.state === "error" ? "error" : "cache";
+  if (confirmed || feed.state !== "error") {
+    feed.message = message || `${id} 데이터가 아직 준비되지 않았습니다.`;
+  }
   updateFeedHealth();
+  return accepted;
 }
 
 function setFeedError(ids, message) {
@@ -429,6 +494,10 @@ function setFeedError(ids, message) {
     if (!id || !feedHealth[id]) continue;
     feedHealth[id].state = "error";
     feedHealth[id].message = message;
+  }
+  if (targetIds.includes("tournament")) {
+    rootAuthorityState = "unavailable";
+    setMaintenanceMode();
   }
   if (targetIds.includes("public-schedule")) {
     publicSchedule = null;
@@ -441,15 +510,19 @@ function setFeedError(ids, message) {
 }
 
 function updateFeedHealth() {
-  const failures = FEED_IDS.filter((id) => ['error', 'cache'].includes(feedHealth[id].state));
+  const failures = FEED_IDS.filter((id) => feedHealth[id].state === "error");
+  const cached = FEED_IDS.filter((id) => feedHealth[id].state === "cache");
   const pending = FEED_IDS.filter((id) => feedHealth[id].state === "pending");
   const liveStatus = document.querySelector(".live-dot");
-  if (liveStatus && !maintenanceActive) {
-    const state = failures.length ? "degraded" : pending.length ? "pending" : "live";
+  if (liveStatus && !maintenanceActive && rootAuthorityState !== "unavailable") {
+    const state = failures.length ? "degraded" : cached.length ? "cache" : pending.length ? "pending" : "live";
     liveStatus.dataset.feedHealth = state;
-    liveStatus.textContent = failures.length ? `일부 연결 지연 (${failures.length})` : pending.length ? "연결 확인 중" : "실시간 중계중";
+    liveStatus.textContent = failures.length
+      ? `일부 연결 지연 (${failures.length})`
+      : cached.length ? "오프라인 캐시 표시 중" : pending.length ? "연결 확인 중" : "실시간 중계중";
     liveStatus.setAttribute("aria-label", failures.length
       ? `데이터 연결 저하: ${failures.join(", ")}`
+      : cached.length ? `오프라인 캐시 표시 중: ${cached.join(", ")}`
       : pending.length ? `데이터 연결 확인 중: ${pending.join(", ")}`
       : "모든 데이터 연결 정상");
   }
@@ -850,7 +923,7 @@ function appendPublicPrelimStructuralList(parent, groupMatches, state) {
 }
 
 function renderPrelim() {
-  if (maintenanceActive) return;
+  if (maintenanceActive || rootAuthorityState === "unavailable") return;
   const state = divisionData();
   const el = document.getElementById("dashPrelim");
   el.replaceChildren();
@@ -908,14 +981,28 @@ function renderPrelim() {
 }
 
 function renderFinalBracket() {
-  if (maintenanceActive) return;
+  if (maintenanceActive || rootAuthorityState === "unavailable") return;
   const state = divisionData();
-  renderBracket(document.getElementById("dashBracketContainer"), state.finalMatches, {
+  const container = document.getElementById("dashBracketContainer");
+  renderBracket(container, state.finalMatches, {
     editable: false,
     viewportFit: "dashboard",
     getTeamLabel: (teamId) => teamGroupRankLabel(teamId, state),
   });
+  appendFinalQualificationNotice(container, activeDivision, state.finalMatches);
   scheduleDashboardFit();
+}
+
+function appendFinalQualificationNotice(parent, division, matches) {
+  if (!matches?.length) return;
+  const proof = tournamentInfo.finalQualification?.[division];
+  if (proof?.status === "current") return;
+  const notice = document.createElement("div");
+  notice.className = "qualification-stale-notice";
+  notice.dataset.qualificationState = "stale";
+  notice.setAttribute("role", "status");
+  notice.textContent = "본선 진출팀 재확인 필요 · 이전 공개 대진";
+  parent.prepend(notice);
 }
 
 function teamName(id, state = divisionData()) {

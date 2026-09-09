@@ -5,6 +5,12 @@ import {
   activateDependencyEntries, consumeCurrentAndAdvance, planCorrectionReplay,
   planCourtRemoval, planRejectedRework, projectCourtQueue, projectForceRelease, projectQueue, TOURNAMENT_ID,
 } from './workflow-core.js';
+import {
+  buildQualificationSnapshot,
+  computeQualificationState,
+  serializeQualificationSnapshot,
+  validateQualificationSelection,
+} from './match-logic.generated.js';
 
 // All privileged workflow operations are fixed to the one deployed `main`
 // tournament; `requireMain` rejects any caller attempt to select another root.
@@ -131,6 +137,23 @@ async function correctionPreviewPlan(tx, targets) {
   const state = await courtState(tx, courtId);
   const officialSnaps = await Promise.all(targets.map((key) => tx.get(matchRef(state.assignments[key]))));
   if (officialSnaps.some((snap) => !snap.exists)) bad('Correction target official match not found.');
+  const qualificationContexts = new Map();
+  const targetDivisions = new Map();
+  for (let index = 0; index < targets.length; index += 1) {
+    const assignment = state.assignments[targets[index]];
+    const division = assignment.divisionId || assignment.division || officialSnaps[index].data()?.division;
+    targetDivisions.set(targets[index], division);
+    if (!['men', 'women'].includes(division)) continue;
+    let context = qualificationContexts.get(division);
+    if (!context) {
+      context = await readQualificationContext(tx, division);
+      qualificationContexts.set(division, context);
+    }
+    if (assignment.matchType === 'prelim'
+        && hasRealFinalPlay(context.finals, context.assignments, context.workflows, division)) {
+      bad('A preliminary correction is blocked after real final play.');
+    }
+  }
   let planned;
   try {
     planned = planCorrectionReplay(state.queue, state.assignments, state.workflows, targets, 'preview');
@@ -162,14 +185,23 @@ async function correctionPreviewPlan(tx, targets) {
         workflow: planned.workflows[key],
       })),
     },
+    qualification: Object.fromEntries([...qualificationContexts].map(([division, context]) => [
+      division, qualificationContextProof(context),
+    ])),
   };
+  const qualification = Object.fromEntries([...qualificationContexts].map(([division, context]) => [
+    division, qualificationContextProof(context),
+  ]));
   return {
     courtId, state, planned, projection,
+    qualificationContexts,
+    targetDivisions,
     planToken: {
       courtId,
       matchKeys: targets,
       expectedQueueRevision: state.queue.queueRevision || 0,
       fingerprint: correctionFingerprint(descriptor),
+      qualification,
     },
   };
 }
@@ -206,6 +238,281 @@ function touchRecorderGrant(tx, uid) {
 function operationFingerprint(value) {
   return crypto.createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 }
+
+function qualificationCount(rootData, division) {
+  const configured = rootData?.qualifyPerGroup;
+  const value = configured && typeof configured === 'object' && !Array.isArray(configured)
+    ? configured[division]
+    : configured;
+  return Number.isInteger(value) ? value : Number(value);
+}
+
+function qualificationFingerprint(snapshot) {
+  return crypto.createHash('sha256').update(serializeQualificationSnapshot(snapshot), 'utf8').digest('hex');
+}
+
+function qualificationMaps(snapshots) {
+  return new Map(snapshots.docs.map((snap) => [snap.id, snap.data()]));
+}
+
+/**
+ * Read every authoritative preliminary input needed by qualification CAS.
+ * The broad collection reads intentionally retain foreign records so a
+ * malformed or cross-division game cannot be hidden by a filtered query.
+ */
+async function readQualificationContext(tx, division) {
+  if (!['men', 'women'].includes(division)) bad('Supported division required.');
+  const [tournamentSnap, groupsSnap, teamsSnap, prelimSnap, finalsSnap, assignmentsSnap, workflowsSnap, queuesSnap] = await Promise.all([
+    tx.get(root()),
+    tx.get(root().collection('groups')),
+    tx.get(root().collection('teams')),
+    tx.get(root().collection('prelimMatches')),
+    tx.get(root().collection('divisions').doc(division).collection('finalMatches')),
+    tx.get(root().collection('courtAssignments')),
+    tx.get(root().collection('scoreWorkflows')),
+    tx.get(root().collection('courtQueues')),
+  ]);
+  const tournament = tournamentSnap.data() || {};
+  const divisionGroups = groupsSnap.docs
+    .filter((snap) => snap.data().division === division)
+    .map((snap) => ({ ...snap.data(), id: snap.id }));
+  const divisionGroupIds = new Set(divisionGroups.map((group) => group.id));
+  const divisionTeams = teamsSnap.docs
+    .filter((snap) => snap.data().division === division
+      || divisionGroupIds.has(snap.data().groupId))
+    .map((snap) => ({ ...snap.data(), id: snap.id }));
+  const divisionMatches = prelimSnap.docs
+    .filter((snap) => snap.data().division === division
+      || divisionGroupIds.has(snap.data().groupId))
+    .map((snap) => ({ ...snap.data(), id: snap.id }));
+  const snapshot = buildQualificationSnapshot({
+    division,
+    qualifyPerGroup: qualificationCount(tournament, division),
+    groups: divisionGroups,
+    teams: divisionTeams,
+    matches: divisionMatches,
+  });
+  const state = computeQualificationState(snapshot);
+  return {
+    division,
+    tournamentSnap,
+    groupsSnap,
+    teamsSnap,
+    prelimSnap,
+    finalsSnap,
+    assignmentsSnap,
+    workflowsSnap,
+    queuesSnap,
+    snapshot,
+    state,
+    fingerprint: qualificationFingerprint(snapshot),
+    finalQualification: tournament.finalQualification?.[division] || null,
+    groups: qualificationMaps(groupsSnap),
+    teams: qualificationMaps(teamsSnap),
+    prelims: qualificationMaps(prelimSnap),
+    finals: qualificationMaps(finalsSnap),
+    assignments: qualificationMaps(assignmentsSnap),
+    workflows: qualificationMaps(workflowsSnap),
+    queues: qualificationMaps(queuesSnap),
+  };
+}
+
+function qualificationSelectionErrors(state, participantIds, tieSelections) {
+  const selection = validateQualificationSelection(state, participantIds, tieSelections);
+  if (!selection.ok) bad(selection.errors[0] || 'Qualification selection is invalid.');
+  return selection;
+}
+
+function canonicalTieSelections(state, tieSelections) {
+  return Object.fromEntries((state.groups || []).map((group) => {
+    const values = Array.isArray(tieSelections?.[group.groupId])
+      ? tieSelections[group.groupId] : [];
+    return [group.groupId, [...new Set(values)].sort()];
+  }));
+}
+
+function finalEntrantIds(finalsSnap) {
+  const rootMatches = finalsSnap.docs.filter((snap) => (snap.data().round || 1) === 1);
+  return finalEntrantIdsFromRecords(rootMatches.map((snap) => snap.data()));
+}
+
+function finalEntrantIdsFromRecords(records) {
+  const rootMatches = records.filter((match) => (match.round || 1) === 1);
+  const entrants = [];
+  const seen = new Set();
+  for (const match of rootMatches) {
+    for (const side of ['A', 'B']) {
+      const team = match[`team${side}`];
+      if (!team) continue;
+      if (typeof team.id !== 'string' || !team.id) bad('Final entrant is invalid.');
+      if (seen.has(team.id)) bad(`Final entrant appears more than once: ${team.id}.`);
+      seen.add(team.id);
+      entrants.push(team.id);
+    }
+    const candidate = match.byeCandidate?.team;
+    if (candidate) {
+      if (typeof candidate.id !== 'string' || !candidate.id) bad('Final BYE candidate is invalid.');
+      if (seen.has(candidate.id)) bad(`Final BYE candidate appears more than once: ${candidate.id}.`);
+      seen.add(candidate.id);
+      entrants.push(candidate.id);
+    }
+  }
+  return entrants;
+}
+
+function assertExactFinalParticipants(finalsSnap, participantIds) {
+  const entrants = finalEntrantIds(finalsSnap);
+  if (entrants.length < 2 || entrants.length > 32) bad('Final qualification requires between 2 and 32 entrants.');
+  const expected = [...new Set(participantIds)].sort();
+  const actual = [...entrants].sort();
+  if (expected.length !== actual.length || expected.some((id, index) => id !== actual[index])) {
+    bad('Final entrants must exactly match the validated qualification set.');
+  }
+  return entrants;
+}
+
+function finalPlayRecords(finals, assignments, workflows, division) {
+  const records = [];
+  for (const [id, final] of finals) {
+    if ((final.division || division) !== division) continue;
+    if (final.status === 'bye'
+        && Number(final.officialRevision || 0) === 0
+        && !(Array.isArray(final.sets) && final.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0))) {
+      continue;
+    }
+    records.push(final);
+  }
+  for (const assignment of assignments.values()) {
+    if (assignment.matchType !== 'final'
+        || (assignment.divisionId || assignment.division) !== division) continue;
+    const workflow = workflows.get(assignment.matchKey || assignment.matchId)
+      || workflows.get(finalAssignmentKey(division, assignment.matchId));
+    if (assignment.attemptCount > 0
+        || ['in_progress', 'under_review', 'replay_required', 'rework_required'].includes(assignment.publicStatus)
+        || workflow?.draftState && ['editing', 'submitted', 'rejected'].includes(workflow.draftState)
+        || workflow?.submissionVersion > 0
+        || workflow?.draftRevision > 0
+        || workflow?.draft?.sets?.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0)
+        || workflow?.submittedSnapshot?.sets?.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0)) {
+      records.push({ assignment, workflow });
+    }
+  }
+  return records;
+}
+
+function hasRealFinalPlay(finals, assignments, workflows, division) {
+  return finalPlayRecords(finals, assignments, workflows, division).some((record) => {
+    if (record.assignment) return true;
+    return Number(record.officialRevision || 0) > 0
+      || ['done', 'completed', 'in_progress', 'under_review'].includes(record.status)
+      || (Array.isArray(record.sets) && record.sets.length > 0
+        && record.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0));
+  });
+}
+
+function finalQualificationStatus(context) {
+  return context.finalQualification?.status === 'current' ? 'current'
+    : context.finalQualification?.status === 'stale' ? 'stale' : 'unverified';
+}
+
+function assertFinalQualificationCurrent(context) {
+  if (finalQualificationStatus(context) !== 'current'
+      || typeof context.finalQualification?.fingerprint !== 'string'
+      || context.finalQualification.fingerprint !== context.fingerprint
+      || !Array.isArray(context.finalQualification?.participantIds)) {
+    callableError('qualification_unverified');
+  }
+  const selection = validateQualificationSelection(
+    context.state,
+    context.finalQualification.participantIds,
+    context.finalQualification.tieSelections || {},
+  );
+  if (!selection.ok) callableError('qualification_unverified');
+  assertExactFinalParticipants(context.finalsSnap, context.finalQualification.participantIds);
+}
+
+function planQualificationChange(context, proposedSnapshot, tieSelections = null) {
+  if (!context.finalQualification && context.finalsSnap.empty) return null;
+  const played = hasRealFinalPlay(context.finals, context.assignments, context.workflows, context.division);
+  let metadata = context.finalQualification;
+  if (!metadata || !Array.isArray(metadata.participantIds)) {
+    if (played) callableError('qualification_unverified');
+    metadata = {
+      status: 'stale',
+      participantIds: finalEntrantIds(context.finalsSnap).sort(),
+      tieSelections: {},
+      reason: 'qualification_unverified',
+    };
+  }
+  const proposedState = computeQualificationState(proposedSnapshot);
+  const selections = tieSelections || metadata.tieSelections || {};
+  if (played) {
+    const selection = validateQualificationSelection(
+      proposedState,
+      metadata.participantIds,
+      selections,
+    );
+    if (!selection.ok) bad('Preliminary correction would invalidate played finalists.');
+    assertExactFinalParticipants(context.finalsSnap, metadata.participantIds);
+    return {
+      metadata: {
+        ...metadata,
+        status: 'current',
+        fingerprint: qualificationFingerprint(proposedSnapshot),
+        participantIds: [...metadata.participantIds].sort(),
+        tieSelections: canonicalTieSelections(proposedState, selections),
+        reason: 'prelim_corrected_revalidated',
+      },
+      fingerprint: qualificationFingerprint(proposedSnapshot),
+      state: proposedState,
+    };
+  }
+  return {
+    metadata: {
+      ...metadata,
+      status: 'stale',
+      fingerprint: qualificationFingerprint(proposedSnapshot),
+      reason: 'prelim_changed',
+    },
+    fingerprint: qualificationFingerprint(proposedSnapshot),
+    state: proposedState,
+  };
+}
+
+function qualificationContextProof(context) {
+  return {
+    fingerprint: context.fingerprint,
+    status: finalQualificationStatus(context),
+    participantIds: Array.isArray(context.finalQualification?.participantIds)
+      ? [...context.finalQualification.participantIds].sort() : null,
+    tieSelections: context.finalQualification?.tieSelections || null,
+    finalEntrants: finalEntrantIds(context.finalsSnap).sort(),
+    realFinalPlay: hasRealFinalPlay(context.finals, context.assignments, context.workflows, context.division),
+  };
+}
+
+function planPrelimQualificationChange(context, assignment, official, evaluated, revision, transition) {
+  if (assignment.matchType !== 'prelim') return null;
+  const current = context.prelims.get(assignment.matchId || assignment.matchKey) || official;
+  const proposedMatches = context.snapshot.matches.map((match) => (
+    match.id === (assignment.matchId || assignment.matchKey)
+      ? {
+        ...match,
+        ...evaluated,
+        id: match.id,
+        division: context.division,
+        groupId: current.groupId,
+        teamA: current.teamA,
+        teamB: current.teamB,
+        officialCurrent: true,
+        officialRevision: revision,
+        lastTransitionId: transition,
+      } : match
+  ));
+  const proposedSnapshot = { ...context.snapshot, matches: proposedMatches };
+  return planQualificationChange(context, proposedSnapshot);
+}
+
 function unresolvedOfficial(assignment, official) {
   return assignment.dependencyReady === false || !official?.teamA || !official?.teamB;
 }
@@ -222,6 +529,10 @@ export async function claimRecorderDraft(request) {
     const assignment = assignmentSnap.data(); const workflow = workflowSnap.data(); const queue = queueSnap.data();
     if (assignment.courtId !== courtId || queue.currentMatchKey !== matchKey || queue.queueRevision !== queueRevision) callableError('stale_queue', 'aborted');
     if (courtSnap.data().recorderName?.trim() !== recorderName.trim()) callableError('recorder_name_changed', 'aborted');
+    if (assignment.matchType === 'final') {
+      const qualificationContext = await readQualificationContext(tx, assignment.divisionId || assignment.division);
+      assertFinalQualificationCurrent(qualificationContext);
+    }
     assertResolved(assignment);
     const official = await tx.get(matchRef(assignment));
     if (!official.exists || unresolvedOfficial(assignment, official.data())) callableError('unresolved_teams');
@@ -1010,16 +1321,142 @@ export async function replaceCourtWorkflows(request) {
   });
   return { replaced: true, topologyRevision };
 }
+
+export async function prepareFinalQualification(request) {
+  await admin(request, request.data);
+  const data = request.data || {};
+  if (Object.keys(data).length !== 2
+      || !Object.hasOwn(data, 'tournamentId')
+      || !Object.hasOwn(data, 'division')
+      || !['men', 'women'].includes(data.division)) {
+    throw new HttpsError('invalid-argument', 'Exact qualification preparation payload required.');
+  }
+  return db().runTransaction(async (tx) => {
+    const context = await readQualificationContext(tx, data.division);
+    if (!context.tournamentSnap.exists) bad('Tournament not found.');
+    return { fingerprint: context.fingerprint, state: context.state };
+  });
+}
+
+export async function setQualificationCount(request) {
+  const uid = await admin(request, request.data);
+  const data = request.data || {};
+  const fields = ['tournamentId', 'division', 'count'];
+  if (!data || typeof data !== 'object' || Array.isArray(data)
+      || Object.keys(data).length !== fields.length
+      || fields.some((field) => !Object.hasOwn(data, field))
+      || !['men', 'women'].includes(data.division)
+      || !Number.isInteger(data.count) || data.count < 1 || data.count > 64) {
+    throw new HttpsError('invalid-argument', 'Qualification count must be an integer from 1 to 64.');
+  }
+  return db().runTransaction(async (tx) => {
+    const context = await readQualificationContext(tx, data.division);
+    const rootData = context.tournamentSnap.data() || {};
+    const previousCount = qualificationCount(rootData, data.division);
+    if (previousCount === data.count) {
+      return {
+        transitionId: null,
+        division: data.division,
+        count: data.count,
+        status: context.finalQualification?.status || null,
+      };
+    }
+    const proposed = {
+      ...context.snapshot,
+      qualifyPerGroup: data.count,
+    };
+    const proposedState = computeQualificationState(proposed);
+    const proposedFingerprint = qualificationFingerprint(proposed);
+    const finalExists = context.finalsSnap.size > 0;
+    const played = hasRealFinalPlay(context.finals, context.assignments, context.workflows, data.division);
+    const metadata = context.finalQualification;
+    let selection = null;
+    let finalSetMatches = false;
+    if (played && metadata) {
+      selection = validateQualificationSelection(
+        proposedState,
+        metadata.participantIds,
+        metadata.tieSelections || {},
+      );
+    }
+    if (finalExists
+        && (!metadata || !Array.isArray(metadata.participantIds))) {
+      callableError('qualification_unverified');
+    }
+    if (metadata && Array.isArray(metadata.participantIds)) {
+      const actual = [...new Set(finalEntrantIds(context.finalsSnap))].sort();
+      const expected = [...new Set(metadata.participantIds)].sort();
+      finalSetMatches = actual.length === expected.length
+        && actual.every((id, index) => id === expected[index]);
+      if (!selection) {
+        selection = validateQualificationSelection(
+          proposedState,
+          metadata.participantIds,
+          metadata.tieSelections || {},
+        );
+      }
+      if (played && (!selection.ok || !proposedState.groups.length || !finalSetMatches)) {
+        bad('Qualification count change would invalidate played finalists.');
+      }
+    }
+    const id = `server:qualification_count:${data.division}:${crypto.randomUUID()}`;
+    const nextMetadata = metadata ? {
+      ...metadata,
+      status: selection?.ok && finalSetMatches ? 'current' : 'stale',
+      fingerprint: proposedFingerprint,
+      tieSelections: selection?.ok
+        ? canonicalTieSelections(proposedState, metadata.tieSelections || {}) : metadata.tieSelections || {},
+      reason: selection?.ok && finalSetMatches
+        ? 'qualification_count_revalidated' : 'qualification_count_changed',
+    } : null;
+    const updates = { [`qualifyPerGroup.${data.division}`]: data.count };
+    if (nextMetadata) updates[`finalQualification.${data.division}`] = nextMetadata;
+    tx.update(root(), updates);
+    audit(tx, id, 'qualification_count_changed', data.division, uid, {
+      count: qualificationCount(rootData, data.division),
+      finalQualification: metadata,
+    }, {
+      count: data.count,
+      finalQualification: nextMetadata,
+      fingerprint: proposedFingerprint,
+    }, 'qualification_count_changed');
+    return {
+      transitionId: id,
+      division: data.division,
+      count: data.count,
+      status: nextMetadata?.status || null,
+    };
+  });
+}
+
 export async function publishFinalStructure(request) {
   const uid = await admin(request, request.data);
-  const { tournamentId, division, expectedMatches, matches, scoreDrafts } = request.data || {};
-  const required = ['tournamentId', 'division', 'expectedMatches', 'matches', 'scoreDrafts'];
+  const {
+    tournamentId, division, expectedMatches, matches, scoreDrafts,
+    expectedPrelimFingerprint, tieSelections,
+    replacementMode, replacementReason,
+  } = request.data || {};
+  const baseRequired = ['tournamentId', 'division', 'expectedMatches', 'matches', 'scoreDrafts',
+    'expectedPrelimFingerprint', 'tieSelections'];
+  const replacementKeys = ['replacementMode', 'replacementReason'];
   if (!request.data || typeof request.data !== 'object' || Array.isArray(request.data)
-      || Object.keys(request.data).length !== required.length
-      || required.some((key) => !Object.hasOwn(request.data, key))
+      || ![baseRequired.length, baseRequired.length + replacementKeys.length].includes(Object.keys(request.data).length)
+      || baseRequired.some((key) => !Object.hasOwn(request.data, key))
+      || (Object.keys(request.data).length === baseRequired.length + replacementKeys.length
+        && replacementKeys.some((key) => !Object.hasOwn(request.data, key)))
+      || (Object.keys(request.data).length === baseRequired.length
+        && replacementKeys.some((key) => Object.hasOwn(request.data, key)))
       || tournamentId !== TOURNAMENT_ID || !['men', 'women'].includes(division)
+      || typeof expectedPrelimFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(expectedPrelimFingerprint)
+      || !tieSelections || typeof tieSelections !== 'object' || Array.isArray(tieSelections)
       || !Array.isArray(expectedMatches) || !Array.isArray(matches) || !Array.isArray(scoreDrafts)) {
     throw new HttpsError('invalid-argument', 'Exact final publication payload required.');
+  }
+  const replacement = Object.hasOwn(request.data, 'replacementMode');
+  if (replacement !== Object.hasOwn(request.data, 'replacementReason')
+      || (replacement && (replacementMode !== 'replace_unplayed'
+        || typeof replacementReason !== 'string' || !replacementReason.trim()))) {
+    throw new HttpsError('invalid-argument', 'Explicit replace_unplayed mode requires a reason.');
   }
   if (matches.length > 31) bad('A final bracket may contain at most 31 matches.');
   const forbidden = new Set([
@@ -1068,6 +1505,7 @@ export async function publishFinalStructure(request) {
         || !Number.isInteger(match.index) || match.index < 0
         || !isTeam(match.teamA ?? null) || !isTeam(match.teamB ?? null)
         || !isSource(match.teamASource ?? null) || !isSource(match.teamBSource ?? null)
+        || (match.byeCandidate != null && match.round !== 1)
         || !['empty', 'waiting', 'pending', 'bye_pending', 'bye'].includes(match.status)
         || (match.nextMatchId !== null && match.nextMatchId !== undefined
           && (typeof match.nextMatchId !== 'string' || !byId.has(match.nextMatchId)))
@@ -1101,6 +1539,12 @@ export async function publishFinalStructure(request) {
             || (match.status === 'waiting' && entrantCount !== 0)) {
           bad('Final root status does not match its entrants.');
         }
+        if (match.byeCandidate != null
+            && (match.status !== 'empty'
+              || typeof match.byeCandidate !== 'object'
+              || Array.isArray(match.byeCandidate))) {
+          bad('An unplaced BYE candidate requires an empty final root.');
+        }
       }
       if (round === maxRound) {
         if (match.nextMatchId || match.nextSlot) bad('Final championship match cannot have a downstream match.');
@@ -1118,6 +1562,60 @@ export async function publishFinalStructure(request) {
       tx.get(root().collection('scoreWorkflows')), tx.get(root().collection('courtQueues')),
       tx.get(root().collection('teams').where('division', '==', division)),
     ]);
+    const qualificationContext = await readQualificationContext(tx, division);
+    if (qualificationContext.fingerprint !== expectedPrelimFingerprint) {
+      throw new HttpsError('aborted', 'Preliminary qualification input changed.');
+    }
+    const existingFinalPlay = hasRealFinalPlay(
+      qualificationContext.finals,
+      qualificationContext.assignments,
+      qualificationContext.workflows,
+      division,
+    );
+    const publicationHasRealFinalPlay = existingFinalPlay
+      || (existingSnap.size > 0 && scoreDrafts.length > 0);
+    if (replacement && publicationHasRealFinalPlay) {
+      bad('replace_unplayed is only available before any real final play.');
+    }
+    if (replacement && existingSnap.size === 0) {
+      bad('replace_unplayed requires an existing pre-play publication.');
+    }
+    if (replacement && qualificationContext.finalQualification
+        && qualificationContext.finalQualification.status !== 'stale') {
+      bad('replace_unplayed requires an existing stale pre-play publication.');
+    }
+    const proposedParticipantIds = finalEntrantIdsFromRecords(matches);
+    const qualificationSelection = qualificationSelectionErrors(
+      qualificationContext.state,
+      proposedParticipantIds,
+      tieSelections,
+    );
+    const canonicalParticipantIds = qualificationSelection.ok
+      ? [...new Set(proposedParticipantIds)].sort() : [];
+    const priorParticipantIds = Array.isArray(qualificationContext.finalQualification?.participantIds)
+      ? [...new Set(qualificationContext.finalQualification.participantIds)].sort() : null;
+    if (existingSnap.size > 0 && !qualificationContext.finalQualification && !replacement) {
+      const existingParticipantIds = [...new Set(finalEntrantIds(existingSnap))].sort();
+      if (existingParticipantIds.length !== canonicalParticipantIds.length
+          || existingParticipantIds.some((id, index) => id !== canonicalParticipantIds[index])) {
+        bad('An unverified publication cannot change final entrants.');
+      }
+    }
+    if (!replacement
+        && publicationHasRealFinalPlay
+        && priorParticipantIds
+        && (priorParticipantIds.length !== canonicalParticipantIds.length
+          || priorParticipantIds.some((id, index) => id !== canonicalParticipantIds[index]))) {
+      bad('Played final entrants cannot change.');
+    }
+    if (!replacement
+        && qualificationContext.finalQualification?.status === 'stale'
+        && !publicationHasRealFinalPlay
+        && priorParticipantIds
+        && (priorParticipantIds.length !== canonicalParticipantIds.length
+          || priorParticipantIds.some((id, index) => id !== canonicalParticipantIds[index]))) {
+      bad('A stale pre-play publication requires replace_unplayed for changed entrants.');
+    }
     const expected = expectedMatches.map((item) => {
       if (!item || typeof item !== 'object' || Array.isArray(item)
           || Object.keys(item).length !== 3 || typeof item.id !== 'string' || !item.id
@@ -1138,9 +1636,11 @@ export async function publishFinalStructure(request) {
     const existing = new Map(existingSnap.docs.map((snap) => [snap.id, snap.data()]));
     const assignments = new Map(assignmentSnap.docs.map((snap) => [snap.id, snap.data()]));
     const workflows = new Map(workflowSnap.docs.map((snap) => [snap.id, snap.data()]));
+    const allowUnplayedReplacement = replacement && !publicationHasRealFinalPlay;
     for (const match of ordered) {
       const old = existing.get(match.id);
-      if (!old || (!(old.officialRevision > 0) && old.status !== 'bye')) continue;
+      if (!old || (!(old.officialRevision > 0) && old.status !== 'bye')
+          || (replacement && !existingFinalPlay)) continue;
       const fields = ['round', 'index', 'nextMatchId', 'nextSlot'];
       if (old.status === 'bye') fields.push('status');
       if (match.round === 1) fields.push('teamA', 'teamB', 'teamASource', 'teamBSource');
@@ -1156,6 +1656,18 @@ export async function publishFinalStructure(request) {
       if (!team) bad('Final entrant is not a member of the selected division.');
       return { id: team.id, name: team.data().name || '' };
     };
+    const canonicalByeCandidate = (candidate) => {
+      if (!candidate) return null;
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
+          || !candidate.team || typeof candidate.team.id !== 'string'
+          || !['A', 'B'].includes(candidate.side)) {
+        bad('Final BYE candidate is invalid.');
+      }
+      return {
+        ...candidate,
+        team: canonicalEntrant(candidate.team),
+      };
+    };
     const rootTeams = new Set();
     for (const match of rounds.get(1) || []) {
       for (const side of ['A', 'B']) {
@@ -1164,6 +1676,16 @@ export async function publishFinalStructure(request) {
         if (!divisionTeams.has(team.id) || rootTeams.has(team.id)) bad('Final root teams must be unique members of the selected division.');
         rootTeams.add(team.id);
       }
+      const byeCandidate = canonicalByeCandidate(match.byeCandidate);
+      if (byeCandidate?.team?.id) {
+        if (rootTeams.has(byeCandidate.team.id)) bad('Final root BYE candidates must be unique members of the selected division.');
+        rootTeams.add(byeCandidate.team.id);
+      }
+    }
+    if (rootTeams.size < 2 || rootTeams.size > 32
+        || rootTeams.size !== canonicalParticipantIds.length
+        || [...rootTeams].sort().some((id, index) => id !== canonicalParticipantIds[index])) {
+      bad('Final root entrants must exactly match the validated qualification set.');
     }
     const transition = `server:final_structure:${division}:${crypto.randomUUID()}`;
     const canonical = new Map();
@@ -1176,6 +1698,7 @@ export async function publishFinalStructure(request) {
       const teamB = match.round === 1 ? canonicalEntrant(match.teamB) : null;
       canonical.set(match.id, {
         ...match, teamA, teamB,
+        byeCandidate: match.round === 1 ? canonicalByeCandidate(match.byeCandidate) : null,
         teamASource: match.round === 1 ? (match.teamASource ?? null) : null,
         teamBSource: match.round === 1 ? (match.teamBSource ?? null) : null,
         status: match.round === 1
@@ -1241,6 +1764,7 @@ export async function publishFinalStructure(request) {
       if (['teamA', 'teamB', 'teamASource', 'teamBSource', 'round', 'index', 'nextMatchId', 'nextSlot']
         .some((field) => JSON.stringify(old[field] ?? null) !== JSON.stringify(item[field] ?? null))
         || (old.status === 'bye' && item.status !== 'bye')) {
+        if (allowUnplayedReplacement) continue;
         bad(`Recorded final participants cannot change: ${id}.`);
       }
     }
@@ -1263,7 +1787,7 @@ export async function publishFinalStructure(request) {
       || assignments.has(finalAssignmentKey(division, match.id))
     )).map((match) => finalAssignmentKey(division, match.id)));
     for (const snap of existingSnap.docs) {
-      if (!canonical.has(snap.id) && !finalMatchIsPristine(snap.data())) {
+      if (!canonical.has(snap.id) && !allowUnplayedReplacement && !finalMatchIsPristine(snap.data())) {
         bad(`Final match is not pristine: ${snap.id}.`);
       }
     }
@@ -1397,11 +1921,52 @@ export async function publishFinalStructure(request) {
     for (const key of desiredKeys) tx.set(ref('courtAssignments', key), postAssignments.get(key));
     const topologyChanged = obsolete.length > 0 || [...desiredKeys].some((key) => !assignments.has(key));
     const topologyRevision = (tournamentSnap.data()?.courtTopologyRevision || 0) + (topologyChanged ? 1 : 0);
-    if (topologyChanged) tx.set(root(), { courtTopologyRevision: topologyRevision }, { merge: true });
-    audit(tx, transition, 'final_structure_published', division, uid, { expectedMatches: expected }, {
+    const finalQualification = {
+      status: 'current',
+      fingerprint: qualificationContext.fingerprint,
+      participantIds: canonicalParticipantIds,
+      tieSelections: canonicalTieSelections(qualificationContext.state, tieSelections),
+      reason: replacement ? 'replace_unplayed' : 'published',
+    };
+    const rootUpdate = { [`finalQualification.${division}`]: finalQualification };
+    if (topologyChanged) rootUpdate.courtTopologyRevision = topologyRevision;
+    tx.update(root(), rootUpdate);
+    audit(tx, transition, replacement ? 'final_structure_replaced_unplayed' : 'final_structure_published', division, uid, {
+      expectedMatches: expected,
+      expectedPrelimFingerprint,
+      tieSelections: finalQualification.tieSelections,
+      cutoff: qualificationContext.state.groups.map((group) => ({
+        groupId: group.groupId,
+        cutoffCandidateIds: group.cutoffCandidateIds,
+        cutoffSlots: group.cutoffSlots,
+        selectedIds: finalQualification.tieSelections[group.groupId] || [],
+      })),
+      ...(replacement ? {
+        replacementMode: 'replace_unplayed',
+        replacementReason: boundedReason(replacementReason),
+        priorQualification: qualificationContext.finalQualification,
+        priorBracket: existingSnap.docs.map((snap) => ({ id: snap.id, ...snap.data() })),
+        priorFinalMatches: existingSnap.docs.map((snap) => ({ id: snap.id, ...snap.data() })),
+        priorAssignments: [...assignments]
+          .filter(([key, assignment]) => assignment.matchType === 'final'
+            && assignment.divisionId === division)
+          .map(([id, assignment]) => ({ id, ...assignment })),
+        priorWorkflows: [...workflows]
+          .filter(([key]) => key.startsWith(`final:${division}:`))
+          .map(([id, workflow]) => ({ id, ...workflow })),
+        priorQueues: [...qualificationContext.queues]
+          .filter(([courtId]) => [...assignments].some(([key, assignment]) => (
+            assignment.matchType === 'final'
+              && assignment.divisionId === division
+              && assignment.courtId === courtId
+          )))
+          .map(([id, queue]) => ({ id, ...queue })),
+      } : {}),
+    }, {
       matchIds: [...canonical.keys()], scoreRevisions: Object.fromEntries([...canonical].map(([id, match]) => [id, match.officialRevision || 0])),
       finalCorrectionReasons,
-    });
+      finalQualification,
+    }, replacement ? boundedReason(replacementReason) : 'final_structure_published');
     return { transitionId: transition, matches: [...canonical.values()], base: expected, scoreRevisions: Object.fromEntries([...canonical].map(([id, match]) => [id, match.officialRevision || 0])), counts: { matches: canonical.size, scores: [...canonical.values()].filter((match) => match.officialRevision > 0).length, createdPairs: [...desiredKeys].filter((key) => !assignments.has(key)).length, removedPairs: obsolete.length }, topologyRevision };
   });
 }
@@ -1583,15 +2148,20 @@ export async function clearFinalStructure(request) {
       }, normalizedAssignments, planned.workflows));
     }
     const topologyRevision = (tournamentSnap.data()?.courtTopologyRevision || 0) + 1;
-    tx.set(root(), { courtTopologyRevision: topologyRevision }, { merge: true });
+    tx.update(root(), {
+      courtTopologyRevision: topologyRevision,
+      [`finalQualification.${division}`]: FieldValue.delete(),
+    });
     audit(tx, id, 'final_structure_cleared', division, uid, {
       finalMatchIds: [...targetMatchIds],
       assignmentKeys: [...targetAssignmentKeys],
+      finalQualification: tournamentSnap.data()?.finalQualification?.[division] || null,
     }, {
       removedFinalMatches: finalMatchesSnap.size,
       removedAssignments: targetAssignments.length,
-      affectedCourts: [...affectedCourtIds],
+      affectedCourts: affectedCourtIds.size,
       topologyRevision,
+      finalQualification: null,
     });
     return {
       transitionId: id,
@@ -1689,6 +2259,353 @@ function officialScoreMatches(snapshot, official, revision) {
     && JSON.stringify(snapshot.sets) === JSON.stringify(official.sets);
 }
 
+const PARTICIPANT_FIELDS = Object.freeze({
+  groups: new Set(['name', 'division', 'order', 'matchMode', 'ringOrder']),
+  teams: new Set(['name', 'division', 'order', 'groupId']),
+});
+const PARTICIPANT_STRUCTURAL_FIELDS = Object.freeze({
+  groups: new Set(['division', 'matchMode', 'ringOrder']),
+  teams: new Set(['division', 'groupId']),
+});
+const PARTICIPANT_ID = /^[^/]{1,256}$/;
+const PARTICIPANT_MAX_CHANGES = 400;
+
+function participantInvalid(message) {
+  throw new HttpsError('invalid-argument', message);
+}
+
+function participantRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function participantEqual(left, right) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function participantDivision(value) {
+  if (typeof value !== 'string' || !['men', 'women'].includes(value)) {
+    participantInvalid('Participant division must be men or women.');
+  }
+  return value;
+}
+
+function participantName(value) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 200) {
+    participantInvalid('Participant name must be a non-empty string of at most 200 characters.');
+  }
+  return value.trim();
+}
+
+function participantOrder(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    participantInvalid('Participant order must be a non-negative integer.');
+  }
+  return value;
+}
+
+function participantId(value, label = 'Participant id') {
+  if (typeof value !== 'string' || !PARTICIPANT_ID.test(value)) {
+    participantInvalid(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function participantGroupId(value) {
+  if (value !== null && (typeof value !== 'string' || !value || !PARTICIPANT_ID.test(value))) {
+    participantInvalid('Team groupId is invalid.');
+  }
+  return value;
+}
+
+function participantRingOrder(value) {
+  if (!Array.isArray(value) || value.length > 256
+      || value.some((item) => item !== null
+        && (typeof item !== 'string' || !item || !PARTICIPANT_ID.test(item)))) {
+    participantInvalid('Ring order must contain team ids or null slots.');
+  }
+  const ids = value.filter((item) => item !== null);
+  if (new Set(ids).size !== ids.length) participantInvalid('Ring order contains duplicate teams.');
+  return [...value];
+}
+
+function participantPatch(collection, raw, create) {
+  if (!participantRecord(raw)) participantInvalid('Participant change data must be an object.');
+  const data = { ...raw };
+
+  const allowed = PARTICIPANT_FIELDS[collection];
+  if (!allowed || Object.keys(data).some((key) => !allowed.has(key))) {
+    participantInvalid(`Unsupported ${collection} participant field.`);
+  }
+  if (!Object.keys(data).length) participantInvalid('Participant change data cannot be empty.');
+  for (const [field, value] of Object.entries(data)) {
+    if (field === 'name') data[field] = participantName(value);
+    else if (field === 'division') data[field] = participantDivision(value);
+    else if (field === 'order') data[field] = participantOrder(value);
+    else if (field === 'matchMode') {
+      if (!['ring', 'roundrobin'].includes(value)) participantInvalid('Unsupported group match mode.');
+    } else if (field === 'ringOrder') data[field] = participantRingOrder(value);
+    else if (field === 'groupId') data[field] = participantGroupId(value);
+  }
+  if (create) {
+    for (const field of ['name', 'division', 'order']) {
+      if (!Object.hasOwn(data, field)) participantInvalid(`New ${collection} requires ${field}.`);
+    }
+    if (collection === 'teams' && !Object.hasOwn(data, 'groupId')) {
+      participantInvalid('New team requires groupId.');
+    }
+  }
+  return data;
+}
+
+function requireEditParticipantsPayload(data) {
+  if (!participantRecord(data)
+      || Object.keys(data).sort().join(',') !== 'changes,operation,tournamentId'
+      || data.operation !== 'edit_participants'
+      || !Array.isArray(data.changes)
+      || !data.changes.length
+      || data.changes.length > PARTICIPANT_MAX_CHANGES
+      || Buffer.byteLength(JSON.stringify(data), 'utf8') > 128 * 1024) {
+    participantInvalid('Exact participant structure payload required.');
+  }
+  const seen = new Set();
+  return data.changes.map((change) => {
+    if (!participantRecord(change)
+        || Object.keys(change).sort().join(',') !== 'collection,create,data,id'
+        || !['groups', 'teams'].includes(change.collection)
+        || typeof change.create !== 'boolean') {
+      participantInvalid('Exact participant change required.');
+    }
+    const id = participantId(change.id, 'Participant document id');
+    const key = `${change.collection}/${id}`;
+    if (seen.has(key)) participantInvalid('Participant changes must not repeat a document.');
+    seen.add(key);
+    return {
+      collection: change.collection,
+      id,
+      create: change.create,
+      data: participantPatch(change.collection, change.data, change.create),
+    };
+  });
+}
+
+function participantEffectiveField(collection, field, value) {
+  if (collection === 'groups' && field === 'matchMode') return value || 'ring';
+  if (collection === 'groups' && field === 'ringOrder') return Array.isArray(value) ? value : [];
+  if (collection === 'teams' && field === 'groupId') return value || null;
+  return value ?? null;
+}
+
+function participantChangedFields(collection, before, after, patch, create) {
+  if (create) return new Set(Object.keys(after).filter((field) => PARTICIPANT_FIELDS[collection].has(field)));
+  return new Set(Object.keys(patch).filter((field) => !participantEqual(
+    participantEffectiveField(collection, field, before?.[field]),
+    participantEffectiveField(collection, field, after?.[field]),
+  )));
+}
+
+function participantFinalExists(finalSnaps, divisions) {
+  return [...divisions].some((division) => finalSnaps.get(division)?.size);
+}
+
+function participantMatchIsLive(matchId, assignments, workflows) {
+  const assignment = assignments.get(matchId);
+  const workflow = workflows.get(matchId);
+  return ['in_progress', 'under_review', 'replay_required', 'rework_required', 'completed'].includes(assignment?.publicStatus)
+    || (workflow && !['idle', 'rejected'].includes(workflow.draftState))
+    || Boolean(workflow?.lock || workflow?.submittedSnapshot);
+}
+
+function validateParticipantRing(groupId, group, teams) {
+  if (!Object.hasOwn(group, 'ringOrder')) return;
+  const ringOrder = group.ringOrder;
+  if (!Array.isArray(ringOrder)) participantInvalid('Ring order must be an array.');
+  const members = [...teams.entries()]
+    .filter(([, team]) => team.groupId === groupId)
+    .map(([id]) => id);
+  if (members.some((id) => teams.get(id).division !== group.division)) {
+    participantInvalid('Group members must match the group division.');
+  }
+  if (ringOrder.length !== 0 && ringOrder.length !== members.length) {
+    participantInvalid('Ring order must contain one slot for every group team.');
+  }
+  const memberIds = new Set(members);
+  const placed = ringOrder.filter((id) => id !== null);
+  if (placed.some((id) => !memberIds.has(id)) || new Set(placed).size !== placed.length) {
+    participantInvalid('Ring order references a missing or foreign team.');
+  }
+}
+
+async function editParticipants(uid, data) {
+  const changes = requireEditParticipantsPayload(data);
+  return db().runTransaction(async (tx) => {
+    const [
+      tournamentSnap,
+      groupsSnap,
+      teamsSnap,
+      prelimSnap,
+      finalsMenSnap,
+      finalsWomenSnap,
+      assignmentsSnap,
+      workflowsSnap,
+    ] = await Promise.all([
+      assertTournamentWritable(tx),
+      tx.get(root().collection('groups')),
+      tx.get(root().collection('teams')),
+      tx.get(root().collection('prelimMatches')),
+      tx.get(root().collection('divisions').doc('men').collection('finalMatches')),
+      tx.get(root().collection('divisions').doc('women').collection('finalMatches')),
+      tx.get(root().collection('courtAssignments')),
+      tx.get(root().collection('scoreWorkflows')),
+    ]);
+    // Keep this local read explicit: every snapshot above is obtained before
+    // any participant or audit write below.
+    if (!tournamentSnap.exists) bad('Tournament root not found.');
+
+    const groups = new Map(groupsSnap.docs.map((snap) => [snap.id, {
+      ref: snap.ref, data: snap.data(), exists: true,
+    }]));
+    const teams = new Map(teamsSnap.docs.map((snap) => [snap.id, {
+      ref: snap.ref, data: snap.data(), exists: true,
+    }]));
+    const plans = [];
+    const changedKeys = new Set();
+    for (const change of changes) {
+      const collection = change.collection;
+      const target = collection === 'groups' ? groups : teams;
+      const current = target.get(change.id);
+      if ((change.create && current?.exists) || (!change.create && !current?.exists)) {
+        participantInvalid(change.create
+          ? `Cannot create existing ${collection} document.`
+          : `Cannot update missing ${collection} document.`);
+      }
+      const before = current?.data || null;
+      const after = change.create ? { ...change.data } : { ...before, ...change.data };
+      if (collection === 'teams' && change.create && !Object.hasOwn(after, 'groupId')) after.groupId = null;
+      target.set(change.id, { ref: current?.ref || ref(collection, change.id), data: after, exists: true });
+      const key = `${collection}/${change.id}`;
+      if (changedKeys.has(key)) participantInvalid('Participant changes must not repeat a document.');
+      changedKeys.add(key);
+      plans.push({ ...change, before, after, changedFields: participantChangedFields(collection, before, after, change.data, change.create) });
+    }
+
+    const touchedGroups = new Set();
+    const touchedTeams = new Set();
+    const affectedDivisions = new Set();
+    for (const plan of plans) {
+      const structural = PARTICIPANT_STRUCTURAL_FIELDS[plan.collection];
+      const effective = plan.create || [...plan.changedFields].some((field) => structural.has(field));
+      plan.effective = effective;
+      if (!effective) continue;
+      if (plan.before?.division) affectedDivisions.add(plan.before.division);
+      if (plan.after?.division) affectedDivisions.add(plan.after.division);
+      if (plan.collection === 'groups') {
+        touchedGroups.add(plan.id);
+        if (!plan.before?.division || !plan.after?.division) {
+          for (const team of teams.values()) {
+            if (team.data.groupId === plan.id && team.data.division) affectedDivisions.add(team.data.division);
+          }
+        }
+      } else {
+        touchedTeams.add(plan.id);
+        if (plan.before?.groupId) touchedGroups.add(plan.before.groupId);
+        if (plan.after?.groupId) touchedGroups.add(plan.after.groupId);
+        for (const groupId of [plan.before?.groupId, plan.after?.groupId]) {
+          const groupDivision = groupId ? groups.get(groupId)?.data?.division : null;
+          if (groupDivision) affectedDivisions.add(groupDivision);
+        }
+      }
+    }
+
+    const finalSnaps = new Map([['men', finalsMenSnap], ['women', finalsWomenSnap]]);
+    if (participantFinalExists(finalSnaps, affectedDivisions)) {
+      bad('Final structure exists in an affected division.');
+    }
+
+    // Group and team relationships are checked against the complete projected
+    // state, so a create+assign batch is atomic and cross-division destinations
+    // cannot slip through between separate writes.
+    for (const teamId of touchedTeams) {
+      const team = teams.get(teamId)?.data;
+      if (!team) participantInvalid('Team projection is missing.');
+      if (team.groupId) {
+        const group = groups.get(team.groupId)?.data;
+        if (!group) participantInvalid('Team destination group does not exist.');
+        if (group.division !== team.division) participantInvalid('Team destination group has another division.');
+      }
+    }
+    for (const plan of plans.filter((item) => item.collection === 'groups'
+      && item.effective && item.changedFields.has('division'))) {
+      const group = groups.get(plan.id).data;
+      for (const [teamId, team] of teams.entries()) {
+        if (team.groupId === plan.id && team.division !== group.division) {
+          participantInvalid(`Team ${teamId} does not match its group division.`);
+        }
+      }
+    }
+    for (const groupId of touchedGroups) {
+      const group = groups.get(groupId)?.data;
+      if (group) validateParticipantRing(groupId, group, new Map([...teams].map(([id, item]) => [id, item.data])));
+    }
+
+    const assignments = new Map(assignmentsSnap.docs.map((snap) => [snap.id, snap.data()]));
+    assignmentsSnap.docs.forEach((snap) => {
+      const assignment = snap.data();
+      if (assignment.matchId) assignments.set(assignment.matchId, assignment);
+    });
+    const workflows = new Map(workflowsSnap.docs.map((snap) => [snap.id, snap.data()]));
+    assignmentsSnap.docs.forEach((snap) => {
+      const assignment = snap.data();
+      if (assignment.matchId && workflows.has(snap.id)) workflows.set(assignment.matchId, workflows.get(snap.id));
+    });
+    const historyGroups = new Set();
+    const historyTeams = new Set();
+    for (const snap of prelimSnap.docs) {
+      const match = snap.data();
+      if (!prelimHasHistory(match) && !participantMatchIsLive(snap.id, assignments, workflows)) continue;
+      if (match.groupId) historyGroups.add(match.groupId);
+      if (match.teamA) historyTeams.add(match.teamA);
+      if (match.teamB) historyTeams.add(match.teamB);
+    }
+    for (const plan of plans) {
+      if (!plan.effective) continue;
+      if (plan.collection === 'groups'
+          && [...plan.changedFields].some((field) => PARTICIPANT_STRUCTURAL_FIELDS.groups.has(field))
+          && historyGroups.has(plan.id)) {
+        bad(`Group has official or live preliminary history: ${plan.id}.`);
+      }
+      if (plan.collection === 'teams'
+          && [...plan.changedFields].some((field) => PARTICIPANT_STRUCTURAL_FIELDS.teams.has(field))
+          && (historyTeams.has(plan.id)
+            || historyGroups.has(plan.before?.groupId)
+            || historyGroups.has(plan.after?.groupId))) {
+        bad(`Team has official or live preliminary history: ${plan.id}.`);
+      }
+    }
+
+    if (plans.length + 1 >= 499) bad('Participant structure mutation exceeds transaction write limit.');
+    const transitionIdValue = `server:participant_structure:${crypto.randomUUID()}`;
+    const before = plans.map((plan) => ({
+      collection: plan.collection, id: plan.id, data: bounded(plan.before),
+    }));
+    const after = plans.map((plan) => ({
+      collection: plan.collection, id: plan.id, data: bounded(plan.after),
+    }));
+    for (const plan of plans) {
+      if (plan.create) tx.create(ref(plan.collection, plan.id), plan.after);
+      else tx.update(ref(plan.collection, plan.id), plan.data);
+    }
+    audit(tx, transitionIdValue, 'participant_structure_mutated', 'participant_structure', uid, before, after);
+    return {
+      operation: 'edit_participants',
+      transitionId: transitionIdValue,
+      counts: {
+        created: plans.filter((plan) => plan.create).length,
+        updated: plans.filter((plan) => !plan.create).length,
+      },
+    };
+  });
+}
+
 function roundRobinPairs(teamIds) {
   let ids = [...teamIds];
   if (ids.length < 2) return [];
@@ -1719,6 +2636,7 @@ function ringPairs(ringOrder) {
 export async function mutatePrelimStructure(request) {
   const uid = await admin(request, request.data);
   const data = request.data;
+  if (data?.operation === 'edit_participants') return editParticipants(uid, data);
   const operation = requirePrelimStructurePayload(data);
   return db().runTransaction(async (tx) => {
     const [tournamentSnap, groupsSnap, teamsSnap, prelimSnap, assignmentsSnap, workflowsSnap, queuesSnap, finalsSnap] = await Promise.all([
@@ -1962,10 +2880,7 @@ async function approve(request, direct = false) {
     const assignmentSnap = await tx.get(ref('courtAssignments', matchKey)); const workflowSnap = await tx.get(ref('scoreWorkflows', matchKey));
     if (!assignmentSnap.exists || !workflowSnap.exists) bad('Match workflow not found.');
     const assignment = assignmentSnap.data(); const workflow = workflowSnap.data();
-    if (direct && assignment.matchType === 'final') {
-      throw new HttpsError('failed-precondition', 'Final scores must be published through the final publication workflow.');
-    }
-    if (!direct && assignment.matchType === 'final') {
+    if (assignment.matchType === 'final') {
       throw new HttpsError('failed-precondition', 'Final scores must be published through the final publication workflow.');
     }
     if (!direct && (assignment.publicStatus !== 'under_review' || workflow.draftState !== 'submitted')) bad('Only submitted reviews can be approved.');
@@ -1982,6 +2897,11 @@ async function approve(request, direct = false) {
     const officialSnap = await tx.get(officialDocumentRef);
     if (!officialSnap.exists) bad('Official match not found.');
     const officialMatch = officialSnap.data();
+    const qualificationDivision = assignment.divisionId || assignment.division || officialMatch.division;
+    const qualificationContext = assignment.matchType === 'prelim'
+      && ['men', 'women'].includes(qualificationDivision)
+      ? await readQualificationContext(tx, qualificationDivision)
+      : null;
     let directQueue = null;
     if (direct) {
       const officialRevision = (value) => Number.isInteger(value) ? value : null;
@@ -2036,6 +2956,9 @@ async function approve(request, direct = false) {
     );
     const revision = (workflow.officialRevision || 0) + 1;
     const id = transitionId(matchKey, direct ? 'admin_direct_edit' : 'review_approved', revision);
+    const qualificationPlan = qualificationContext
+      ? planPrelimQualificationChange(qualificationContext, assignment, officialMatch, evaluated, revision, id)
+      : null;
     const official = {
       ...evaluated,
       officialRevision: revision,
@@ -2143,6 +3066,11 @@ async function approve(request, direct = false) {
     if (queue) tx.update(ref('courtQueues', assignment.courtId), queue);
     tx.update(workflowSnap.ref, postWorkflow);
     tx.update(assignmentSnap.ref, postAssignment);
+    if (qualificationPlan
+        && qualificationPlan.metadata
+        && qualificationPlan.metadata.fingerprint !== qualificationContext.finalQualification?.fingerprint) {
+      tx.update(root(), { [`finalQualification.${qualificationContext.division}`]: qualificationPlan.metadata });
+    }
     audit(tx, id, direct ? 'admin_direct_edit' : 'review_approved', matchKey, uid, {
       assignment, workflow, queue: directQueue?.queue || null,
     }, {
@@ -2151,6 +3079,10 @@ async function approve(request, direct = false) {
       submission: { version: workflow.submissionVersion, metadata: workflow.submission || null },
       queue: directQueue ? { before: directQueue.queue, after: queue } : null,
       dependencyQueue: dependencyActivation?.queue || null,
+      qualification: qualificationPlan ? {
+        before: qualificationContext.finalQualification,
+        after: qualificationPlan.metadata,
+      } : null,
     }, direct ? reason.trim() : 'review_approved');
     return { transitionId: id, official };
   });
@@ -2323,6 +3255,10 @@ export async function resumeRecorderDraft(request) {
         || workflow.lock.recorderName !== normalizedRecorderName
         || court.recorderName?.trim() !== normalizedRecorderName) {
       throw new HttpsError('permission-denied', 'Only the same recorder can resume this draft.');
+}
+    if (assignment.matchType === 'final') {
+      const qualificationContext = await readQualificationContext(tx, assignment.divisionId || assignment.division);
+      assertFinalQualificationCurrent(qualificationContext);
 }
     assertResolved(assignment);
     if (!isExpired(workflow.lock) && workflow.lock.sessionId !== sessionId && takeover !== true) callableError('ownership_lost', 'aborted');
@@ -2514,7 +3450,7 @@ export async function applyApprovedCorrection(request) {
   const uid = await admin(request, request.data);
   const { reason, planToken } = request.data || {};
   const fields = ['tournamentId', 'planToken', 'reason'];
-  const tokenFields = ['courtId', 'matchKeys', 'expectedQueueRevision', 'fingerprint'];
+  const tokenFields = ['courtId', 'matchKeys', 'expectedQueueRevision', 'fingerprint', 'qualification'];
   if (!request.data || typeof request.data !== 'object' || Array.isArray(request.data)
       || Object.keys(request.data).length !== fields.length || fields.some((key) => !Object.hasOwn(request.data, key))
       || !planToken || typeof planToken !== 'object' || Array.isArray(planToken)
@@ -2523,7 +3459,9 @@ export async function applyApprovedCorrection(request) {
       || !planToken || typeof planToken.courtId !== 'string'
       || !Number.isInteger(planToken.expectedQueueRevision)
       || typeof planToken.fingerprint !== 'string'
-      || !/^[a-f0-9]{64}$/.test(planToken.fingerprint)) {
+      || !/^[a-f0-9]{64}$/.test(planToken.fingerprint)
+      || !planToken.qualification || typeof planToken.qualification !== 'object'
+      || Array.isArray(planToken.qualification)) {
     throw new HttpsError('invalid-argument', 'reason and a valid planToken are required.');
   }
   const targets = correctionTargets(planToken.matchKeys);
@@ -2540,7 +3478,9 @@ export async function applyApprovedCorrection(request) {
     }
     if (planToken.courtId !== preview.planToken.courtId
         || planToken.expectedQueueRevision !== preview.planToken.expectedQueueRevision
-        || planToken.fingerprint !== preview.planToken.fingerprint) {
+        || planToken.fingerprint !== preview.planToken.fingerprint
+        || JSON.stringify(canonical(planToken.qualification))
+          !== JSON.stringify(canonical(preview.planToken.qualification))) {
       throw new HttpsError('aborted', 'Correction plan changed.');
     }
     const id = `server:approved_correction:${crypto.randomUUID()}`;
@@ -2724,8 +3664,43 @@ export async function applyApprovedCorrection(request) {
         lastTransitionId: id,
       }, state.assignments, state.workflows));
     }
+    const prelimQualificationDivisions = new Set(
+      targets.map((key) => ({
+        assignment: preview.state.assignments[key],
+        division: preview.targetDivisions.get(key),
+      }))
+        .filter(({ assignment }) => assignment.matchType === 'prelim')
+        .map(({ assignment, division }) => division || assignment.divisionId || assignment.division)
+        .filter((division) => ['men', 'women'].includes(division)),
+    );
+    const changedQualifications = new Map();
+    for (const division of prelimQualificationDivisions) {
+      const context = preview.qualificationContexts.get(division);
+      if (!context || (!context.finalQualification && context.finalsSnap.empty)
+          || hasRealFinalPlay(context.finals, context.assignments, context.workflows, division)) continue;
+      const nextQualification = {
+        ...(context.finalQualification || {
+          participantIds: finalEntrantIds(context.finalsSnap).sort(),
+          tieSelections: {},
+          fingerprint: context.fingerprint,
+        }),
+        status: 'stale',
+        reason: 'prelim_correction',
+      };
+      changedQualifications.set(division, nextQualification);
+      tx.update(root(), { [`finalQualification.${division}`]: nextQualification });
+    }
     audit(tx, id, 'approved_correction', targets.join(','), uid, { targets }, {
       targets, queue: plan.queue, retractedOfficials,
+      qualification: Object.fromEntries([...preview.qualificationContexts].map(([division, context]) => [
+        division,
+        {
+          before: context.finalQualification,
+          after: changedQualifications.get(division) || context.finalQualification,
+          status: finalQualificationStatus(context),
+          realFinalPlay: hasRealFinalPlay(context.finals, context.assignments, context.workflows, division),
+        },
+      ])),
     }, boundedReason(reason));
     return { transitionId: id };
   });
