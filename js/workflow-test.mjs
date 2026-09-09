@@ -18,6 +18,7 @@ import {
   projectForceRelease,
   reconcilePlannerAssignments,
   selectQueueView,
+  swapPlannerCourts,
 } from './score-workflow.js';
 import {
   buildRecorderCourtSchedule,
@@ -587,6 +588,40 @@ const queue = (changes = {}) => ({
     'hidden-prelim', 'visible-final', 'other-final',
   ]);
   assert.deepEqual(moved, originalMoved);
+}
+
+// A whole-court swap includes hidden/completed and cross-phase entries while
+// preserving the internal order of both source lists.
+{
+  const plannerAssignments = [
+    { matchKey: 'a-hidden', courtId: 'court-a', courtOrder: 3, matchType: 'prelim', publicStatus: 'scheduled' },
+    { matchKey: 'b-final', courtId: 'court-b', courtOrder: 2, matchType: 'final', publicStatus: 'completed' },
+    { matchKey: 'a-final', courtId: 'court-a', courtOrder: 1, matchType: 'final', publicStatus: 'completed' },
+    { matchKey: 'b-prelim', courtId: 'court-b', courtOrder: 1, matchType: 'prelim', publicStatus: 'in_progress' },
+  ];
+  const before = structuredClone(plannerAssignments);
+  const swapped = swapPlannerCourts(plannerAssignments, 'court-a', 'court-b');
+  assert.deepEqual(swapped.map((assignment) => [
+    assignment.matchKey, assignment.courtId, assignment.courtOrder,
+  ]), [
+    ['a-hidden', 'court-b', 2],
+    ['b-final', 'court-a', 2],
+    ['a-final', 'court-b', 1],
+    ['b-prelim', 'court-a', 1],
+  ]);
+  assert.deepEqual(plannerAssignments, before);
+  assert.deepEqual(
+    swapped.filter((assignment) => assignment.courtId === 'court-a')
+      .sort((left, right) => left.courtOrder - right.courtOrder)
+      .map((assignment) => assignment.matchKey),
+    ['b-prelim', 'b-final'],
+  );
+  assert.deepEqual(
+    swapped.filter((assignment) => assignment.courtId === 'court-b')
+      .sort((left, right) => left.courtOrder - right.courtOrder)
+      .map((assignment) => assignment.matchKey),
+    ['a-final', 'a-hidden'],
+  );
 }
 
 // pass-4: review history is excluded and submit advances without approval.

@@ -51,6 +51,19 @@ export function reconcileRecorderSelections(courts, selectedCourtId = "", select
 }
 
 /**
+ * Assignment snapshots can arrive from the local Firestore cache after an
+ * administrator moves a match. A cached court mismatch is not authoritative;
+ * only a server snapshot may revoke the recorder's current court context.
+ */
+export function reconcileRecorderAssignment({ assignment, metadata = null, courtId = "" } = {}) {
+  const assignedCourtId = typeof assignment?.courtId === "string" ? assignment.courtId : "";
+  const mismatch = Boolean(assignedCourtId && courtId && assignedCourtId !== courtId);
+  if (!mismatch) return { status: "owned" };
+  if (metadata?.fromCache === true) return { status: "ignore" };
+  return { status: "lost", assignedCourtId };
+}
+
+/**
  * Build the text-only data used by the confirmation view. The caller supplies
  * the already evaluated outcome; this helper only clones and shapes reviewed
  * score data so a DOM renderer cannot accidentally flatten or reinterpret it.

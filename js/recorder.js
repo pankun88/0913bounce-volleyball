@@ -15,7 +15,8 @@ import {
   buildRecorderConfirmationModel, buildRecorderSubmitContext, reconcileRecorderSelections,
   buildRecorderCourtSchedule, reconcileRecorderSubmit, recorderRouteState, sortRecorderCourts,
   cloneRecorderDraft, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
-  recorderDataState, reconcileRecorderOwnership, resolveRecorderConflict, writeStoredRecorderDraft,
+  recorderDataState, reconcileRecorderAssignment, reconcileRecorderOwnership, resolveRecorderConflict,
+  writeStoredRecorderDraft,
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
@@ -310,7 +311,7 @@ function applyActionGate() {
     if (button) button.disabled = busy || blocked;
   });
   if (ui.scoreFields) {
-    ui.scoreFields.disabled = busy || blocked;
+    ui.scoreFields.disabled = busy || blocked || !edit.token;
     ui.scoreFields.setAttribute("aria-busy", String(busy));
   }
   const selectorsDisabled = selectorLocked();
@@ -497,6 +498,7 @@ function isStaleTerminalCurrent() {
 }
 let contextVersion = 0;
 function bumpContext() {
+  const hadPendingSave = Boolean(edit.pendingSave);
   if (edit.pendingSave?.context?.storageKey) {
     const pending = edit.pendingSave;
     const stored = writeStoredRecorderDraft(getLocalStorage(), pending.context.storageKey, {
@@ -510,6 +512,7 @@ function bumpContext() {
   contextVersion += 1;
   edit.pendingSave = null;
   edit.saveConflict = null;
+  if (hadPendingSave) setBusy(false);
 }
 function captureContext() {
   return {
@@ -552,8 +555,8 @@ function preserveOwnershipWarning(operation) {
     && ownershipWarningMatches(operation)
     && ui.connectionStatus?.textContent === ownershipWarning.message;
 }
-function setOwnershipLostWarning(key, token) {
-  if (edit.dirty) {
+function setOwnershipLostWarning(key, token, { force = false } = {}) {
+  if (force || edit.dirty) {
     const stored = storeDraft();
     const message = stored
       ? ownershipLostMessage
@@ -563,6 +566,42 @@ function setOwnershipLostWarning(key, token) {
     return;
   }
   ownershipWarning = null;
+}
+function fenceAssignmentContext(key) {
+  const lostToken = edit.token;
+  const pendingSaveDraft = draftCopy(edit.pendingSave?.draft);
+  const pendingSaveTouched = edit.pendingSave?.touched ? [...edit.pendingSave.touched] : [];
+  const pendingSaveRevision = edit.pendingSave?.expectedRevision;
+  const hadPendingSave = Boolean(edit.pendingSave);
+  const hadDirtyDraft = edit.dirty;
+  stopHeartbeat();
+  bumpContext();
+  if (pendingSaveDraft && (!edit.localDraft || !hadDirtyDraft)) {
+    edit.localDraft = pendingSaveDraft;
+    edit.touched = new Set(pendingSaveTouched);
+    edit.savedRevision = Number.isInteger(pendingSaveRevision) ? pendingSaveRevision : edit.savedRevision;
+    edit.dirty = true;
+  }
+  edit.token = null;
+  renderedFormKey = "";
+  if (!edit.pendingSubmit) {
+    edit.reviewedPayload = null;
+    clearConfirmation();
+  }
+  if (hadDirtyDraft || hadPendingSave) {
+    setOwnershipLostWarning(key, lostToken, { force: hadPendingSave });
+  } else {
+    ownershipWarning = null;
+  }
+  if (!queue?.currentMatchKey || queue.currentMatchKey !== key) {
+    clearCurrentMatch();
+  } else {
+    assignment = null;
+    official = null;
+    setDataState("assignment", "idle");
+    setDataState("official", "idle");
+  }
+  render();
 }
 function reconcileWorkflowOwnership(value, metadata, key = matchKey) {
   const result = reconcileRecorderOwnership({
@@ -682,7 +721,10 @@ async function reconcileFreshWorkflow(pendingSave) {
   return reconciliation.status;
 }
 function syncScreenVisibility() {
-  const confirmationActive = Boolean(edit.reviewedPayload || edit.pendingSubmit);
+  const confirmationActive = Boolean(
+    (edit.reviewedPayload && (!edit.pendingSubmit || edit.pendingSubmit.matchKey === matchKey))
+      || edit.pendingSubmit?.matchKey === matchKey,
+  );
   const authenticatedScreen = ui.authPanel.hidden;
   ui.courtPanel.hidden = !authenticatedScreen || viewState !== "selection";
   if (ui.confirmPanel) ui.confirmPanel.hidden = !authenticatedScreen || !confirmationActive;
@@ -752,6 +794,16 @@ function attachMatch(key) {
   setDataState("official", "idle");
   matchStops.push(subscribeAssignment(key, (value, metadata) => {
     if (localMatchVersion !== matchContextVersion || key !== matchKey || viewState !== "operations") return;
+    const assignmentReconciliation = reconcileRecorderAssignment({
+      assignment: value,
+      metadata,
+      courtId,
+    });
+    if (assignmentReconciliation.status === "ignore") return;
+    if (assignmentReconciliation.status === "lost") {
+      fenceAssignmentContext(key);
+      return;
+    }
     setSnapshotState("assignment", metadata);
     assignment = value;
     attachOfficial(localMatchVersion);
@@ -878,7 +930,7 @@ function subscribeCourtStreams(expectedCourtVersion = courtContextVersion) {
     queue = snap.exists() ? {id:snap.id,...snap.data()} : null;
     if (queue?.currentMatchKey && queue.currentMatchKey !== matchKey) {
       attachMatch(queue.currentMatchKey);
-    } else if (!queue?.currentMatchKey && !edit.token && !edit.pendingSubmit) {
+    } else if (!queue?.currentMatchKey && !edit.token && (!edit.pendingSubmit || !assignment)) {
       clearCurrentMatch();
     }
     render();

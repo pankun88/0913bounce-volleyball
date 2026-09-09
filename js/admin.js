@@ -27,6 +27,7 @@ import {
   movePlannerMatchByOffset,
   plannerPhaseMatches,
   reconcilePlannerAssignments,
+  swapPlannerCourts,
 } from "./score-workflow.js";
 import { upgradeLegacyBackup } from "./backup-format.js";
 import {
@@ -91,8 +92,12 @@ let workflowDirty = false;
 let workflowSaveInProgress = false;
 let workflowTopologyBaseline = 0;
 let workflowQueueRevisionBaseline = {};
+let workflowDraftCourtSwaps = [];
 let workflowPhaseFilter = "all";
 const workflowCompletedDetailsOpen = new Map();
+let workflowDragMatchKey = null;
+let workflowDragTarget = null;
+let workflowDropHighlightTimer = null;
 const WORKFLOW_DRAG_HINT = "완료 경기가 분리되거나 일부 경기가 숨겨져 드래그 정렬은 제한됩니다. 코트 선택과 가능한 화살표를 사용하세요.";
 const PRELIM_ORDER_GUIDANCE = "경기 진행 순서는 통합 경기 배정·순서에서 변경합니다. 도형의 팀 배치는 대진 상대를 변경합니다.";
 const PRELIM_UNSAVED_PLAN_HINT = "저장되지 않은 코트 배정·진행 순서가 표시 중입니다. 통합 경기 배정·순서에서 저장하세요.";
@@ -772,6 +777,7 @@ function resetWorkflowDraft() {
       courtId: persisted.get(option.matchKey)?.courtId || null,
     }));
   workflowDirty = false;
+  workflowDraftCourtSwaps = [];
   workflowTopologyBaseline = Number(tournamentInfo.courtTopologyRevision || 0);
   workflowQueueRevisionBaseline = Object.fromEntries(
     [...reviewQueues].map(([courtId, queue]) => [courtId, Number(queue.queueRevision || 0)]),
@@ -840,6 +846,88 @@ function normalizeWorkflowOrders(courtId) {
     .forEach((assignment, index) => { assignment.courtOrder = index + 1; });
 }
 
+function workflowCourtSwapPairKey(firstCourtId, secondCourtId) {
+  return [firstCourtId, secondCourtId].sort().join("\u0000");
+}
+
+function workflowCourtSwapsMatchSavedPlan() {
+  const orderedKeys = (assignments, courtId) => assignments
+    .filter((item) => item.courtId === courtId)
+    .sort((a, b) => (a.courtOrder || 0) - (b.courtOrder || 0))
+    .map((item) => item.matchKey || item.id);
+  return workflowDraftCourtSwaps.every(({ fromCourtId, toCourtId }) => (
+    [[fromCourtId, toCourtId], [toCourtId, fromCourtId]].every(([sourceId, targetId]) => {
+      const savedCourt = reviewCourts.get(targetId);
+      const draftCourt = workflowDraftCourts.find((court) => court.id === targetId);
+      if (!savedCourt || !draftCourt
+          || normalizeCourtName(savedCourt.name || savedCourt.displayName) !== normalizeCourtName(draftCourt.name)
+          || (savedCourt.recorderName || "").trim() !== (draftCourt.recorderName || "").trim()) return false;
+      const saved = orderedKeys(reviewAssignments, sourceId);
+      const draft = orderedKeys(workflowDraftAssignments, targetId);
+      return saved.length === draft.length && saved.every((key, index) => key === draft[index]);
+    })
+  ));
+}
+
+function swapWorkflowCourts(firstCourtId, secondCourtId) {
+  if (!firstCourtId || !secondCourtId || firstCourtId === secondCourtId) return;
+  const pairKey = workflowCourtSwapPairKey(firstCourtId, secondCourtId);
+  const existingPairIndex = workflowDraftCourtSwaps.findIndex((pair) => (
+    workflowCourtSwapPairKey(pair.fromCourtId, pair.toCourtId) === pairKey
+  ));
+  const conflictingPair = workflowDraftCourtSwaps.find((pair, index) => (
+    index !== existingPairIndex
+      && [pair.fromCourtId, pair.toCourtId].some((id) => id === firstCourtId || id === secondCourtId)
+  ));
+  if (conflictingPair) {
+    showToast("저장 전에는 같은 코트를 여러 교환에 사용할 수 없습니다.");
+    return;
+  }
+  const firstCourt = workflowDraftCourts.find((court) => court.id === firstCourtId);
+  const secondCourt = workflowDraftCourts.find((court) => court.id === secondCourtId);
+  if (!firstCourt || !secondCourt) return;
+  const firstAssignments = workflowDraftAssignments.filter((assignment) => assignment.courtId === firstCourtId);
+  const secondAssignments = workflowDraftAssignments.filter((assignment) => assignment.courtId === secondCourtId);
+  const ongoing = [...firstAssignments, ...secondAssignments].filter((assignment) => (
+    assignment.publicStatus === "in_progress" || workflowStatusFor(assignment.matchKey).lock
+  )).length;
+  const completed = [...firstAssignments, ...secondAssignments].filter((assignment) => (
+    workflowMatchCompleted(assignment.matchKey)
+  )).length;
+  const firstName = formatCourtName(firstCourt.name, "첫 번째 코트");
+  const secondName = formatCourtName(secondCourt.name, "두 번째 코트");
+  const ongoingNotice = ongoing
+    ? `\n진행 중인 경기 ${ongoing}개는 기존 기록관 잠금이 해제되어 새 코트에서 다시 시작해야 합니다.`
+    : "";
+  const completedNotice = completed
+    ? `\n완료 경기 ${completed}개도 교환 대상에 포함됩니다.`
+    : "";
+  if (!confirm(
+    `'${firstName}'와 '${secondName}'의 전체 경기 목록을 통째로 교환할까요?`
+      + "\n예정·진행 중·완료 경기를 포함하고, 각 코트 안의 경기 순서는 그대로 유지합니다."
+      + ongoingNotice
+      + completedNotice
+      + "\n점수 초안·공식 결과·경기 이력은 보존되며 물리 코트 이름과 담당 기록관은 바뀌지 않습니다."
+      + "\n기록관은 기기에서만 입력 중인 내용을 먼저 저장하세요. 저장되지 않은 기기 로컬 입력은 코트 교환으로 전송되지 않습니다."
+      + "\n저장 버튼을 눌러야 서버에 적용됩니다.",
+  )) return;
+  workflowDraftAssignments = swapPlannerCourts(
+    workflowDraftAssignments,
+    firstCourtId,
+    secondCourtId,
+  );
+  if (existingPairIndex >= 0) {
+    workflowDraftCourtSwaps = workflowDraftCourtSwaps.filter((_, index) => index !== existingPairIndex);
+  } else {
+    workflowDraftCourtSwaps = [
+      ...workflowDraftCourtSwaps,
+      { fromCourtId: firstCourtId, toCourtId: secondCourtId },
+    ];
+  }
+  workflowDirty = true;
+  renderWorkflowCourtPlanner();
+}
+
 function workflowOptionFor(matchKey) {
   return workflowDraftAssignments.find((option) => option.matchKey === matchKey);
 }
@@ -869,11 +957,11 @@ function workflowMatchEditable(matchKey) {
 
 function setMatchCourt(matchKey, courtId, beforeMatchKey = null) {
   const assignment = assignmentFor(matchKey);
-  if (!assignment || !workflowMatchEditable(matchKey)) return;
+  if (!assignment || !workflowMatchEditable(matchKey)) return false;
   if (beforeMatchKey && (
     !workflowMatchEditable(beforeMatchKey)
       || (assignmentFor(beforeMatchKey)?.courtId || null) !== (courtId || null)
-  )) return;
+  )) return false;
   const targetCourtId = courtId || null;
   const next = movePlannerAssignment(
     workflowDraftAssignments,
@@ -884,10 +972,11 @@ function setMatchCourt(matchKey, courtId, beforeMatchKey = null) {
   if (next.every((item, index) => (
     item.courtId === workflowDraftAssignments[index].courtId
       && item.courtOrder === workflowDraftAssignments[index].courtOrder
-  ))) return;
+  ))) return false;
   workflowDraftAssignments = next;
   workflowDirty = true;
   renderWorkflowCourtPlanner();
+  return true;
 }
 
 function moveWorkflowMatch(matchKey, offset) {
@@ -1293,6 +1382,9 @@ async function saveCourtWorkflow(button) {
     .find((name, index, names) => names.indexOf(name) !== index);
   if (duplicated) return showToast(`코트 이름 '${duplicated}'이(가) 중복됩니다. 기록관이 헷갈리지 않게 다르게 지어주세요.`);
   if (workflowSaveInProgress) return;
+  if (!workflowCourtSwapsMatchSavedPlan()) {
+    return showToast("전체 교환과 해당 코트의 개별 배정·순서·설정 변경을 함께 저장할 수 없습니다. 같은 두 코트를 다시 교환해 취소한 뒤 개별 변경을 먼저 저장하고, 전체 교환을 다시 적용하세요. 다른 관리자가 변경했다면 최신 데이터를 다시 불러오세요.");
+  }
   const assignmentsByCourt = {};
   const unassignedAssignments = [];
   workflowDraftAssignments.forEach((assignment) => {
@@ -1320,6 +1412,7 @@ async function saveCourtWorkflow(button) {
       courts: workflowDraftCourts.map((court) => ({ id: court.id, name: normalizeCourtName(court.name), recorderName: court.recorderName.trim() })),
       assignmentsByCourt,
       unassignedAssignments,
+      courtSwaps: workflowDraftCourtSwaps.map((pair) => ({ ...pair })),
       // Keep the baseline captured with this draft: accepting live snapshots here
       // would silently overwrite a concurrent topology or queue change.
       expectedTopologyRevision: workflowTopologyBaseline,
@@ -1374,11 +1467,301 @@ function workflowBoardDragEnabled() {
   ));
 }
 
+function workflowBoardRoot() {
+  return document.getElementById("allCourtBoard");
+}
+
+function workflowOrderedCourtKeys(courtId, excludedMatchKey = null) {
+  return workflowDraftAssignments
+    .map((assignment, index) => ({ assignment, index }))
+    .filter(({ assignment }) => (
+      (assignment.courtId || null) === (courtId || null)
+        && assignment.matchKey !== excludedMatchKey
+    ))
+    .sort((left, right) => (
+      (Number.isFinite(Number(left.assignment.courtOrder))
+        ? Number(left.assignment.courtOrder)
+        : Number.POSITIVE_INFINITY)
+        - (Number.isFinite(Number(right.assignment.courtOrder))
+          ? Number(right.assignment.courtOrder)
+          : Number.POSITIVE_INFINITY)
+      || left.index - right.index
+    ))
+    .map(({ assignment }) => assignment.matchKey);
+}
+
+function workflowDropWouldChange(sourceMatchKey, targetCourtId, beforeMatchKey) {
+  const source = assignmentFor(sourceMatchKey);
+  if (!source || beforeMatchKey === sourceMatchKey) return false;
+  const sourceCourtId = source.courtId || null;
+  const destinationCourtId = targetCourtId || null;
+  const destination = workflowOrderedCourtKeys(destinationCourtId, sourceMatchKey);
+  const insertionIndex = beforeMatchKey
+    ? destination.indexOf(beforeMatchKey)
+    : destination.length;
+  if (beforeMatchKey && insertionIndex < 0) return false;
+  destination.splice(insertionIndex < 0 ? destination.length : insertionIndex, 0, sourceMatchKey);
+  if (sourceCourtId !== destinationCourtId) return true;
+  const current = workflowOrderedCourtKeys(sourceCourtId);
+  return current.length !== destination.length
+    || current.some((matchKey, index) => matchKey !== destination[index]);
+}
+
+function workflowListCards(list, sourceMatchKey = null) {
+  if (!list) return [];
+  return [...list.querySelectorAll(".court-board-card")].filter((card) => (
+    !card.classList.contains("is-completed")
+      && card.dataset.workflowMatchKey !== sourceMatchKey
+  ));
+}
+
+function workflowElementMidpoint(element) {
+  const rect = element?.getBoundingClientRect?.();
+  const top = Number(rect?.top);
+  const height = Number(rect?.height);
+  if (Number.isFinite(top) && Number.isFinite(height) && height >= 0) {
+    return top + height / 2;
+  }
+  const bottom = Number(rect?.bottom);
+  if (Number.isFinite(top) && Number.isFinite(bottom)) return top + (bottom - top) / 2;
+  const offsetTop = Number(element?.offsetTop);
+  const offsetHeight = Number(element?.offsetHeight);
+  if (Number.isFinite(offsetTop) && Number.isFinite(offsetHeight) && offsetHeight >= 0) {
+    return offsetTop + offsetHeight / 2;
+  }
+  return null;
+}
+
+function workflowDragSourceKey(event) {
+  if (workflowDragMatchKey) return workflowDragMatchKey;
+  try {
+    return event?.dataTransfer?.getData?.("text/plain") || null;
+  } catch {
+    return null;
+  }
+}
+
+function workflowDropTargetForList(list, column, courtId, courtName, event, sourceMatchKey) {
+  const cards = workflowListCards(list, sourceMatchKey);
+  let insertionIndex = cards.length;
+  const pointerY = Number(event?.clientY);
+  if (Number.isFinite(pointerY)) {
+    for (let index = 0; index < cards.length; index += 1) {
+      const midpoint = workflowElementMidpoint(cards[index]);
+      if (midpoint != null && pointerY <= midpoint) {
+        insertionIndex = index;
+        break;
+      }
+    }
+  }
+  const beforeMatchKey = cards[insertionIndex]?.dataset.workflowMatchKey || null;
+  if (!workflowDropWouldChange(sourceMatchKey, courtId, beforeMatchKey)) return null;
+  return {
+    sourceMatchKey,
+    targetCourtId: courtId || null,
+    beforeMatchKey,
+    insertionIndex,
+    position: workflowDropPosition(sourceMatchKey, courtId, beforeMatchKey),
+    list,
+    column,
+    targetCard: null,
+    referenceCard: cards[insertionIndex] || null,
+    previousCard: cards[insertionIndex - 1] || null,
+    courtName,
+  };
+}
+
+function workflowDropTargetForCard(card, column, courtId, courtName, event, sourceMatchKey) {
+  if (!card || card.dataset.workflowMatchKey === sourceMatchKey) return null;
+  const list = card.parentElement;
+  const cards = workflowListCards(list, sourceMatchKey);
+  const targetIndex = cards.indexOf(card);
+  if (targetIndex < 0) return null;
+  const midpoint = workflowElementMidpoint(card);
+  const before = midpoint == null || Number(event?.clientY) <= midpoint;
+  const insertionIndex = targetIndex + (before ? 0 : 1);
+  const beforeMatchKey = cards[insertionIndex]?.dataset.workflowMatchKey || null;
+  if (!workflowDropWouldChange(sourceMatchKey, courtId, beforeMatchKey)) return null;
+  return {
+    sourceMatchKey,
+    targetCourtId: courtId || null,
+    beforeMatchKey,
+    insertionIndex,
+    position: workflowDropPosition(sourceMatchKey, courtId, beforeMatchKey),
+    list,
+    column,
+    targetCard: card,
+    referenceCard: cards[insertionIndex] || null,
+    previousCard: cards[insertionIndex - 1] || null,
+    before,
+    courtName,
+  };
+}
+
+function workflowDropPosition(sourceMatchKey, targetCourtId, beforeMatchKey) {
+  const destination = workflowOrderedCourtKeys(targetCourtId, sourceMatchKey);
+  const insertionIndex = beforeMatchKey
+    ? destination.indexOf(beforeMatchKey)
+    : destination.length;
+  return (insertionIndex < 0 ? destination.length : insertionIndex) + 1;
+}
+
+function clearWorkflowDragTarget() {
+  workflowDragTarget = null;
+  const board = workflowBoardRoot();
+  if (!board) return;
+  board.querySelectorAll(".court-board-drop-indicator").forEach((indicator) => indicator.remove());
+  board.querySelectorAll(".workflow-drop-target").forEach((card) => card.classList.remove("workflow-drop-target"));
+  board.querySelectorAll(".court-board-column").forEach((column) => column.classList.remove("drag-over"));
+}
+
+function clearWorkflowDragState() {
+  clearWorkflowDragTarget();
+  workflowDragMatchKey = null;
+  const board = workflowBoardRoot();
+  if (!board) return;
+  board.querySelectorAll(".workflow-drag-source").forEach((card) => card.classList.remove("workflow-drag-source"));
+}
+
+function setWorkflowDragTarget(target) {
+  if (workflowDragTarget
+      && workflowDragTarget.sourceMatchKey === target?.sourceMatchKey
+      && workflowDragTarget.targetCourtId === target?.targetCourtId
+      && workflowDragTarget.beforeMatchKey === target?.beforeMatchKey
+      && workflowDragTarget.list === target?.list
+      && workflowDragTarget.targetCard === target?.targetCard
+      && workflowDragTarget.indicator?.parentNode) {
+    return;
+  }
+  clearWorkflowDragTarget();
+  if (!target?.list || !target?.column) return;
+  workflowDragTarget = target;
+  target.column.classList.add("drag-over");
+  target.targetCard?.classList.add("workflow-drop-target");
+  const indicator = document.createElement("div");
+  indicator.className = "court-board-drop-indicator";
+  indicator.setAttribute("role", "status");
+  indicator.setAttribute("aria-live", "polite");
+  indicator.dataset.workflowDropPosition = String(target.position);
+  indicator.dataset.workflowDropCourt = target.targetCourtId || "unassigned";
+  indicator.dataset.workflowDropPlacement = target.before === false
+    || (!target.beforeMatchKey && target.previousCard)
+    ? "after"
+    : "before";
+  const label = document.createElement("strong");
+  label.textContent = `${target.courtName} · ${target.position}번째 슬롯`;
+  const detail = document.createElement("span");
+  detail.textContent = target.targetCard
+    ? target.before ? "대상 경기 앞에 놓기" : "대상 경기 뒤에 놓기"
+    : target.beforeMatchKey ? "다음 경기 앞에 놓기" : "목록 마지막에 놓기";
+  indicator.append(label, detail);
+  target.list.insertBefore(indicator, target.referenceCard || null);
+  const listRect = target.list.getBoundingClientRect?.();
+  const referenceRect = target.referenceCard?.getBoundingClientRect?.();
+  const previousRect = target.previousCard?.getBoundingClientRect?.();
+  const listTop = Number(listRect?.top);
+  const referenceTop = Number(referenceRect?.top);
+  const previousBottom = Number(previousRect?.bottom);
+  const boundary = Number.isFinite(listTop) && Number.isFinite(referenceTop)
+    ? referenceTop - listTop
+    : Number.isFinite(listTop) && Number.isFinite(previousBottom)
+      ? previousBottom - listTop
+      : null;
+  indicator.style.top = `${Math.max(0, boundary ?? 0)}px`;
+  target.indicator = indicator;
+}
+
+function highlightWorkflowDrop(matchKey) {
+  if (workflowDropHighlightTimer) clearTimeout(workflowDropHighlightTimer);
+  const board = workflowBoardRoot();
+  const card = [...(board?.querySelectorAll(".court-board-card") || [])]
+    .find((candidate) => candidate.dataset.workflowMatchKey === matchKey);
+  if (!card) {
+    workflowDropHighlightTimer = null;
+    return;
+  }
+  card.classList.add("workflow-drop-confirmed");
+  workflowDropHighlightTimer = setTimeout(() => {
+    card.classList.remove("workflow-drop-confirmed");
+    workflowDropHighlightTimer = null;
+  }, 850);
+}
+
+function commitWorkflowDragDrop(target, sourceMatchKey = workflowDragMatchKey) {
+  if (!sourceMatchKey || !target || !workflowBoardDragEnabled()
+      || !workflowMatchEditable(sourceMatchKey)) {
+    clearWorkflowDragState();
+    return false;
+  }
+  const { targetCourtId, beforeMatchKey } = target;
+  if (beforeMatchKey && (
+    !workflowMatchEditable(beforeMatchKey)
+      || (assignmentFor(beforeMatchKey)?.courtId || null) !== (targetCourtId || null)
+  )) {
+    clearWorkflowDragState();
+    return false;
+  }
+  clearWorkflowDragTarget();
+  const moved = setMatchCourt(sourceMatchKey, targetCourtId, beforeMatchKey);
+  clearWorkflowDragState();
+  if (moved) highlightWorkflowDrop(sourceMatchKey);
+  return moved;
+}
+
+function handleWorkflowCardDragOver(event, card, option, column, courtId, courtName) {
+  const sourceMatchKey = workflowDragSourceKey(event);
+  if (!sourceMatchKey || !workflowBoardDragEnabled() || !workflowMatchEditable(sourceMatchKey)) {
+    clearWorkflowDragTarget();
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (!workflowMatchEditable(option.matchKey) || sourceMatchKey === option.matchKey) {
+    clearWorkflowDragTarget();
+    return;
+  }
+  const target = workflowDropTargetForCard(
+    card,
+    column,
+    courtId,
+    courtName,
+    event,
+    sourceMatchKey,
+  );
+  if (target) setWorkflowDragTarget(target);
+  else clearWorkflowDragTarget();
+}
+
+function handleWorkflowCardDrop(event, card, option, column, courtId, courtName) {
+  event.preventDefault();
+  event.stopPropagation();
+  const sourceMatchKey = workflowDragSourceKey(event);
+  if (!sourceMatchKey || !workflowBoardDragEnabled() || !workflowMatchEditable(sourceMatchKey)) {
+    clearWorkflowDragState();
+    return;
+  }
+  const target = workflowDragTarget;
+  if (!target
+      || target.sourceMatchKey !== sourceMatchKey
+      || target.column !== column
+      || target.targetCard !== card
+      || target.targetCourtId !== (courtId || null)) {
+    clearWorkflowDragState();
+    return;
+  }
+  commitWorkflowDragDrop(target, sourceMatchKey);
+}
+
 function createWorkflowBoardCard(option, courtId, completed, dragEnabled) {
   const assignment = assignmentFor(option.matchKey);
   const card = document.createElement("article");
   card.className = `court-board-card${completed ? " is-completed" : ""}`;
   card.dataset.divisionTheme = option.divisionId || option.division || "men";
+  card.dataset.workflowMatchKey = option.matchKey;
+  const boardCourtName = formatCourtName(
+    workflowDraftCourts.find((court) => court.id === courtId)?.name,
+    courtId ? "이름 없는 코트" : "미배정",
+  );
   if (!completed && dragEnabled) {
     card.draggable = true;
     card.addEventListener("dragstart", (event) => {
@@ -1386,20 +1769,22 @@ function createWorkflowBoardCard(option, courtId, completed, dragEnabled) {
         event.preventDefault();
         return;
       }
+      clearWorkflowDragState();
+      workflowDragMatchKey = option.matchKey;
+      card.classList.add("workflow-drag-source");
       event.dataTransfer?.setData("text/plain", option.matchKey);
       if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
     });
+    card.addEventListener("dragend", () => clearWorkflowDragState());
     card.addEventListener("dragover", (event) => {
-      if (workflowBoardDragEnabled() && workflowMatchEditable(option.matchKey)) event.preventDefault();
+      handleWorkflowCardDragOver(event, card, option, card.closest(".court-board-column"), courtId, boardCourtName);
+    });
+    card.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && card.contains(event.relatedTarget)) return;
+      if (workflowDragTarget?.targetCard === card) clearWorkflowDragTarget();
     });
     card.addEventListener("drop", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (!workflowBoardDragEnabled() || !workflowMatchEditable(option.matchKey)) return;
-      const draggedKey = event.dataTransfer?.getData("text/plain");
-      if (draggedKey && draggedKey !== option.matchKey) {
-        setMatchCourt(draggedKey, courtId, option.matchKey);
-      }
+      handleWorkflowCardDrop(event, card, option, card.closest(".court-board-column"), courtId, boardCourtName);
     });
   } else {
     card.draggable = false;
@@ -1463,8 +1848,16 @@ function createWorkflowBoardCard(option, courtId, completed, dragEnabled) {
 }
 
 function renderCourtBoard() {
+  clearWorkflowDragState();
   const root = document.getElementById("allCourtBoard");
   if (!root) return;
+  if (!root.dataset.workflowDragBound) {
+    root.dataset.workflowDragBound = "true";
+    root.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && root.contains(event.relatedTarget)) return;
+      clearWorkflowDragTarget();
+    });
+  }
   const options = workflowDraftAssignments;
   captureWorkflowCompletedDetails();
   syncWorkflowPhaseFilter();
@@ -1481,17 +1874,54 @@ function renderCourtBoard() {
     const column = document.createElement("section");
     column.className = "court-board-column";
     column.addEventListener("dragover", (event) => {
-      if (!workflowBoardDragEnabled()) return;
+      const cardTarget = event.target?.closest?.(".court-board-card");
+      if (cardTarget && column.contains(cardTarget)) {
+        clearWorkflowDragTarget();
+        return;
+      }
+      const sourceMatchKey = workflowDragSourceKey(event);
+      if (!sourceMatchKey || !workflowBoardDragEnabled() || !workflowMatchEditable(sourceMatchKey)) {
+        clearWorkflowDragTarget();
+        return;
+      }
       event.preventDefault();
-      column.classList.add("drag-over");
+      event.stopPropagation();
+      const target = workflowDropTargetForList(
+        list,
+        column,
+        courtId,
+        name,
+        event,
+        sourceMatchKey,
+      );
+      if (target) setWorkflowDragTarget(target);
+      else clearWorkflowDragTarget();
     });
-    column.addEventListener("dragleave", () => column.classList.remove("drag-over"));
+    column.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && column.contains(event.relatedTarget)) return;
+      if (workflowDragTarget?.column === column) clearWorkflowDragTarget();
+      else column.classList.remove("drag-over");
+    });
     column.addEventListener("drop", (event) => {
+      const cardTarget = event.target?.closest?.(".court-board-card");
+      if (cardTarget && column.contains(cardTarget)) return;
       event.preventDefault();
-      column.classList.remove("drag-over");
-      if (!workflowBoardDragEnabled()) return;
-      const matchKey = event.dataTransfer?.getData("text/plain");
-      if (matchKey && workflowMatchEditable(matchKey)) setMatchCourt(matchKey, courtId);
+      event.stopPropagation();
+      const sourceMatchKey = workflowDragSourceKey(event);
+      if (!sourceMatchKey || !workflowBoardDragEnabled() || !workflowMatchEditable(sourceMatchKey)) {
+        clearWorkflowDragState();
+        return;
+      }
+      const target = workflowDragTarget;
+      if (!target
+          || target.sourceMatchKey !== sourceMatchKey
+          || target.column !== column
+          || target.targetCard
+          || target.targetCourtId !== (courtId || null)) {
+        clearWorkflowDragState();
+        return;
+      }
+      commitWorkflowDragDrop(target, sourceMatchKey);
     });
     const heading = document.createElement("h3");
     const headingName = document.createElement("span");
@@ -1514,7 +1944,32 @@ function renderCourtBoard() {
     completedCount.textContent = `완료 ${completed.length}경기`;
     counts.append(upcomingCount, completedCount);
     heading.append(headingName, counts);
+    let swapControls = null;
+    if (courtId && workflowDraftCourts.length > 1) {
+      const target = document.createElement("select");
+      target.className = "court-board-swap-target";
+      target.setAttribute("aria-label", `${name} 경기 목록을 교환할 코트`);
+      workflowDraftCourts
+        .filter((court) => court.id !== courtId)
+        .forEach((court) => target.append(new Option(
+          formatCourtName(court.name, "이름 없는 코트"),
+          court.id,
+        )));
+      const swap = document.createElement("button");
+      swap.type = "button";
+      swap.className = "btn small";
+      swap.textContent = "전체 교환";
+      swap.setAttribute("aria-label", `${name}와 다른 코트의 전체 경기 목록 교환`);
+      swap.title = "예정·진행 중·완료 경기를 모두 다른 코트와 교환";
+      swap.addEventListener("click", () => {
+        if (target.value) swapWorkflowCourts(courtId, target.value);
+      });
+      swapControls = document.createElement("div");
+      swapControls.className = "court-board-swap-controls";
+      swapControls.append(target, swap);
+    }
     column.appendChild(heading);
+    if (swapControls) column.appendChild(swapControls);
     const list = document.createElement("div");
     list.className = "court-board-list";
     active.forEach((option) => {

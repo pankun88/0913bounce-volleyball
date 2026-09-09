@@ -224,6 +224,39 @@ export function movePlannerAssignment(assignments = [], matchKey, targetCourtId 
 }
 
 /**
+ * 두 코트의 전체 경기 목록을 통째로 교환한다.
+ * 표시 필터나 완료 경기 접힘과 무관하게 입력된 모든 배정을 대상으로 하며,
+ * 각 코트 안의 기존 courtOrder 순서는 그대로 유지한다. 입력 배열과 항목은
+ * 변경하지 않는다.
+ */
+export function swapPlannerCourts(assignments = [], firstCourtId, secondCourtId) {
+  const next = (Array.isArray(assignments) ? assignments : []).map((item) => ({ ...item }));
+  const first = firstCourtId || null;
+  const second = secondCourtId || null;
+  if (!first || !second || first === second) return next;
+
+  const orderedByCourt = (courtId) => next
+    .map((assignment, index) => ({ assignment, index }))
+    .filter(({ assignment }) => (assignment.courtId || null) === courtId)
+    .sort((left, right) => (
+      plannerAssignmentOrder(left.assignment) - plannerAssignmentOrder(right.assignment)
+        || left.index - right.index
+    ))
+    .map(({ assignment }) => assignment);
+  const firstEntries = orderedByCourt(first);
+  const secondEntries = orderedByCourt(second);
+  firstEntries.forEach((assignment, index) => {
+    assignment.courtId = second;
+    assignment.courtOrder = index + 1;
+  });
+  secondEntries.forEach((assignment, index) => {
+    assignment.courtId = first;
+    assignment.courtOrder = index + 1;
+  });
+  return next;
+}
+
+/**
  * 표시 가능한 바로 옆 경기와만 순서를 바꾼다. 숨겨진 경기나 완료 경기를
  * 사이에 두고 건너뛰는 결과는 만들지 않는다.
  */

@@ -643,13 +643,15 @@ export async function exchangeRecorderAccessCode(request) {
 export async function replaceCourtWorkflows(request) {
   const uid = await admin(request, request.data);
   const {
-    courts, assignmentsByCourt, unassignedAssignments, expectedTopologyRevision, expectedQueueRevisions,
+    courts, assignmentsByCourt, unassignedAssignments, courtSwaps = [],
+    expectedTopologyRevision, expectedQueueRevisions,
   } = request.data || {};
   if (!Array.isArray(courts) || !assignmentsByCourt || typeof assignmentsByCourt !== 'object'
       || Array.isArray(assignmentsByCourt) || !Array.isArray(unassignedAssignments)
+      || !Array.isArray(courtSwaps)
       || !Number.isInteger(expectedTopologyRevision) || !expectedQueueRevisions
       || typeof expectedQueueRevisions !== 'object' || Array.isArray(expectedQueueRevisions)) {
-    throw new HttpsError('invalid-argument', 'courts, assignments, topology revision and queue revisions are required.');
+    throw new HttpsError('invalid-argument', 'courts, assignments, court swaps, topology revision and queue revisions are required.');
   }
   const courtIds = new Set();
   const courtNames = new Set();
@@ -665,6 +667,25 @@ export async function replaceCourtWorkflows(request) {
     courtIds.add(court.id);
     courtNames.add(name);
     return { id: court.id, name, recorderName: court.recorderName.trim(), order: index + 1 };
+  });
+  if (courtSwaps.length > Math.floor(normalizedCourts.length / 2)) {
+    bad('Too many court swaps.');
+  }
+  const normalizedCourtSwaps = [];
+  const swappedCourtIds = new Set();
+  courtSwaps.forEach((pair) => {
+    if (!pair || typeof pair.fromCourtId !== 'string' || typeof pair.toCourtId !== 'string'
+        || !courtIds.has(pair.fromCourtId) || !courtIds.has(pair.toCourtId)
+        || pair.fromCourtId === pair.toCourtId
+        || swappedCourtIds.has(pair.fromCourtId) || swappedCourtIds.has(pair.toCourtId)) {
+      bad('Court swaps must pair two different registered courts once.');
+    }
+    swappedCourtIds.add(pair.fromCourtId);
+    swappedCourtIds.add(pair.toCourtId);
+    normalizedCourtSwaps.push({
+      fromCourtId: pair.fromCourtId,
+      toCourtId: pair.toCourtId,
+    });
   });
   if (Buffer.byteLength(JSON.stringify(request.data), 'utf8') > 512 * 1024) {
     bad('Court workflow payload is too large.');
@@ -721,15 +742,93 @@ export async function replaceCourtWorkflows(request) {
     }
     const existingAssignments = new Map(assignmentSnap.docs.map((snap) => [snap.id, snap.data()]));
     const existingWorkflows = new Map(workflowSnap.docs.map((snap) => [snap.id, snap.data()]));
+    const orderedAssignmentKeys = (items) => [...items]
+      .sort((left, right) => (
+        (Number(left.courtOrder) || Number.POSITIVE_INFINITY)
+          - (Number(right.courtOrder) || Number.POSITIVE_INFINITY)
+          || String(left.matchKey).localeCompare(String(right.matchKey))
+      ))
+      .map((item) => item.matchKey);
+    const existingByCourt = new Map(normalizedCourts.map((court) => [court.id, []]));
+    const desiredByCourtForSwap = new Map(normalizedCourts.map((court) => [court.id, []]));
+    existingAssignments.forEach((assignment, matchKey) => {
+      if (existingByCourt.has(assignment.courtId)) {
+        existingByCourt.get(assignment.courtId).push({ ...assignment, matchKey });
+      }
+    });
+    desired.forEach((assignment) => {
+      if (desiredByCourtForSwap.has(assignment.courtId)) {
+        desiredByCourtForSwap.get(assignment.courtId).push(assignment);
+      }
+    });
+    const swapDestinationByCourt = new Map();
+    normalizedCourtSwaps.forEach(({ fromCourtId, toCourtId }) => {
+      const fromCourt = courtSnap.docs.find((snap) => snap.id === fromCourtId);
+      const toCourt = courtSnap.docs.find((snap) => snap.id === toCourtId);
+      const normalizedFrom = normalizedCourts.find((court) => court.id === fromCourtId);
+      const normalizedTo = normalizedCourts.find((court) => court.id === toCourtId);
+      if (!fromCourt || !toCourt
+          || (fromCourt.data().name || fromCourt.data().displayName || '').trim() !== normalizedFrom.name
+          || (fromCourt.data().recorderName || '').trim() !== normalizedFrom.recorderName
+          || (toCourt.data().name || toCourt.data().displayName || '').trim() !== normalizedTo.name
+          || (toCourt.data().recorderName || '').trim() !== normalizedTo.recorderName) {
+        bad('A whole-court swap cannot change court names or recorder assignments.');
+      }
+      const fromKeys = orderedAssignmentKeys(existingByCourt.get(fromCourtId));
+      const toKeys = orderedAssignmentKeys(existingByCourt.get(toCourtId));
+      const desiredFromKeys = orderedAssignmentKeys(desiredByCourtForSwap.get(fromCourtId));
+      const desiredToKeys = orderedAssignmentKeys(desiredByCourtForSwap.get(toCourtId));
+      if (fromKeys.length !== desiredToKeys.length
+          || toKeys.length !== desiredFromKeys.length
+          || fromKeys.some((key, index) => key !== desiredToKeys[index])
+          || toKeys.some((key, index) => key !== desiredFromKeys[index])) {
+        bad('A whole-court swap must exchange every assigned match in its existing order.');
+      }
+      swapDestinationByCourt.set(fromCourtId, toCourtId);
+      swapDestinationByCourt.set(toCourtId, fromCourtId);
+    });
+    const invalidatedLocks = [];
+    const invalidatedStateByMatch = new Map();
+    const transition = `server:court_workflows_replaced:${crypto.randomUUID()}`;
     for (const [matchKey, workflow] of existingWorkflows) {
       if (!workflow.lock) continue;
       const old = existingAssignments.get(matchKey);
       const next = desired.get(matchKey);
       const destination = next?.courtId && normalizedCourts.find((court) => court.id === next.courtId);
-      if (!old || !destination || destination.recorderName !== workflow.lock.recorderName) {
+      const movedByWholeSwap = Boolean(
+        old?.courtId
+          && next?.courtId
+          && swapDestinationByCourt.get(old.courtId) === next.courtId,
+      );
+      if (!old || !next || !destination) {
+        bad(`Live recorder lock must remain with ${workflow.lock.recorderName}.`);
+      }
+      if (movedByWholeSwap) {
+        const returnDraftState = workflow.resumeDraftState === 'rejected' ? 'rejected' : 'idle';
+        const publicStatus = returnDraftState === 'rejected' ? 'replay_required' : 'scheduled';
+        invalidatedLocks.push({ matchKey, recorderName: workflow.lock.recorderName });
+        invalidatedStateByMatch.set(matchKey, {
+          draftState: returnDraftState,
+          publicStatus,
+          lastTransitionId: transition,
+        });
+      } else if (destination.recorderName !== workflow.lock.recorderName) {
         bad(`Live recorder lock must remain with ${workflow.lock.recorderName}.`);
       }
     }
+    invalidatedStateByMatch.forEach((state, matchKey) => {
+      const item = desired.get(matchKey);
+      const workflow = existingWorkflows.get(matchKey);
+      if (item) desired.set(matchKey, { ...item, publicStatus: state.publicStatus, lastTransitionId: transition });
+      if (workflow) {
+        existingWorkflows.set(matchKey, {
+          ...workflow,
+          draftState: state.draftState,
+          lock: null,
+          lastTransitionId: transition,
+        });
+      }
+    });
     for (const [matchKey, item] of desired) {
       if (existingAssignments.has(matchKey)) continue;
       const official = await tx.get(matchRef(item));
@@ -747,7 +846,6 @@ export async function replaceCourtWorkflows(request) {
         );
     }
     }
-    const transition = `server:court_workflows_replaced:${crypto.randomUUID()}`;
     const writePaths = new Set([
       root().path, ref('auditEvents', transition).path,
       ...normalizedCourts.map((court) => ref('courts', court.id).path),
@@ -814,7 +912,13 @@ export async function replaceCourtWorkflows(request) {
         return workflow?.draftState === 'editing' || Boolean(workflow?.lock);
       });
       if (editing.length > 1) throw new HttpsError('aborted', 'Only one editing match can occupy a court.');
-      if (editing.length) entries.splice(entries.indexOf(editing[0]), 1), entries.unshift(editing[0]);
+      // Whole-court swaps promise to retain each source list's complete order.
+      // Queue projection selects an active match independently, so moving an
+      // editing card to the front here would silently reorder completed games.
+      if (editing.length && !swappedCourtIds.has(courtId)) {
+        entries.splice(entries.indexOf(editing[0]), 1);
+        entries.unshift(editing[0]);
+      }
       const normalizedEntries = entries.map((item, index) => {
         const normalized = {
           ...item,
@@ -836,12 +940,13 @@ export async function replaceCourtWorkflows(request) {
     for (const [matchKey, item] of desired) {
       const oldWorkflow = existingWorkflows.get(matchKey);
       const oldAssignment = existingAssignments.get(matchKey);
+      const invalidatedState = invalidatedStateByMatch.get(matchKey);
       const storedItem = oldAssignment ? {
         ...item,
-        publicStatus: oldAssignment.publicStatus,
+        publicStatus: invalidatedState?.publicStatus || oldAssignment.publicStatus,
         attemptCount: oldAssignment.attemptCount || 0,
         officialRevision: oldAssignment.officialRevision || 0,
-        lastTransitionId: oldAssignment.lastTransitionId || null,
+        lastTransitionId: invalidatedState?.lastTransitionId || oldAssignment.lastTransitionId || null,
       } : item;
       tx.set(ref('courtAssignments', matchKey), storedItem);
       if (!oldWorkflow) {
@@ -850,14 +955,27 @@ export async function replaceCourtWorkflows(request) {
         });
       }
     }
+    invalidatedLocks.forEach(({ matchKey }) => {
+      const state = invalidatedStateByMatch.get(matchKey);
+      if (!state) return;
+      tx.update(ref('scoreWorkflows', matchKey), {
+        draftState: state.draftState,
+        lock: null,
+        lastTransitionId: state.lastTransitionId,
+      });
+    });
     for (const court of normalizedCourts) {
       const entries = desiredByCourt.get(court.id);
       const previous = queueSnap.docs.find((snap) => snap.id === court.id)?.data();
       const assignments = Object.fromEntries(entries.map((item) => [item.matchKey, {
         ...item,
-        ...(['publicStatus', 'attemptCount', 'officialRevision', 'lastTransitionId'].reduce((state, key) => (
-          existingAssignments.get(item.matchKey)?.[key] === undefined ? state : { ...state, [key]: existingAssignments.get(item.matchKey)[key] }
-        ), {})),
+        ...(['publicStatus', 'attemptCount', 'officialRevision', 'lastTransitionId'].reduce((state, key) => {
+          if (key === 'publicStatus' && invalidatedStateByMatch.has(item.matchKey)) return state;
+          if (key === 'lastTransitionId' && invalidatedStateByMatch.has(item.matchKey)) return state;
+          return existingAssignments.get(item.matchKey)?.[key] === undefined
+            ? state
+            : { ...state, [key]: existingAssignments.get(item.matchKey)[key] };
+        }, {})),
       }]));
       const workflows = Object.fromEntries(entries.map((item) => [item.matchKey, existingWorkflows.get(item.matchKey) || {
         draftState: 'idle', draftRevision: 0, submissionVersion: 0, officialRevision: 0, lock: null,
@@ -885,6 +1003,8 @@ export async function replaceCourtWorkflows(request) {
       courts: normalizedCourts,
       assignmentsByCourt: Object.fromEntries(normalizedCourts.map((court) => [court.id, [...desired.values()].filter((item) => item.courtId === court.id).map((item) => item.matchKey)])),
       unassignedAssignments: [...desired.values()].filter((item) => !item.courtId).map((item) => item.matchKey),
+      courtSwaps: normalizedCourtSwaps,
+      invalidatedLocks: invalidatedLocks.map(({ matchKey, recorderName }) => ({ matchKey, recorderName })),
     });
     return currentTopologyRevision + 1;
   });

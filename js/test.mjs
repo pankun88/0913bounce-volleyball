@@ -13,7 +13,15 @@ import {
 import { generateBracket, recordMatchResult, invalidateDescendantResults, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, publicMatchView, roundLabel } from './bracket.js';
 import { generateRoundRobin, orderExistingRoundRobinMatchIds } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
-import { movePlannerMatchByOffset } from './score-workflow.js';
+import {
+  getPlannerVisibleAdjacent,
+  groupPlannerAssignments,
+  isPlannerMatchCompleted,
+  movePlannerAssignment,
+  movePlannerMatchByOffset,
+  plannerPhaseMatches,
+  swapPlannerCourts,
+} from './score-workflow.js';
 import {
   backupFromServerExport, normalizeBackupData, restorableRootData, selectRestoreRecovery, upgradeLegacyBackup,
 } from './backup-format.js';
@@ -27,11 +35,96 @@ import {
   correctionSelectionKeys,
   isCorrectionCandidateEligible,
 } from './correction-view.js';
+import {
+  buildRecorderSubmitContext,
+  readStoredRecorderDraft,
+  reconcileRecorderAssignment,
+  reconcileRecorderSubmit,
+  writeStoredRecorderDraft,
+} from './recorder-state.js';
 
 let pass = 0, fail = 0;
 function check(label, cond) {
   if (cond) { pass++; }
   else { fail++; console.error('FAIL:', label); }
+}
+
+// A cached assignment may briefly contain the post-swap court. Only the
+// authoritative snapshot fences the current recorder context.
+{
+  const moved = { matchKey: 'M1', courtId: 'court-b' };
+  check(
+    'cached assignment court move does not revoke the current recorder',
+    reconcileRecorderAssignment({
+      assignment: moved,
+      metadata: { fromCache: true },
+      courtId: 'court-a',
+    }).status === 'ignore',
+  );
+  check(
+    'authoritative assignment court move revokes the current recorder',
+    reconcileRecorderAssignment({
+      assignment: moved,
+      metadata: { fromCache: false },
+      courtId: 'court-a',
+    }).status === 'lost',
+  );
+}
+
+// Context invalidation keeps the original match/uid storage identity even
+// when the source court has no successor match.
+{
+  const storageData = new Map();
+  const storage = {
+    getItem: (key) => storageData.has(key) ? storageData.get(key) : null,
+    setItem: (key, value) => storageData.set(key, value),
+    removeItem: (key) => storageData.delete(key),
+  };
+  const originalKey = 'recorder-score:tournament:M1:uid-1';
+  const movedKey = 'recorder-score:tournament:M2:uid-1';
+  const draft = { sets: [{ a: 10, b: 8 }] };
+  const pendingSave = {
+    context: { matchKey: 'M1', courtId: 'court-a', storageKey: originalKey },
+    draft,
+    touched: new Set(['0-a']),
+    expectedRevision: 3,
+  };
+  const stored = writeStoredRecorderDraft(storage, pendingSave.context.storageKey, {
+    draft: pendingSave.draft,
+    touched: [...pendingSave.touched],
+    revision: pendingSave.expectedRevision,
+  });
+  const recovered = readStoredRecorderDraft(storage, originalKey);
+  check(
+    'dirty pending-save draft survives a source court with an empty queue',
+    stored.ok && recovered.ok && recovered.found && recovered.value.revision === 3
+      && recovered.value.draft.sets[0].a === 10 && !storageData.has(movedKey),
+  );
+}
+
+// A stale operation keeps its immutable request and old storage key until
+// the callable settles; a rejection never retargets or deletes the new draft.
+{
+  const pending = buildRecorderSubmitContext({
+    matchKey: 'M1',
+    courtId: 'court-a',
+    token: 'token-1',
+    queueRevision: 7,
+    score: { sets: [{ a: 10, b: 8 }] },
+    operationId: 'operation-1',
+    storageKey: 'recorder-score:tournament:M1:uid-1',
+  });
+  const rejected = reconcileRecorderSubmit({
+    pendingSubmit: pending,
+    currentMatchKey: 'M2',
+    outcome: 'rejected',
+  });
+  check(
+    'stale submit rejection retains immutable old request',
+    rejected.status === 'pending' && rejected.pendingSubmit === pending
+      && pending.matchKey === 'M1' && pending.courtId === 'court-a'
+      && pending.storageKey.endsWith(':M1:uid-1'),
+  );
 }
 
 // ---- public match view ----
@@ -2362,6 +2455,15 @@ function createAdminProjectionHarness() {
       };
     }
 
+    get textContent() {
+      return this._textContent + this.children.map((child) => child.textContent).join("");
+    }
+
+    set textContent(value) {
+      this._textContent = String(value ?? "");
+      this.replaceChildren();
+    }
+
     get innerHTML() {
       return this._innerHTML;
     }
@@ -2721,13 +2823,14 @@ function createAdminProjectionHarness() {
     renderRingDiagram: renderRingDiagramForTest,
     orderExistingRoundRobinMatchIds: () => [],
     adminWorkflowCallable: async () => ({}),
-    getPlannerVisibleAdjacent: () => ({ previousMatchKey: null, nextMatchKey: null }),
-    isPlannerMatchCompleted: () => false,
-    movePlannerAssignment: (assignments) => assignments.map((item) => ({ ...item })),
+    getPlannerVisibleAdjacent,
+    isPlannerMatchCompleted,
+    movePlannerAssignment,
     movePlannerMatchByOffset,
-    plannerPhaseMatches: () => true,
+    plannerPhaseMatches,
     reconcilePlannerAssignments: (assignments) => assignments,
-    groupPlannerAssignments: () => new Map(),
+    groupPlannerAssignments,
+    swapPlannerCourts,
     correctionConfirmationState: () => ({}),
     correctionSelectionInfo: () => ({}),
     correctionSelectionKeys: (selection) => selection,
@@ -2756,6 +2859,7 @@ function createAdminProjectionHarness() {
   const source = (rawSource.slice(0, bootstrapStart) + rawSource.slice(bootstrapEnd))
     .replace(/^import[\s\S]*?;\s*/gm, "");
   const bridge = `
+    const originalRenderCourtBoard = renderCourtBoard;
     renderGroupList = () => {};
     renderTeamGroupSelect = () => {};
     renderGroupTeamLists = () => {};
@@ -2847,6 +2951,7 @@ function createAdminProjectionHarness() {
         workflowDraftCourts = projectionFixture.courts.map((court) => ({ ...court }));
         reviewAssignments = [];
         reviewWorkflows = new Map();
+        workflowDraftCourtSwaps = [];
         prelimHistoryReadiness = { status: "ready", error: null };
         workflowPhaseFilter = "all";
         workflowDirty = false;
@@ -2862,12 +2967,181 @@ function createAdminProjectionHarness() {
         moveWorkflowMatch("match-ab", -1);
         return projectionState();
       },
+      swapDraft() {
+        allPrelimMatches.push(
+          { id: "match-hidden", division: "men", groupId: "group-a", round: 4, teamA: "team-a", teamB: "team-b", sets: [] },
+          { id: "match-complete", division: "men", groupId: "group-a", round: 5, teamA: "team-b", teamB: "team-c", sets: [] },
+        );
+        workflowDraftCourts = [
+          ...workflowDraftCourts,
+          { id: "court-b", name: "B", recorderName: "" },
+        ];
+        workflowDraftAssignments = [
+          ...workflowDraftAssignments,
+          { matchKey: "match-hidden", courtId: "court-b", courtOrder: 1, matchType: "prelim", publicStatus: "scheduled" },
+          { matchKey: "match-complete", courtId: "court-b", courtOrder: 2, matchType: "prelim", publicStatus: "completed" },
+        ];
+        reviewWorkflows = new Map([
+          ["match-complete", { draftState: "approved" }],
+        ]);
+        workflowPhaseFilter = "final";
+        workflowDraftCourtSwaps = [];
+        reviewAssignments = workflowDraftAssignments.map((assignment) => ({ ...assignment }));
+        reviewCourts = new Map(workflowDraftCourts.map((court) => [court.id, { ...court }]));
+        swapWorkflowCourts("court-a", "court-b");
+        const validSwap = workflowCourtSwapsMatchSavedPlan();
+        const moved = workflowDraftAssignments[0];
+        const originalCourt = moved.courtId;
+        moved.courtId = null;
+        const rejectsMixedAssignment = !workflowCourtSwapsMatchSavedPlan();
+        moved.courtId = originalCourt;
+        const originalName = workflowDraftCourts[0].name;
+        workflowDraftCourts[0].name = "변경";
+        const rejectsMixedCourtSettings = !workflowCourtSwapsMatchSavedPlan();
+        workflowDraftCourts[0].name = originalName;
+        return {
+          validSwap,
+          rejectsMixedAssignment,
+          rejectsMixedCourtSettings,
+          assignments: workflowDraftAssignments.map((assignment) => [
+            assignment.matchKey, assignment.courtId, assignment.courtOrder,
+          ]),
+          dirty: workflowDirty,
+          phase: workflowPhaseFilter,
+        };
+      },
+      boardSetup() {
+        renderCourtBoard = originalRenderCourtBoard;
+        allGroups = [];
+        allTeams = [];
+        allPrelimMatches = [];
+        workflowDraftAssignments = [
+          { matchKey: "board-a", label: "경기 A", teams: "A팀 · B팀", matchType: "final", courtId: "court-a", courtOrder: 1, publicStatus: "scheduled" },
+          { matchKey: "board-b", label: "경기 B", teams: "C팀 · D팀", matchType: "final", courtId: "court-a", courtOrder: 2, publicStatus: "scheduled" },
+          { matchKey: "board-c", label: "경기 C", teams: "E팀 · F팀", matchType: "final", courtId: "court-a", courtOrder: 3, publicStatus: "scheduled" },
+          { matchKey: "board-d", label: "경기 D", teams: "G팀 · H팀", matchType: "final", courtId: "court-a", courtOrder: 4, publicStatus: "completed" },
+          { matchKey: "board-e", label: "경기 E", teams: "I팀 · J팀", matchType: "final", courtId: "court-b", courtOrder: 1, publicStatus: "scheduled" },
+        ];
+        workflowDraftCourts = [
+          { id: "court-a", name: "A", recorderName: "" },
+          { id: "court-b", name: "B", recorderName: "" },
+        ];
+        reviewAssignments = [];
+        reviewWorkflows = new Map([["board-d", { draftState: "approved" }]]);
+        workflowCompletedDetailsOpen.clear();
+        workflowCompletedDetailsOpen.set("court-a", true);
+        workflowPhaseFilter = "all";
+        workflowDirty = false;
+        renderCourtBoard();
+        const root = document.getElementById("allCourtBoard");
+        const cardFor = (matchKey) => [...root.querySelectorAll(".court-board-card")]
+          .find((card) => card.dataset.workflowMatchKey === matchKey);
+        const setGeometry = () => {
+          root.querySelectorAll(".court-board-list").forEach((list) => {
+            list.getBoundingClientRect = () => ({ top: 0, height: 500, bottom: 500 });
+            [...list.querySelectorAll(".court-board-card")].forEach((card, index) => {
+              card.getBoundingClientRect = () => ({
+                top: index * 100,
+                height: 80,
+                bottom: index * 100 + 80,
+              });
+            });
+          });
+        };
+        const transferFor = (matchKey) => {
+          let value = matchKey;
+          return {
+            types: ["text/plain"],
+            effectAllowed: "",
+            setData(type, data) {
+              if (type === "text/plain") value = data;
+            },
+            getData(type) {
+              return type === "text/plain" ? value : "";
+            },
+          };
+        };
+        const invoke = (node, type, event) => {
+          (node?.eventHandlers[type] || []).forEach((handler) => handler({
+            currentTarget: node,
+            target: node,
+            preventDefault() { this.defaultPrevented = true; },
+            stopPropagation() { this.propagationStopped = true; },
+            ...event,
+          }));
+        };
+        const orderFor = (courtId) => workflowDraftAssignments
+          .filter((assignment) => (assignment.courtId || null) === courtId)
+          .sort((left, right) => left.courtOrder - right.courtOrder)
+          .map((assignment) => assignment.matchKey);
+        const columnFor = (courtId) => root.querySelectorAll(".court-board-column")[
+          courtId === null ? 0 : courtId === "court-a" ? 1 : 2
+        ];
+        const drag = (sourceKey) => {
+          const source = cardFor(sourceKey);
+          const dataTransfer = transferFor(sourceKey);
+          invoke(source, "dragstart", { dataTransfer });
+          setGeometry();
+          return {
+            source,
+            over(targetKey, clientY) {
+              const target = cardFor(targetKey);
+              const event = { dataTransfer, clientY };
+              invoke(target, "dragover", event);
+              return {
+                indicator: root.querySelector(".court-board-drop-indicator"),
+                event,
+              };
+            },
+            drop(targetKey, clientY) {
+              const target = cardFor(targetKey);
+              const event = { dataTransfer, clientY };
+              invoke(target, "drop", event);
+              return event;
+            },
+            overColumn(courtId, clientY) {
+              const column = columnFor(courtId);
+              const list = column.querySelector(".court-board-list");
+              const event = { dataTransfer, clientY, target: list };
+              invoke(column, "dragover", event);
+              return {
+                indicator: root.querySelector(".court-board-drop-indicator"),
+                event,
+              };
+            },
+            dropColumn(courtId, clientY) {
+              const column = columnFor(courtId);
+              const list = column.querySelector(".court-board-list");
+              const event = { dataTransfer, clientY, target: list };
+              invoke(column, "drop", event);
+              return event;
+            },
+            end() {
+              invoke(source, "dragend", { dataTransfer });
+            },
+            order: orderFor,
+            cardFor,
+            root,
+          };
+        };
+        const restrict = () => {
+          root.querySelectorAll("[data-workflow-completed-court]").forEach((details) => {
+            if (details.dataset.workflowCompletedCourt === "court-a") details.open = false;
+          });
+          workflowCompletedDetailsOpen.delete("court-a");
+          renderCourtBoard();
+          return cardFor("board-a").draggable;
+        };
+        return { root, cardFor, setGeometry, drag, orderFor, restrict };
+      },
     };
   `;
   vm.runInNewContext(`${source}\n${bridge}`, context, { filename: "admin.js" });
   return {
     setup: () => context.__adminProjectionTest.setup(),
     moveDraft: () => context.__adminProjectionTest.moveDraft(),
+    swapDraft: () => context.__adminProjectionTest.swapDraft(),
+    board: () => context.__adminProjectionTest.boardSetup(),
   };
 }
 
@@ -2902,6 +3176,102 @@ check(
     && draftedProjectionUi.setupHintVisible
     && draftedProjectionUi.scoreHintVisible
     && draftedProjectionUi.hintText.includes("저장되지 않은 코트"),
+);
+const swappedProjectionUi = adminProjectionUi.swapDraft();
+check(
+  'whole-court swap save validation rejects mixed assignment and court setting edits',
+  swappedProjectionUi.validSwap
+    && swappedProjectionUi.rejectsMixedAssignment
+    && swappedProjectionUi.rejectsMixedCourtSettings,
+);
+check(
+  'whole-court swap includes filter-hidden and completed assignments in original court order',
+  swappedProjectionUi.phase === "final"
+    && swappedProjectionUi.dirty
+    && JSON.stringify(swappedProjectionUi.assignments) === JSON.stringify([
+      ["match-ab", "court-b", 2],
+      ["match-bc", "court-b", 3],
+      ["match-ca", "court-b", 1],
+      ["match-hidden", "court-a", 1],
+      ["match-complete", "court-a", 2],
+    ]),
+);
+
+const boardTop = adminProjectionUi.board();
+const topDrag = boardTop.drag("board-b");
+const topPreview = topDrag.over("board-a", 10);
+check(
+  "court planner previews the top-half insertion as the first full-court slot",
+  topPreview.indicator?.dataset.workflowDropPosition === "1"
+    && topPreview.indicator?.textContent.includes("A코트 · 1번째 슬롯")
+    && topPreview.indicator?.dataset.workflowDropPlacement === "before"
+    && topPreview.indicator?.textContent.includes("대상 경기 앞에 놓기")
+    && boardTop.cardFor("board-b").classList.contains("workflow-drag-source"),
+);
+topDrag.drop("board-a", 10);
+check(
+  "court planner drop matches the top-half preview and confirms the moved card",
+  JSON.stringify(boardTop.orderFor("court-a")) === JSON.stringify(["board-b", "board-a", "board-c", "board-d"])
+    && !boardTop.root.querySelector(".court-board-drop-indicator")
+    && boardTop.cardFor("board-b").classList.contains("workflow-drop-confirmed"),
+);
+
+const boardBottom = adminProjectionUi.board();
+const bottomDrag = boardBottom.drag("board-c");
+const bottomPreview = bottomDrag.over("board-b", 170);
+check(
+  "court planner previews the bottom-half insertion after the target while counting completed slots",
+  bottomPreview.indicator?.dataset.workflowDropPosition === "4"
+    && bottomPreview.indicator?.textContent.includes("A코트 · 4번째 슬롯")
+    && bottomPreview.indicator?.dataset.workflowDropPlacement === "after"
+    && bottomPreview.indicator?.textContent.includes("대상 경기 뒤에 놓기"),
+);
+bottomDrag.drop("board-b", 170);
+check(
+  "court planner bottom-half drop preserves the exact full-court insertion target",
+  JSON.stringify(boardBottom.orderFor("court-a")) === JSON.stringify(["board-a", "board-b", "board-d", "board-c"]),
+);
+
+const boardEnd = adminProjectionUi.board();
+const endDrag = boardEnd.drag("board-a");
+const endPreview = endDrag.overColumn("court-a", 999);
+check(
+  "court planner exposes the destination list end as a full-court slot",
+  endPreview.indicator?.dataset.workflowDropPosition === "4"
+    && endPreview.indicator?.textContent.includes("목록 마지막에 놓기"),
+);
+endDrag.dropColumn("court-a", 999);
+check(
+  "court planner appends a background drop to the same end slot it previewed",
+  JSON.stringify(boardEnd.orderFor("court-a")) === JSON.stringify(["board-b", "board-c", "board-d", "board-a"]),
+);
+
+const boardNoop = adminProjectionUi.board();
+const noopDrag = boardNoop.drag("board-b");
+const noopPreview = noopDrag.over("board-b", 10);
+noopDrag.drop("board-b", 10);
+check(
+  "court planner rejects self drops without an indicator or draft mutation",
+  !noopPreview.indicator
+    && JSON.stringify(boardNoop.orderFor("court-a")) === JSON.stringify(["board-a", "board-b", "board-c", "board-d"])
+    && !boardNoop.cardFor("board-b").classList.contains("workflow-drop-confirmed"),
+);
+
+const boardCancel = adminProjectionUi.board();
+const cancelDrag = boardCancel.drag("board-a");
+cancelDrag.over("board-b", 170);
+cancelDrag.end();
+check(
+  "court planner clears insertion feedback and source styling on cancellation",
+  !boardCancel.root.querySelector(".court-board-drop-indicator")
+    && !boardCancel.cardFor("board-a").classList.contains("workflow-drag-source"),
+);
+
+const boardRestricted = adminProjectionUi.board();
+check(
+  "court planner disables drag handlers when completed disclosure is collapsed",
+  boardRestricted.restrict() === false
+    && !boardRestricted.cardFor("board-a").eventHandlers.dragover,
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);

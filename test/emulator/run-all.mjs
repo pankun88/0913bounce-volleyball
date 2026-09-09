@@ -1,6 +1,7 @@
 import { runRulesSuite } from './rules.test.mjs';
 import { runFunctionsSuite } from './functions.test.mjs';
 import { runPublicScheduleSuite } from './public-schedule.test.mjs';
+import { runCourtSwapSuite } from './court-swap.mjs';
 import { PROJECT_ID } from './fixtures.mjs';
 
 const required = Object.freeze({ FIREBASE_AUTH_EMULATOR_HOST: '9099', FIRESTORE_EMULATOR_HOST: '8080', FIREBASE_EMULATOR_HUB: '4400' });
@@ -21,4 +22,5 @@ checkEnvironment();
 await runRulesSuite();
 await runFunctionsSuite();
 await runPublicScheduleSuite();
+await runCourtSwapSuite();
 console.log('demo-bounce-volleyball emulator release gate passed');
