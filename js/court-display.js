@@ -149,7 +149,7 @@ export function projectPrelimCourtSchedule(matches, assignments, courts) {
           courtId,
           courtName,
           courtOrder,
-          label: `${formatCourtName(courtName)} · 전체 ${courtOrder}번째`,
+          label: `${formatCourtName(courtName)} · ${courtOrder}라운드`,
           shortLabel: `${courtName}·${courtOrder}`,
         },
       };

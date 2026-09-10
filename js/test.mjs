@@ -258,10 +258,10 @@ check(
   ]),
 );
 check(
-  'projection labels use normalized court name and absolute slot',
-  prelimProjection[0].label === 'A코트 · 전체 1번째'
+  'projection labels use normalized court name and per-court round',
+  prelimProjection[0].label === 'A코트 · 1라운드'
     && prelimProjection[0].shortLabel === 'A·1'
-    && prelimProjection[2].label === 'A코트 · 전체 5번째',
+    && prelimProjection[2].label === 'A코트 · 5라운드',
 );
 check(
   'projection does not mutate matches or assignments',
@@ -399,7 +399,7 @@ check(
 check(
   'ring label text and titles are safe strings',
   ringLabels.every((item) => typeof item.text === 'string' && typeof item.title === 'string')
-    && ringLabels[0].title === 'A코트 · 전체 5번째',
+    && ringLabels[0].title === 'A코트 · 5라운드',
 );
 const shuffledUnassignedMatches = [
   { id: 'z-unassigned', round: 2 },
@@ -419,7 +419,7 @@ const partialRingLabels = getPrelimRingEdgeLabels([null, 'b'], [
     courtId: 'court-a',
     courtName: 'A',
     courtOrder: 1,
-    label: 'A코트 · 전체 1번째',
+    label: 'A코트 · 1라운드',
     shortLabel: 'A·1',
   },
 ]);
@@ -435,7 +435,7 @@ check(
     match: { teamA: "", teamB: "b" },
     courtId: "court-a",
     courtOrder: 1,
-    label: "A코트 · 전체 1번째",
+    label: "A코트 · 1라운드",
     shortLabel: "A·1",
   }])[0].text === "—",
 );
@@ -2518,6 +2518,22 @@ check(
 );
 
 // ---- admin preliminary projection UI ----
+const adminStyleSource = fs.readFileSync(new URL("../css/style.css", import.meta.url), "utf8");
+check(
+  "preliminary rows use two logical desktop columns after badge removal",
+  adminStyleSource.includes(
+    ".prelim-match-row {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) auto;",
+  ),
+);
+check(
+  "preliminary rows collapse to one usable column on mobile",
+  adminStyleSource.includes(
+    "@media (max-width: 640px) {\n  .prelim-match-row {\n    grid-template-columns: minmax(0, 1fr);",
+  )
+    && adminStyleSource.includes(
+      ".prelim-court-control {\n    grid-column: 1 / -1;\n    grid-template-columns: auto minmax(0, 1fr);",
+    ),
+);
 function createAdminProjectionHarness() {
   const elements = new Map();
   const listeners = new Map();
@@ -3039,6 +3055,8 @@ function createAdminProjectionHarness() {
       return {
         setupIds: setupRows.map((row) => row.dataset.prelimMatchRow),
         scoreIds: scoreRows.map((row) => row.dataset.prelimMatchRow),
+        setupRowChildren: setupRows[0]?.children.map((child) => child.className) || [],
+        setupCourtControlChildren: setupRows[0]?.children[1]?.children.map((child) => child.tagName) || [],
         setupExecution: setupRows.map((row) => row.querySelector("[data-prelim-execution-label]")?.textContent),
         scoreExecution: scoreRows.map((row) => row.querySelector("[data-prelim-execution-label]")?.textContent),
         setupRing: projectionRingLabels("prelimSetupGroups"),
@@ -3123,7 +3141,7 @@ function createAdminProjectionHarness() {
           phase: workflowPhaseFilter,
         };
       },
-      boardSetup() {
+      boardSetup(mixed = false) {
         renderCourtBoard = originalRenderCourtBoard;
         allGroups = [];
         allTeams = [];
@@ -3145,6 +3163,49 @@ function createAdminProjectionHarness() {
         workflowCompletedDetailsOpen.set("court-a", true);
         workflowPhaseFilter = "all";
         workflowDirty = false;
+        if (mixed) {
+          activeDivision = "men";
+          allPrelimMatches = [
+            {
+              id: "board-prelim-men",
+              division: "men",
+              groupId: "group-men",
+              round: 1,
+              teamA: "men-a",
+              teamB: "men-b",
+            },
+            {
+              id: "board-prelim-women",
+              division: "women",
+              groupId: "group-women",
+              round: 2,
+              teamA: "women-a",
+              teamB: "women-b",
+            },
+          ];
+          prelimMatches = allPrelimMatches.filter((match) => match.division === activeDivision);
+          workflowDraftAssignments = [
+            {
+              matchKey: "board-prelim-men",
+              matchType: "prelim",
+              division: "men",
+              courtId: "court-a",
+              courtOrder: 1,
+              publicStatus: "scheduled",
+              teams: "남자 A팀 · 남자 B팀",
+            },
+            {
+              matchKey: "board-prelim-women",
+              matchType: "prelim",
+              division: "women",
+              courtId: "court-a",
+              courtOrder: 2,
+              publicStatus: "scheduled",
+              teams: "여자 A팀 · 여자 B팀",
+            },
+          ];
+          reviewWorkflows = new Map();
+        }
         renderCourtBoard();
         const root = document.getElementById("allCourtBoard");
         const cardFor = (matchKey) => [...root.querySelectorAll(".court-board-card")]
@@ -3245,7 +3306,19 @@ function createAdminProjectionHarness() {
           renderCourtBoard();
           return cardFor("board-a").draggable;
         };
-        return { root, cardFor, setGeometry, drag, orderFor, restrict };
+        return {
+          root,
+          cardFor,
+          setGeometry,
+          drag,
+          orderFor,
+          restrict,
+          move: (matchKey, courtId) => {
+            setMatchCourt(matchKey, courtId);
+            return cardFor(matchKey)?.children[0]?.textContent || "";
+          },
+          matches: () => allPrelimMatches.map((match) => ({ ...match })),
+        };
       },
     };
   `;
@@ -3254,7 +3327,7 @@ function createAdminProjectionHarness() {
     setup: () => context.__adminProjectionTest.setup(),
     moveDraft: () => context.__adminProjectionTest.moveDraft(),
     swapDraft: () => context.__adminProjectionTest.swapDraft(),
-    board: () => context.__adminProjectionTest.boardSetup(),
+    board: (mixed) => context.__adminProjectionTest.boardSetup(mixed),
   };
 }
 
@@ -3264,9 +3337,13 @@ check(
   'admin setup and score views initially share projected court execution order',
   JSON.stringify(savedProjectionUi.setupIds) === JSON.stringify(['match-ca', 'match-bc', 'match-ab'])
     && JSON.stringify(savedProjectionUi.scoreIds) === JSON.stringify(savedProjectionUi.setupIds)
+    && JSON.stringify(savedProjectionUi.setupRowChildren) === JSON.stringify([
+      "prelim-matchup", "prelim-court-control",
+    ])
+    && JSON.stringify(savedProjectionUi.setupCourtControlChildren) === JSON.stringify(["SPAN", "SELECT"])
     && JSON.stringify(savedProjectionUi.setupExecution) === JSON.stringify(savedProjectionUi.scoreExecution)
-    && savedProjectionUi.setupExecution[0] === 'A코트 · 전체 1번째'
-    && savedProjectionUi.setupExecution[2] === 'A코트 · 전체 5번째',
+    && savedProjectionUi.setupExecution[0] === 'A코트 · 1라운드'
+    && savedProjectionUi.setupExecution[2] === 'A코트 · 5라운드',
 );
 check(
   'saved planner projection keeps preliminary hints hidden',
@@ -3308,6 +3385,29 @@ check(
       ["match-hidden", "court-a", 1],
       ["match-complete", "court-a", 2],
     ]),
+);
+
+const mixedDivisionBoard = adminProjectionUi.board(true);
+check(
+  "unified board projects an opposite-division preliminary assignment",
+  mixedDivisionBoard.cardFor("board-prelim-women")?.children[0]?.textContent === "A코트 · 2라운드"
+    && mixedDivisionBoard.cardFor("board-prelim-men")?.children[0]?.textContent === "A코트 · 1라운드",
+);
+const mixedWomenMatchesBefore = JSON.stringify(mixedDivisionBoard.matches());
+mixedDivisionBoard.move("board-prelim-men", "court-a");
+check(
+  "unified board refreshes preliminary round labels after a draft reorder",
+  mixedDivisionBoard.cardFor("board-prelim-women")?.children[0]?.textContent === "A코트 · 1라운드",
+);
+const movedMixedWomen = mixedDivisionBoard.move("board-prelim-women", "court-b");
+check(
+  "unified board reflects a draft court move in the preliminary execution label",
+  movedMixedWomen === "B코트 · 1라운드"
+    && JSON.stringify(mixedDivisionBoard.matches()) === mixedWomenMatchesBefore,
+);
+check(
+  "unified board keeps an explicit unassigned fallback after a draft removal",
+  mixedDivisionBoard.move("board-prelim-women", null) === "미배정",
 );
 
 const boardTop = adminProjectionUi.board();

@@ -1361,11 +1361,6 @@ function structuralPrelimMatches(matches) {
   ));
 }
 
-function structuralPrelimNumber(match, fallback = 1) {
-  const round = Number(match?.round);
-  return Number.isFinite(round) && round > 0 ? round : fallback;
-}
-
 function prelimScheduleRow(matchKey, schedule = prelimCourtSchedule()) {
   return schedule.find((row) => row.match?.id === matchKey) || null;
 }
@@ -2060,7 +2055,13 @@ function handleWorkflowCardDrop(event, card, option, column, courtId, courtName)
   commitWorkflowDragDrop(target, sourceMatchKey);
 }
 
-function createWorkflowBoardCard(option, courtId, completed, dragEnabled) {
+function createWorkflowBoardCard(
+  option,
+  courtId,
+  completed,
+  dragEnabled,
+  prelimSchedule = prelimCourtSchedule(allPrelimMatches),
+) {
   const assignment = assignmentFor(option.matchKey);
   const card = document.createElement("article");
   card.className = `court-board-card${completed ? " is-completed" : ""}`;
@@ -2101,18 +2102,14 @@ function createWorkflowBoardCard(option, courtId, completed, dragEnabled) {
     ? allPrelimMatches.find((match) => match.id === option.matchKey)
     : null;
   const boardLabel = document.createElement("b");
+  // 예선 카드는 구조상 "대진 N" 대신 코트별 배정 위치(코트·N라운드)를 그대로 보여준다.
+  const executionLabel = prelimMatch
+    ? prelimScheduleRow(option.matchKey, prelimSchedule)?.label
+    : null;
   boardLabel.textContent = prelimMatch
-    ? `대진 ${structuralPrelimNumber(prelimMatch)}`
+    ? (executionLabel || "순서 미배정")
     : option.label;
-  const executionLabel = prelimMatch && prelimScheduleRow(option.matchKey)?.label;
-  if (executionLabel) {
-    const execution = document.createElement("span");
-    execution.className = "workflow-execution-label";
-    execution.textContent = executionLabel;
-    card.append(boardLabel, execution);
-  } else {
-    card.appendChild(boardLabel);
-  }
+  card.appendChild(boardLabel);
   const teams = document.createElement("span");
   teams.textContent = option.teams;
   const status = document.createElement("span");
@@ -2167,6 +2164,7 @@ function renderCourtBoard() {
     });
   }
   const options = workflowDraftAssignments;
+  const prelimSchedule = prelimCourtSchedule(allPrelimMatches);
   captureWorkflowCompletedDetails();
   syncWorkflowPhaseFilter();
   const dragEnabled = workflowBoardDragEnabled();
@@ -2281,7 +2279,7 @@ function renderCourtBoard() {
     const list = document.createElement("div");
     list.className = "court-board-list";
     active.forEach((option) => {
-      list.appendChild(createWorkflowBoardCard(option, courtId, false, dragEnabled));
+      list.appendChild(createWorkflowBoardCard(option, courtId, false, dragEnabled, prelimSchedule));
     });
     if (!list.children.length) list.innerHTML = '<p class="workflow-empty">경기가 없습니다.</p>';
     column.appendChild(list);
@@ -2301,7 +2299,7 @@ function renderCourtBoard() {
       const completedList = document.createElement("div");
       completedList.className = "court-board-completed-list";
       completed.forEach((option) => {
-        completedList.appendChild(createWorkflowBoardCard(option, courtId, true, false));
+        completedList.appendChild(createWorkflowBoardCard(option, courtId, true, false, prelimSchedule));
       });
       details.append(summary, completedList);
       column.appendChild(details);
@@ -4248,7 +4246,7 @@ function renderPrelimViews() {
   syncPrelimWorkflowHints();
 }
 
-function createPrelimMatchup(match, scheduleRow, structuralNumber) {
+function createPrelimMatchup(match, scheduleRow) {
   const matchup = document.createElement("span");
   matchup.className = "prelim-matchup";
   const line = document.createElement("span");
@@ -4259,14 +4257,6 @@ function createPrelimMatchup(match, scheduleRow, structuralNumber) {
   versus.textContent = "VS";
   const teamB = document.createElement("strong");
   teamB.textContent = teamName(match.teamB);
-  if (structuralNumber != null) {
-    const order = document.createElement("span");
-    order.className = "match-order-badge";
-    order.dataset.prelimStructuralOrder = String(structuralNumber);
-    order.textContent = `대진 ${structuralNumber}`;
-    order.title = `구조상 대진 ${structuralNumber}`;
-    line.append(order);
-  }
   line.append(teamA, versus, teamB);
   const execution = document.createElement("span");
   execution.className = "prelim-execution-label";
@@ -4301,12 +4291,6 @@ function appendPrelimScheduleLanes(parent, groupId, groupMatches, rowFactory) {
   const scheduleById = new Map(schedule.map((row) => [row.match.id, row]));
   const scheduleIndex = new Map(schedule.map((row, index) => [row.match.id, index]));
   const knownCourtIds = new Set(workflowDraftCourts.map((court) => court.id));
-  const structuralNumbers = new Map(
-    structuralPrelimMatches(groupMatches).map((match, index) => [
-      match.id,
-      structuralPrelimNumber(match, index + 1),
-    ]),
-  );
   const lanes = createPrelimCourtLanes(groupId);
   const rowsByLane = new Map();
   groupMatches.forEach((match) => {
@@ -4332,11 +4316,7 @@ function appendPrelimScheduleLanes(parent, groupId, groupMatches, rowFactory) {
           - (scheduleIndex.get(right.match.id) ?? Number.POSITIVE_INFINITY)
       ))
       .forEach(({ match, scheduleRow }) => {
-        laneList.appendChild(rowFactory(
-          match,
-          scheduleRow,
-          structuralNumbers.get(match.id) || 1,
-        ));
+        laneList.appendChild(rowFactory(match, scheduleRow));
       });
   });
   lanes.querySelectorAll("[data-prelim-court-lane]").forEach((lane) => {
@@ -4446,17 +4426,13 @@ function renderPrelimSetupGroups() {
     guidance.textContent = PRELIM_ORDER_GUIDANCE;
     box.appendChild(guidance);
     if (groupMatches.length) {
-      appendPrelimScheduleLanes(box, g.id, groupMatches, (m, scheduleRow, structuralNumber) => {
+      appendPrelimScheduleLanes(box, g.id, groupMatches, (m, scheduleRow) => {
         const row = document.createElement("div");
         row.className = "prelim-match-row";
         row.dataset.prelimMatchRow = m.id;
         row.dataset.prelimMatchId = m.id;
-        const matchup = createPrelimMatchup(m, scheduleRow, null);
-        const order = document.createElement("span");
-        order.className = "prelim-match-order";
-        order.dataset.prelimStructuralOrder = String(structuralNumber);
-        order.textContent = `대진 ${structuralNumber}`;
-        row.append(order, matchup);
+        const matchup = createPrelimMatchup(m, scheduleRow);
+        row.append(matchup);
         const courtControl = document.createElement("label");
         courtControl.className = "prelim-court-control";
         const courtLabel = document.createElement("span");
@@ -4550,7 +4526,7 @@ function renderPrelimGroups() {
       empty.textContent = "생성된 경기가 없습니다. 대회설정 탭의 '예선 대진 방식·생성'에서 대진을 생성하세요.";
       card.appendChild(empty);
     } else {
-      appendPrelimScheduleLanes(card, g.id, groupMatches, (m, scheduleRow, structuralNumber) => {
+      appendPrelimScheduleLanes(card, g.id, groupMatches, (m, scheduleRow) => {
         const row = document.createElement("div");
         row.className = "prelim-score-row";
         row.dataset.prelimMatchRow = m.id;
@@ -4566,7 +4542,7 @@ function renderPrelimGroups() {
           ? submittedWorkflow.submittedSnapshot.sets
           : [];
         const pendingScoreText = pendingSets.map((s) => `${s.a}:${s.b}`).join(" / ");
-        const left = createPrelimMatchup(m, scheduleRow, structuralNumber);
+        const left = createPrelimMatchup(m, scheduleRow);
         if (scoreText) {
           const score = document.createElement("span");
           score.className = "prelim-score-text";

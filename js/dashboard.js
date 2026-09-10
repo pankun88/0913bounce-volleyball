@@ -807,11 +807,6 @@ function createPublicPrelimMatchRow(match, scheduleRow, structuralNumber, state)
     row.dataset.prelimCourtOrder = String(scheduleRow.courtOrder);
   }
 
-  const order = document.createElement("span");
-  order.className = "prelim-match-order";
-  order.textContent = `대진 ${structuralNumber}`;
-  order.title = `구조상 대진 ${structuralNumber}`;
-
   const matchup = document.createElement("span");
   matchup.className = "prelim-matchup";
   const line = document.createElement("span");
@@ -842,7 +837,7 @@ function createPublicPrelimMatchRow(match, scheduleRow, structuralNumber, state)
     execution.textContent = scheduleRow?.label || "미배정";
     matchup.appendChild(execution);
   }
-  row.append(order, matchup);
+  row.append(matchup);
 
   const evaluated = evaluatePrelimMatch(match.sets || []);
   const result = document.createElement("span");
