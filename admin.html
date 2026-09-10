@@ -28,7 +28,7 @@
       <button class="btn ghost small" id="exportCsvBtn" title="예선·본선 전체 결과를 CSV 파일로 다운로드">CSV</button>
       <button class="btn ghost small" id="changePasswordBtn" title="비밀번호 변경">비밀번호 변경</button>
       <button class="btn ghost small" id="logoutBtn" title="로그아웃">로그아웃</button>
-      <a class="btn ghost small" href="dashboard.html" target="_blank">대시보드 열기</a>
+      <a class="btn ghost small" id="adminAudienceDashboardLink" href="dashboard.html?display=venue&amp;tab=prelim" target="_blank" title="저장된 경기장 송출 설정(자동 교대·고정 부문)을 사용하는 관객 대시보드">관객 대시보드 열기</a>
     </div>
   </div>
 
@@ -146,9 +146,10 @@
               </select>
             </label>
             <button class="btn primary" id="saveVenueDisplayBtn">송출 설정 저장</button>
-            <a class="btn" href="dashboard.html?display=venue&amp;tab=prelim" target="_blank">경기장 화면 열기</a>
+            <a class="btn" id="settingsAudienceDashboardLink" href="dashboard.html?display=venue&amp;tab=prelim" target="_blank" title="저장된 경기장 송출 설정(자동 교대·고정 부문)을 사용하는 관객 대시보드">관객 대시보드 열기</a>
+            <a class="btn ghost" id="manualAudienceDashboardLink" href="dashboard.html" target="_blank" title="부문을 직접 선택하는 수동 관람 화면">수동 관람 화면 열기</a>
           </div>
-          <p class="empty-hint" style="margin:8px 0 0;">경기장 화면은 한 번에 한 부문을 크게 표시하며, 자동 교대는 기본 15초입니다. 이 설정은 모든 경기장 화면에 공통 적용되고, 전환 타이머는 화면마다 독립적으로 동작합니다. <b>경기장 화면 열기</b>로 저장한 자동 교대·고정 설정을 사용하세요. 화면 두 대에 남녀부를 각각 표시하려면 일반 대시보드에서 부문을 각각 선택하세요(일반 대시보드는 수동 전환).</p>
+          <p class="empty-hint" style="margin:8px 0 0;">상단과 이 설정의 <b>관객 대시보드 열기</b> 버튼은 같은 주소에서 저장된 자동 교대·고정 설정을 사용합니다. 15초는 부문 교대 간격이며 송출 지연이 아닙니다. 전환 타이머는 화면마다 독립적으로 동작합니다. 화면마다 남녀부를 각각 선택하려면 <b>수동 관람 화면 열기</b>를 사용해 각 화면에서 부문을 선택하세요.</p>
         </div>
 
         <div class="card">

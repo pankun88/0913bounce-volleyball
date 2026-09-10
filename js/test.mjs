@@ -2024,6 +2024,100 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
   };
 }
 
+const adminHtml = fs.readFileSync(new URL('../admin.html', import.meta.url), 'utf8');
+function readAdminAudienceLink(id) {
+  const anchor = adminHtml.match(new RegExp(`<a\\b[^>]*\\bid="${id}"[^>]*>[^<]*</a>`, 'm'))?.[0];
+  assert.ok(anchor, `admin audience link exists: ${id}`);
+  const href = anchor.match(/\bhref="([^"]+)"/)?.[1];
+  assert.ok(href, `admin audience link has href: ${id}`);
+  return {
+    href: href.replace(/&amp;/g, '&'),
+    label: anchor.match(/>([^<]*)<\/a>/)?.[1]?.trim() || '',
+    title: anchor.match(/\btitle="([^"]+)"/)?.[1] || '',
+  };
+}
+
+const primaryAudienceLinks = [
+  { id: 'adminAudienceDashboardLink', ...readAdminAudienceLink('adminAudienceDashboardLink') },
+  { id: 'settingsAudienceDashboardLink', ...readAdminAudienceLink('settingsAudienceDashboardLink') },
+];
+const dashboardBaseUrl = 'https://example.test/';
+const primaryAudienceUrls = primaryAudienceLinks.map(({ href }) => new URL(href, dashboardBaseUrl));
+check(
+  'admin primary audience links share the saved venue URL',
+  primaryAudienceLinks.every(({ href }) => href === 'dashboard.html?display=venue&tab=prelim')
+    && new Set(primaryAudienceLinks.map(({ href }) => href)).size === 1,
+);
+check(
+  'admin primary audience links use the consistent label and saved-settings title',
+  primaryAudienceLinks.every(({ label, title }) => (
+    label === '관객 대시보드 열기' && title.includes('저장된 경기장 송출 설정')
+  )),
+);
+
+for (const [{ id }, url] of primaryAudienceLinks.map((link, index) => [link, primaryAudienceUrls[index]])) {
+  const entry = createDashboardHarness(url.search);
+  let entryState = entry.state();
+  check(
+    `${id} venue entry starts a 15-second rotation`,
+    entryState.activeDivision === 'men'
+      && entryState.timerCount === 1
+      && entryState.countdown === '15초 후 전환',
+  );
+  entry.advance(14999);
+  entryState = entry.state();
+  check(
+    `${id} venue entry holds the starting division at the 15-second boundary`,
+    entryState.activeDivision === 'men' && entryState.countdown === '1초 후 전환',
+  );
+  entry.advance(1);
+  entryState = entry.state();
+  check(
+    `${id} venue entry rotates at the 15-second boundary`,
+    entryState.activeDivision === 'women' && entryState.countdown === '15초 후 전환',
+  );
+  entry.snapshot({ venueDisplay: { mode: 'women', intervalSeconds: 15 } });
+  entryState = entry.state();
+  check(
+    `${id} venue entry honors a fixed saved division without a timer`,
+    entryState.activeDivision === 'women' && entryState.timerCount === 0 && entryState.progressHidden,
+  );
+  entry.snapshot({ venueDisplay: { mode: 'auto', intervalSeconds: 20 } });
+  entryState = entry.state();
+  check(
+    `${id} venue entry honors the configured auto interval`,
+    entryState.activeDivision === 'women'
+      && entryState.timerCount === 1
+      && entryState.countdown === '20초 후 전환',
+  );
+  entry.advance(19999);
+  check(
+    `${id} configured interval keeps the current division until its boundary`,
+    entry.state().activeDivision === 'women' && entry.state().countdown === '1초 후 전환',
+  );
+  entry.advance(1);
+  check(
+    `${id} configured interval rotates at its boundary`,
+    entry.state().activeDivision === 'men' && entry.state().countdown === '20초 후 전환',
+  );
+}
+
+const manualAudienceLink = readAdminAudienceLink('manualAudienceDashboardLink');
+const manualAudienceUrl = new URL(manualAudienceLink.href, dashboardBaseUrl);
+check(
+  'admin settings keeps a separate manual audience link',
+  manualAudienceLink.href === 'dashboard.html' && manualAudienceUrl.pathname === '/dashboard.html',
+);
+const manualAudience = createDashboardHarness(manualAudienceUrl.search);
+manualAudience.clickDivision('women');
+const manualAudienceState = manualAudience.state();
+check(
+  'manual audience link keeps division selection without a venue timer',
+  manualAudienceState.activeDivision === 'women'
+    && manualAudienceState.timerCount === 0
+    && manualAudienceState.venueHidden,
+);
+
 const venue = createDashboardHarness();
 let venueState = venue.state();
 check('venue auto starts without cycleStartedAt or server clock', venueState.activeDivision === 'men' && venueState.timerCount === 1 && venueState.countdown === '15초 후 전환');
