@@ -193,7 +193,7 @@
       <div class="recorder-runbook" aria-label="기록관 접근 코드 운영 안내">
         <strong>운영 안내</strong>
         <ul>
-          <li><b>기기 분실·계정 문제:</b> 해당 계정만 아래 목록에서 폐기한 뒤 새 코드로 다시 권한을 받게 하세요. 다른 기록관의 권한은 유지됩니다.</li>
+          <li><b>기기 분실·계정 문제:</b> 이메일·이름을 확인하고 해당 계정의 <b>접근 권한 취소</b>를 누르세요. 로그인 계정 자체를 삭제하지 않으며 다른 기록관의 권한은 유지됩니다. 취소한 계정을 다시 허용하려면 접근 코드를 재발급해야 하며, 재발급 시에는 모든 기록관이 새 코드로 권한을 다시 받아야 합니다.</li>
           <li><b>코드가 넓게 유출됨:</b> 접근 코드를 재발급하거나 폐기해 모든 기존 권한을 무효화하세요. 입력 중인 경기는 아래 검수 목록의 <b>잠금 강제 해제</b>로 별도로 처리하며, 코드 작업이 잠금을 자동 해제하지 않습니다.</li>
         </ul>
       </div>
@@ -203,6 +203,11 @@
       </div>
       <div id="recorderGrantStatus" class="empty-hint" role="status" aria-live="polite">권한 목록을 불러오는 중입니다.</div>
       <div id="recorderGrantList" class="recorder-grant-list" aria-live="polite" aria-label="기록관 계정별 접근 권한 목록"></div>
+      <details id="recorderGrantHistory" class="recorder-grant-history">
+        <summary id="recorderGrantHistorySummary">이력 (0건)</summary>
+        <div id="recorderGrantHistoryList" class="recorder-grant-list" aria-label="기록관 접근 권한 이력"></div>
+        <button class="btn small" id="recorderGrantHistoryMoreBtn" type="button" hidden>이력 더 보기</button>
+      </details>
     </div>
     <div class="card">
       <h2>제출 결과 검수 <button type="button" class="help-trigger" aria-label="제출 결과 검수 설명" data-help="기록관이 제출한 결과를 승인·반려합니다. 검수 대기 항목은 현재 코트 진행 순서와 별도로 표시됩니다.">설명</button></h2>

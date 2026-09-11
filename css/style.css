@@ -1298,9 +1298,13 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 .recorder-grant-header h3 { margin: 0; font-size: 15px; }
 .recorder-grant-list { display: grid; gap: 8px; margin-top: 8px; }
 .recorder-grant-card {
-  display: grid; grid-template-columns: minmax(120px, 1fr) auto minmax(220px, 2fr) auto;
+  display: grid; grid-template-columns: minmax(180px, 1fr) auto minmax(220px, 2fr) minmax(100px, auto) auto;
   align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px;
 }
+.recorder-grant-identity { display: grid; gap: 2px; min-width: 0; }
+.recorder-grant-email { overflow-wrap: anywhere; }
+.recorder-grant-display-name { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.recorder-grant-account-deleted { color: #9b2626; font-size: 12px; font-weight: 700; }
 .recorder-uid {
   border: 0; background: transparent; padding: 0; text-align: left; font: inherit;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--red-dark); cursor: pointer;
@@ -1309,6 +1313,16 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 .recorder-grant-details { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; }
 .recorder-grant-details span { display: grid; gap: 2px; }
 .recorder-grant-details small { color: var(--muted); }
+.recorder-grant-account { min-width: 0; font-size: 12px; }
+.recorder-grant-account summary { color: var(--muted); cursor: pointer; }
+.recorder-grant-account-body { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
+.recorder-grant-account-body small { color: var(--muted); }
+.recorder-grant-history {
+  margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px;
+}
+.recorder-grant-history > summary { cursor: pointer; font-weight: 700; }
+.recorder-grant-history .recorder-grant-list { margin-top: 10px; }
+.recorder-grant-history > .btn { margin-top: 10px; }
 .recorder-grant-state {
   white-space: nowrap; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700;
 }
@@ -1316,9 +1330,10 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 .recorder-grant-state.expired { color: #795b00; background: #fff2c2; }
 .recorder-grant-state.revoked { color: #9b2626; background: #fde6e6; }
 
-@media (max-width: 640px) {
+@media (max-width: 900px) {
   .recorder-grant-card { grid-template-columns: 1fr auto; }
-  .recorder-grant-details { grid-column: 1 / -1; }
+  .recorder-grant-details,
+  .recorder-grant-account { grid-column: 1 / -1; }
   .recorder-grant-card .btn { grid-column: 1 / -1; width: 100%; }
 }
 

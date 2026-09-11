@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+import { getAuth } from 'firebase-admin/auth';
+import { getFirestore, FieldPath, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { HttpsError } from 'firebase-functions/v2/https';
 import {
   activateDependencyEntries, consumeCurrentAndAdvance, planCorrectionReplay,
@@ -696,18 +697,37 @@ export async function revokeRecorderAccessCode(request) {
 }
 export async function listRecorderGrants(request) {
   await admin(request, request.data);
-  const [grants, config, tournament] = await Promise.all([
-    root().collection('recorderGrants').get(),
+  const cursor = request.data?.cursor;
+  if (cursor !== undefined && (
+    typeof cursor !== 'string'
+    || !cursor
+    || cursor.length > 128
+    || cursor.includes('/')
+  )) {
+    throw new HttpsError('invalid-argument', 'Invalid grant cursor.');
+  }
+  let query = root().collection('recorderGrants')
+    .orderBy(FieldPath.documentId())
+    .limit(101);
+  if (cursor !== undefined) query = query.startAfter(cursor);
+  const [grantPage, config, tournament] = await Promise.all([
+    query.get(),
     ref('recorderAccess', 'config').get(),
     root().get(),
   ]);
+  const pageDocs = grantPage.docs.slice(0, 100);
+  const authUsers = pageDocs.length
+    ? await getAuth().getUsers(pageDocs.map((snap) => ({ uid: snap.id })))
+    : { users: [] };
+  const usersByUid = new Map(authUsers.users.map((user) => [user.uid, user]));
   const access = config.data();
   const globallyEnabled = tournament.data()?.maintenance?.enabled !== true
     && tournament.data()?.recorderFeatureEnabled === true
     && config.exists
     && access.enabled === true;
-  return { grants: grants.docs.slice(0, 500).map((snap) => {
+  return { grants: pageDocs.map((snap) => {
     const value = snap.data();
+    const uid = snap.id;
     const expiresAt = value.expiresAt?.toMillis?.() || null;
     const effectiveStatus = value.status === 'revoked'
       ? 'revoked'
@@ -718,16 +738,21 @@ export async function listRecorderGrants(request) {
           : value.version !== access.version
             ? 'superseded'
             : 'active';
+    const user = usersByUid.get(uid);
     return {
-      uid: value.uid,
+      uid,
       version: value.version,
       status: value.status,
       effectiveStatus,
       issuedAt: value.issuedAt?.toMillis?.() || null,
       lastUsedAt: value.lastUsedAt?.toMillis?.() || null,
       expiresAt,
+      revokedAt: value.revokedAt?.toMillis?.() ?? null,
+      email: typeof user?.email === 'string' ? user.email : null,
+      displayName: typeof user?.displayName === 'string' ? user.displayName : null,
+      accountDeleted: !user,
     };
-  }) };
+  }), nextCursor: grantPage.docs.length > 100 ? pageDocs[pageDocs.length - 1].id : null };
 }
 export async function revokeRecorderGrant(request) {
   const actor = await admin(request, request.data);

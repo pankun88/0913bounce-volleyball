@@ -2945,6 +2945,29 @@ function createAdminProjectionHarness() {
   ["prelimSetupGroups", "prelimGroups", "courtSettingsList", "allCourtBoard"].forEach((id) => {
     body.appendChild(document.getElementById(id));
   });
+  for (const [id, tag] of [
+    ["recorderGrantStatus", "div"],
+    ["recorderGrantList", "div"],
+    ["recorderGrantHistory", "details"],
+    ["recorderGrantHistorySummary", "summary"],
+    ["recorderGrantHistoryList", "div"],
+    ["recorderGrantHistoryMoreBtn", "button"],
+  ]) {
+    assert.match(adminHtml, new RegExp(`<${tag}\\b[^>]*\\bid="${id}"`));
+    const node = element(tag);
+    node.id = id;
+    elements.set(id, node);
+  }
+  body.append(
+    document.getElementById("recorderGrantStatus"),
+    document.getElementById("recorderGrantList"),
+    document.getElementById("recorderGrantHistory"),
+  );
+  document.getElementById("recorderGrantHistory").append(
+    document.getElementById("recorderGrantHistorySummary"),
+    document.getElementById("recorderGrantHistoryList"),
+    document.getElementById("recorderGrantHistoryMoreBtn"),
+  );
 
   function Option(text, value) {
     const option = element("option");
@@ -2969,6 +2992,8 @@ function createAdminProjectionHarness() {
     setItem(key, value) { this.values.set(key, String(value)); },
     removeItem(key) { this.values.delete(key); },
   };
+  let adminWorkflowCallableImpl = async () => ({});
+  let lastConfirmMessage = "";
   const renderRingDiagramForTest = (container, opts = {}) => {
     container.replaceChildren();
     const labels = Array.isArray(opts.edgeLabels) ? opts.edgeLabels : [];
@@ -2992,6 +3017,7 @@ function createAdminProjectionHarness() {
     setTimeout,
     clearTimeout,
     requestAnimationFrame: (callback) => callback(),
+    navigator: { clipboard: { writeText: async () => {} } },
     console,
     isFirebaseConfigured: true,
     db: {},
@@ -3047,7 +3073,11 @@ function createAdminProjectionHarness() {
     normalizeRingOrder,
     renderRingDiagram: renderRingDiagramForTest,
     orderExistingRoundRobinMatchIds: () => [],
-    adminWorkflowCallable: async () => ({}),
+    adminWorkflowCallable: (...args) => adminWorkflowCallableImpl(...args),
+    __setAdminWorkflowCallable: (fn) => {
+      adminWorkflowCallableImpl = fn;
+    },
+    __getConfirmMessage: () => lastConfirmMessage,
     getPlannerVisibleAdjacent,
     isPlannerMatchCompleted,
     movePlannerAssignment,
@@ -3070,7 +3100,10 @@ function createAdminProjectionHarness() {
     getPrelimRingEdgeLabels,
     projectPrelimCourtSchedule,
     TOURNAMENT_ID: "test",
-    confirm: () => true,
+    confirm: (message) => {
+      lastConfirmMessage = String(message || "");
+      return true;
+    },
     alert: () => {},
     prompt: () => "",
   };
@@ -3417,6 +3450,51 @@ function createAdminProjectionHarness() {
         };
       },
     };
+    globalThis.__adminGrantTest = {
+      setCallable(fn) {
+        globalThis.__setAdminWorkflowCallable(fn);
+      },
+      setAuth(uid) {
+        resetRecorderGrantAuth(uid);
+      },
+      setGrants(grants) {
+        recorderGrantsLoading = false;
+        recorderGrantsError = "";
+        recorderGrantsHistoryVisibleCount = 20;
+        recorderGrants = grants.map((grant) => ({ ...grant }));
+        renderRecorderGrants();
+      },
+      refresh() {
+        return refreshRecorderGrants();
+      },
+      render() {
+        renderRecorderGrants();
+      },
+      status() {
+        return document.getElementById("recorderGrantStatus").textContent;
+      },
+      activeCards() {
+        return [...document.getElementById("recorderGrantList").children];
+      },
+      historyCards() {
+        return [...document.getElementById("recorderGrantHistoryList").children];
+      },
+      historyMore() {
+        return document.getElementById("recorderGrantHistoryMoreBtn");
+      },
+      historyDetails() {
+        return document.getElementById("recorderGrantHistory");
+      },
+      revokeButton(kind, index = 0) {
+        const root = kind === "history"
+          ? document.getElementById("recorderGrantHistoryList")
+          : document.getElementById("recorderGrantList");
+        return root.children[index]?.querySelector(".btn.danger") || null;
+      },
+      confirmation() {
+        return globalThis.__getConfirmMessage();
+      },
+    };
   `;
   vm.runInNewContext(`${source}\n${bridge}`, context, { filename: "admin.js" });
   return {
@@ -3424,6 +3502,7 @@ function createAdminProjectionHarness() {
     moveDraft: () => context.__adminProjectionTest.moveDraft(),
     swapDraft: () => context.__adminProjectionTest.swapDraft(),
     board: (mixed) => context.__adminProjectionTest.boardSetup(mixed),
+    grant: context.__adminGrantTest,
   };
 }
 
@@ -3581,6 +3660,219 @@ check(
   "court planner disables drag handlers when completed disclosure is collapsed",
   boardRestricted.restrict() === false
     && !boardRestricted.cardFor("board-a").eventHandlers.dragover,
+);
+
+// ---- recorder grant access UI ----
+function grantFixture(overrides = {}) {
+  return {
+    uid: "uid-default",
+    version: 1,
+    status: "active",
+    effectiveStatus: "active",
+    issuedAt: 1000,
+    lastUsedAt: null,
+    expiresAt: 2000,
+    revokedAt: null,
+    email: "recorder@example.com",
+    displayName: "기록관",
+    accountDeleted: false,
+    ...overrides,
+  };
+}
+
+const adminGrantUi = createAdminProjectionHarness();
+adminGrantUi.grant.setAuth("admin-uid");
+adminGrantUi.grant.setGrants([
+  grantFixture({ uid: "uid-safe", email: "safe@example.com", displayName: "안전 기록관" }),
+]);
+const identityCard = adminGrantUi.grant.activeCards()[0];
+check(
+  "grant card uses email as primary identity and display name as secondary identity",
+  identityCard?.querySelector(".recorder-grant-email")?.textContent === "safe@example.com"
+    && identityCard?.querySelector(".recorder-grant-display-name")?.textContent === "안전 기록관",
+);
+check(
+  "grant UID is present only within the expandable account details",
+  identityCard?.querySelector(".recorder-grant-account")?.querySelector(".recorder-uid")?.textContent === "uid-safe"
+    && identityCard?.querySelector(".recorder-grant-identity")?.querySelector(".recorder-uid") === null,
+);
+const unsafeEmail = '<img src=x onerror="alert(1)">';
+adminGrantUi.grant.setGrants([
+  grantFixture({ uid: "uid-unsafe", email: unsafeEmail, displayName: "<b>이름</b>" }),
+]);
+const unsafeCard = adminGrantUi.grant.activeCards()[0];
+check(
+  "grant identity text is rendered safely without HTML interpolation",
+  unsafeCard?.querySelector(".recorder-grant-email")?.textContent === unsafeEmail
+    && unsafeCard?.querySelector("img") === null
+    && unsafeCard?.querySelector("b") === null,
+);
+adminGrantUi.grant.setGrants([
+  grantFixture({ uid: "uid-deleted", email: null, displayName: null, accountDeleted: true }),
+]);
+const deletedCard = adminGrantUi.grant.activeCards()[0];
+check(
+  "grant card labels missing email and deleted Auth account explicitly",
+  deletedCard?.querySelector(".recorder-grant-email")?.textContent === "이메일 정보 없음"
+    && deletedCard?.querySelector(".recorder-grant-account-deleted")?.textContent === "삭제된 로그인 계정",
+);
+
+adminGrantUi.grant.setGrants([
+  grantFixture({ uid: "uid-active" }),
+  grantFixture({ uid: "uid-expired", effectiveStatus: "expired" }),
+  grantFixture({ uid: "uid-revoked", status: "revoked", effectiveStatus: "revoked", revokedAt: 3000 }),
+]);
+check(
+  "active and history grants are separated with a collapsed history section and total",
+  adminGrantUi.grant.activeCards().length === 1
+    && adminGrantUi.grant.historyCards().length === 2
+    && !adminGrantUi.grant.historyDetails().open
+    && adminGrantUi.grant.historyDetails().querySelector("summary").textContent === "이력 (2건)",
+);
+adminGrantUi.grant.setGrants(Array.from({ length: 21 }, (_, index) => grantFixture({
+  uid: `uid-history-${index}`,
+  effectiveStatus: "expired",
+  issuedAt: index + 1,
+})));
+check(
+  "history initially renders in client pages of twenty",
+  adminGrantUi.grant.historyCards().length === 20
+    && adminGrantUi.grant.historyMore().hidden === false,
+);
+adminGrantUi.grant.historyMore().click();
+check(
+  "history more renders the next twenty-page increment",
+  adminGrantUi.grant.historyCards().length === 21
+    && adminGrantUi.grant.historyMore().hidden === true,
+);
+
+let grantCalls = [];
+adminGrantUi.grant.setCallable(async (name, data) => {
+  grantCalls.push([name, data]);
+  if (!data.cursor) {
+    return {
+      data: {
+        grants: [grantFixture({ uid: "uid-page-one", email: "one@example.com" })],
+        nextCursor: "uid-page-one",
+      },
+    };
+  }
+  return {
+    data: {
+      grants: [grantFixture({ uid: "uid-page-two", email: "two@example.com" })],
+      nextCursor: null,
+    },
+  };
+});
+await adminGrantUi.grant.refresh();
+check(
+  "grant refresh consumes every page and includes an active grant on the last page",
+  grantCalls.length === 2
+    && grantCalls[1][1].cursor === "uid-page-one"
+    && adminGrantUi.grant.activeCards().length === 2
+    && adminGrantUi.grant.status() === "2개 활성 접근 권한",
+);
+
+grantCalls = [];
+adminGrantUi.grant.setCallable(async (name, data) => {
+  grantCalls.push([name, data]);
+  if (!data.cursor) {
+    return {
+      data: {
+        grants: [grantFixture({ uid: "uid-before-failure" })],
+        nextCursor: "uid-before-failure",
+      },
+    };
+  }
+  throw new Error("second page failed");
+});
+await adminGrantUi.grant.refresh();
+check(
+  "second-page failure clears partial grants and reports an incomplete refresh",
+  grantCalls.length === 2
+    && adminGrantUi.grant.activeCards().length === 0
+    && adminGrantUi.grant.status().includes("불러오지 못했습니다"),
+);
+
+adminGrantUi.grant.setCallable(async (name, data) => ({
+  data: {
+    grants: [grantFixture({ uid: data.cursor ? "uid-repeat-two" : "uid-repeat-one" })],
+    nextCursor: "uid-repeat-one",
+  },
+}));
+await adminGrantUi.grant.refresh();
+check(
+  "repeating page cursor is rejected without claiming a complete list",
+  adminGrantUi.grant.activeCards().length === 0
+    && adminGrantUi.grant.status().includes("불러오지 못했습니다"),
+);
+
+adminGrantUi.grant.setCallable(async () => ({
+  data: {
+    grants: [],
+    nextCursor: "uid-empty-page",
+  },
+}));
+await adminGrantUi.grant.refresh();
+check(
+  "a nonterminal empty page is rejected as malformed",
+  adminGrantUi.grant.activeCards().length === 0
+    && adminGrantUi.grant.status().includes("불러오지 못했습니다"),
+);
+
+adminGrantUi.grant.setCallable(async () => ({
+  data: {
+    grants: [grantFixture({ uid: "uid-cursor-source" })],
+    nextCursor: "uid-different",
+  },
+}));
+await adminGrantUi.grant.refresh();
+check(
+  "a cursor that does not identify the last returned grant is rejected",
+  adminGrantUi.grant.activeCards().length === 0
+    && adminGrantUi.grant.status().includes("불러오지 못했습니다"),
+);
+
+let revokePayload = null;
+adminGrantUi.grant.setGrants([
+  grantFixture({ uid: "uid-to-revoke", email: "revoke@example.com", displayName: "취소 대상" }),
+  grantFixture({ uid: "uid-already-revoked", status: "revoked", effectiveStatus: "revoked" }),
+]);
+adminGrantUi.grant.setCallable(async (name, data) => {
+  if (name === "revokeRecorderGrant") revokePayload = data;
+  return { data: { revoked: false } };
+});
+adminGrantUi.grant.revokeButton("active")?.click();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check(
+  "revoke action preserves UID payload and names the account without deleting login",
+  revokePayload?.uid === "uid-to-revoke"
+    && adminGrantUi.grant.confirmation().includes("revoke@example.com")
+    && adminGrantUi.grant.confirmation().includes("취소 대상")
+    && adminGrantUi.grant.confirmation().includes("로그인 계정 자체는 삭제하지 않습니다"),
+);
+check(
+  "revoked grants do not expose a repeat revoke action",
+  adminGrantUi.grant.revokeButton("history") === null,
+);
+
+let resolveStalePage;
+adminGrantUi.grant.setCallable(() => new Promise((resolve) => {
+  resolveStalePage = resolve;
+}));
+const staleRefresh = adminGrantUi.grant.refresh();
+adminGrantUi.grant.setAuth(null);
+resolveStalePage({
+  data: {
+    grants: [grantFixture({ uid: "uid-stale", email: "stale@example.com" })],
+    nextCursor: null,
+  },
+});
+await staleRefresh;
+check(
+  "logout invalidates a delayed grant response and leaves no stale account identity",
+  adminGrantUi.grant.activeCards().length === 0
+    && !adminGrantUi.grant.status().includes("stale@example.com"),
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);

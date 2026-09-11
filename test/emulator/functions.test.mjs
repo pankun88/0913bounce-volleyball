@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { initializeApp, deleteApp } from 'firebase/app';
-import { getAuth, connectAuthEmulator, signInAnonymously } from 'firebase/auth';
+import { getAuth, connectAuthEmulator, signInAnonymously, updateEmail, updateProfile } from 'firebase/auth';
 import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/functions';
 import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, setDoc, Timestamp, updateDoc } from 'firebase/firestore';
 import { createFixture, IDS, PROJECT_ID, path } from './fixtures.mjs';
@@ -1995,9 +1995,114 @@ export async function runFunctionsSuite() {
     assert.ok(activeGrant.data().issuedAt?.toMillis?.(), 'exchange-grant-has-issued-at');
     assert.ok(activeGrant.data().expiresAt?.toMillis?.() > activeGrant.data().issuedAt?.toMillis?.(), 'exchange-grant-has-expiry');
     assert.ok(Math.abs(activeGrant.data().expiresAt.toMillis() - activeGrant.data().issuedAt.toMillis() - 12 * 60 * 60 * 1000) < 5_000, 'exchange-grant-lasts-twelve-hours');
+    await updateProfile(credential.user, { displayName: 'Recorder Profile' });
+    await updateEmail(credential.user, 'recorder-profile@example.com');
     const grantList = await call(functions, 'listRecorderGrants', data);
     const listedGrant = grantList.grants.find(({ uid }) => uid === credential.user.uid);
-    assert.deepEqual(Object.keys(listedGrant).sort(), ['effectiveStatus', 'expiresAt', 'issuedAt', 'lastUsedAt', 'status', 'uid', 'version'], 'grant-list-redacts-verifier-proof-and-email');
+    assert.deepEqual(Object.keys(listedGrant).sort(), [
+      'accountDeleted', 'displayName', 'effectiveStatus', 'email', 'expiresAt',
+      'issuedAt', 'lastUsedAt', 'revokedAt', 'status', 'uid', 'version',
+    ], 'grant-list-returns-only-safe-grant-and-profile-fields');
+    assert.equal(listedGrant.email, 'recorder-profile@example.com', 'grant-list-returns-auth-email');
+    assert.equal(listedGrant.displayName, 'Recorder Profile', 'grant-list-returns-auth-display-name');
+    assert.equal(listedGrant.accountDeleted, false, 'grant-list-marks-existing-auth-account');
+    assert.equal(listedGrant.revokedAt, null, 'grant-list-returns-null-revocation-time');
+    await f.seed((db) => setDoc(doc(db, path('recorderGrants', 'grant-missing-auth')), {
+      uid: 'spoofed-grant-uid',
+      version: activeGrant.data().version,
+      status: 'revoked',
+      issuedAt: Timestamp.fromMillis(Date.now() - 2_000),
+      expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),
+      revokedAt: Timestamp.fromMillis(Date.now() - 1_000),
+      proofHash: 'private-proof',
+    }));
+    const missingAuthList = await call(functions, 'listRecorderGrants', data);
+    const missingAuthGrant = missingAuthList.grants.find(({ uid }) => uid === 'grant-missing-auth');
+    assert.equal(missingAuthGrant.uid, 'grant-missing-auth', 'grant-list-uses-document-id-as-uid');
+    assert.equal(missingAuthGrant.email, null, 'grant-list-missing-auth-has-null-email');
+    assert.equal(missingAuthGrant.displayName, null, 'grant-list-missing-auth-has-null-display-name');
+    assert.equal(missingAuthGrant.accountDeleted, true, 'grant-list-marks-missing-auth-account');
+    assert.ok(missingAuthGrant.revokedAt > 0, 'grant-list-returns-revocation-time');
+    assert.deepEqual(Object.keys(missingAuthGrant).sort(), [
+      'accountDeleted', 'displayName', 'effectiveStatus', 'email', 'expiresAt',
+      'issuedAt', 'lastUsedAt', 'revokedAt', 'status', 'uid', 'version',
+    ], 'grant-list-missing-auth-returns-only-allowlisted-fields');
+    for (const cursor of ['', 'grant/child', 'x'.repeat(129)]) {
+      await assert.rejects(
+        call(functions, 'listRecorderGrants', { ...data, cursor }),
+        /Invalid grant cursor/i,
+        `grant-list-invalid-cursor-${cursor.length}`,
+      );
+    }
+    const deniedListApp = initializeApp({
+      projectId: PROJECT_ID,
+      apiKey: 'emulator-only',
+      appId: `grant-list-denied-${Date.now()}`,
+    }, `grant-list-denied-${Date.now()}`);
+    try {
+      const deniedAuth = getAuth(deniedListApp);
+      connectAuthEmulator(deniedAuth, `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST || '127.0.0.1:9099'}`, { disableWarnings: true });
+      await signInAnonymously(deniedAuth);
+      const deniedFunctions = getFunctions(deniedListApp, 'asia-northeast3');
+      connectFunctionsEmulator(deniedFunctions, functionsHost, Number(functionsPort));
+      await assert.rejects(
+        call(deniedFunctions, 'listRecorderGrants', { ...data, cursor: 'grant/child' }),
+        /Seeded administrator required/,
+        'grant-list-denies-non-admin-before-profile-lookup',
+      );
+    } finally {
+      await deleteApp(deniedListApp);
+    }
+    const paginationPrefix = 'zzzz-recorder-pagination-';
+    const paginationGrantIds = Array.from(
+      { length: 501 },
+      (_, index) => `${paginationPrefix}${String(index).padStart(3, '0')}`,
+    );
+    const paginationEndId = `${paginationPrefix}final`;
+    await f.seed(async (db) => {
+      const issuedAt = Timestamp.fromMillis(Date.now() - 2_000);
+      const expiresAt = Timestamp.fromMillis(Date.now() + 3_600_000);
+      await Promise.all([...paginationGrantIds, paginationEndId].map((uid) => setDoc(
+        doc(db, path('recorderGrants', uid)),
+        {
+          uid: `spoofed-${uid}`,
+          version: activeGrant.data().version,
+          status: 'active',
+          issuedAt,
+          expiresAt,
+        },
+      )));
+    });
+    const grantPages = [];
+    let grantCursor;
+    do {
+      const page = await call(functions, 'listRecorderGrants', {
+        ...data,
+        ...(grantCursor === undefined ? {} : { cursor: grantCursor }),
+      });
+      assert.ok(page.grants.length <= 100, 'grant-list-page-is-bounded-to-one-hundred');
+      grantPages.push(page);
+      grantCursor = page.nextCursor;
+    } while (grantCursor !== null);
+    assert.ok(grantPages.length >= 6, 'grant-list-paginates-over-five-hundred-records');
+    const pagedIds = grantPages.flatMap(({ grants }) => grants
+      .map(({ uid }) => uid)
+      .filter((uid) => uid.startsWith(paginationPrefix)));
+    assert.equal(pagedIds.length, paginationGrantIds.length + 1, 'grant-list-pages-cover-all-seeded-pagination-grants');
+    assert.equal(new Set(pagedIds).size, pagedIds.length, 'grant-list-pages-have-no-duplicate-grants');
+    assert.deepEqual(
+      new Set(pagedIds),
+      new Set([...paginationGrantIds, paginationEndId]),
+      'grant-list-pages-have-disjoint-complete-pagination-set',
+    );
+    assert.equal(grantPages.at(-1).nextCursor, null, 'grant-list-last-page-has-no-cursor');
+    assert.equal(grantPages.at(-1).grants.at(-1).uid, paginationEndId, 'grant-list-includes-final-grant-on-last-page');
+    await f.seed(async (db) => {
+      await deleteDoc(doc(db, path('recorderGrants', 'grant-missing-auth')));
+      await Promise.all([...paginationGrantIds, paginationEndId].map((uid) => deleteDoc(
+        doc(db, path('recorderGrants', uid)),
+      )));
+    });
     await f.seed((db) => setDoc(doc(db, path('recorderGrants', 'revoke-target')), {
       uid: 'revoke-target', version: activeGrant.data().version, status: 'active',
       proofHash: 'private-proof', issuedAt: Timestamp.now(), expiresAt: Timestamp.fromMillis(Date.now() + 3_600_000),

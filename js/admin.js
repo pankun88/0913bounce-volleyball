@@ -132,6 +132,10 @@ const TOURNAMENT_RESET_STATE_KEY = "bounce-volleyball:tournament-reset";
 let recorderGrants = [];
 let recorderGrantsLoading = false;
 let recorderGrantsError = "";
+let recorderGrantsLoadedCount = 0;
+let recorderGrantsHistoryVisibleCount = 20;
+let recorderGrantsAuthUid = null;
+let recorderGrantsRefreshToken = 0;
 let prelimHistoryReadiness = { status: "loading", error: null };
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
@@ -139,6 +143,24 @@ const divisionLabel = () => DIVISION_LABELS[activeDivision];
 const PRELIM_HISTORY_GUIDANCE = "공식 예선 이력이 있는 경기는 조·팀·예선 초기화와 대진 재생성을 할 수 없습니다. 전체 초기화로 결과를 지우지 말고, 기록·검수 탭의 ‘승인 결과 정정’에서 해당 경기를 선택해 감사 사유와 함께 정정 절차를 진행하세요.";
 const PRELIM_HISTORY_DISABLED_TITLE = "공식 예선 이력이 있어 비활성화되었습니다. 기록·검수 탭에서 승인 결과 정정을 진행하세요.";
 const PRELIM_HISTORY_LOADING_GUIDANCE = "예선 이력을 서버에서 확인하는 중입니다. 확인이 끝날 때까지 결과를 지울 수 있는 초기화·대진 재생성을 사용할 수 없습니다.";
+
+function resetRecorderGrantAuth(uid) {
+  recorderGrantsAuthUid = uid || null;
+  recorderGrantsRefreshToken += 1;
+  recorderGrantsLoading = false;
+  recorderGrantsLoadedCount = 0;
+  recorderGrantsHistoryVisibleCount = 20;
+  recorderGrants = [];
+  recorderGrantsError = "";
+  const historyDetails = document.getElementById("recorderGrantHistory");
+  if (historyDetails) historyDetails.open = false;
+  const refreshButton = document.getElementById("refreshRecorderGrantsBtn");
+  if (refreshButton) {
+    refreshButton.disabled = false;
+    refreshButton.textContent = "권한 목록 새로고침";
+  }
+  renderRecorderGrants();
+}
 
 function hasOfficialPrelimHistory(match) {
   return Number(match?.officialRevision || 0) > 0
@@ -765,6 +787,7 @@ function initAuthGate() {
 
   watchAuthState((user) => {
     hideLoginError();
+    resetRecorderGrantAuth(user?.uid || null);
     if (user) {
       loginScreen.style.display = "none";
       appShell.style.display = "";
@@ -2570,99 +2593,284 @@ function shortRecorderUid(uid) {
 }
 
 function recorderGrantState(grant) {
-  if (grant.effectiveStatus === "revoked") return { label: "폐기됨", className: "revoked" };
+  if (grant.effectiveStatus === "revoked") return { label: "접근 취소됨", className: "revoked" };
   if (grant.effectiveStatus === "expired") return { label: "만료됨", className: "expired" };
   if (grant.effectiveStatus === "superseded") return { label: "이전 코드 권한", className: "expired" };
   if (grant.effectiveStatus === "disabled") return { label: "전체 비활성", className: "expired" };
   return { label: "활성", className: "active" };
 }
 
+const RECORDER_GRANT_EFFECTIVE_STATUSES = new Set([
+  "active", "expired", "revoked", "superseded", "disabled",
+]);
+const RECORDER_GRANT_STATUSES = new Set(["active", "revoked"]);
+
+function recorderGrantDisplayEmail(grant) {
+  return grant.email || "이메일 정보 없음";
+}
+
+function recorderGrantDisplayName(grant) {
+  return grant.displayName || "이름 정보 없음";
+}
+
+function appendRecorderGrantMeta(parent, label, value) {
+  const item = document.createElement("span");
+  const labelNode = document.createElement("small");
+  labelNode.textContent = label;
+  const valueNode = document.createElement("span");
+  valueNode.textContent = value;
+  item.append(labelNode, valueNode);
+  parent.appendChild(item);
+}
+
+function recorderGrantConfirmationName(grant) {
+  return `${recorderGrantDisplayEmail(grant)} / ${recorderGrantDisplayName(grant)}`;
+}
+
+function createRecorderGrantCard(grant) {
+  const state = recorderGrantState(grant);
+  const row = document.createElement("article");
+  row.className = "recorder-grant-card";
+  row.dataset.recorderGrantStatus = grant.effectiveStatus;
+  row.dataset.recorderGrantKind = grant.effectiveStatus === "active" ? "active" : "history";
+
+  const identity = document.createElement("div");
+  identity.className = "recorder-grant-identity";
+  const email = document.createElement("strong");
+  email.className = "recorder-grant-email";
+  email.textContent = recorderGrantDisplayEmail(grant);
+  const displayName = document.createElement("span");
+  displayName.className = "recorder-grant-display-name";
+  displayName.textContent = recorderGrantDisplayName(grant);
+  identity.append(email, displayName);
+  if (grant.accountDeleted) {
+    const accountDeleted = document.createElement("span");
+    accountDeleted.className = "recorder-grant-account-deleted";
+    accountDeleted.textContent = "삭제된 로그인 계정";
+    identity.appendChild(accountDeleted);
+  }
+
+  const details = document.createElement("div");
+  details.className = "recorder-grant-details";
+  appendRecorderGrantMeta(details, "발급", recorderGrantTime(grant.issuedAt));
+  appendRecorderGrantMeta(details, "마지막 사용", recorderGrantTime(grant.lastUsedAt));
+  appendRecorderGrantMeta(details, "만료", recorderGrantTime(grant.expiresAt));
+  if (grant.revokedAt != null) {
+    appendRecorderGrantMeta(details, "접근 취소", recorderGrantTime(grant.revokedAt));
+  }
+
+  const badge = document.createElement("span");
+  badge.className = `recorder-grant-state ${state.className}`;
+  badge.textContent = state.label;
+
+  const accountDetails = document.createElement("details");
+  accountDetails.className = "recorder-grant-account";
+  const accountSummary = document.createElement("summary");
+  accountSummary.textContent = "계정 정보";
+  const accountBody = document.createElement("div");
+  accountBody.className = "recorder-grant-account-body";
+  const uidLabel = document.createElement("small");
+  uidLabel.textContent = "UID";
+  const uid = document.createElement("button");
+  uid.type = "button";
+  uid.className = "recorder-uid";
+  uid.textContent = shortRecorderUid(grant.uid);
+  uid.title = `${grant.uid} 복사`;
+  uid.setAttribute("aria-label", `기록관 UID ${grant.uid} 복사`);
+  uid.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(grant.uid);
+      showToast("기록관 UID를 복사했습니다.");
+    } catch {
+      showToast("UID 복사에 실패했습니다. 브라우저 권한을 확인하세요.");
+    }
+  });
+  accountBody.append(uidLabel, uid);
+  accountDetails.append(accountSummary, accountBody);
+
+  row.append(identity, badge, details, accountDetails);
+  if (grant.status !== "revoked") {
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "btn danger small";
+    revoke.textContent = "접근 권한 취소";
+    revoke.addEventListener("click", async () => {
+      const name = recorderGrantConfirmationName(grant);
+      if (!confirm(`${name}의 기록관 접근 권한을 취소할까요?\n이 작업은 접근 권한만 취소하며 로그인 계정 자체는 삭제하지 않습니다.\n다른 기록관의 권한, 입력 중인 초안 및 잠금은 변경되지 않습니다.`)) return;
+      const result = await runWorkflowButton(
+        revoke,
+        "계정별 접근 권한 취소",
+        () => adminWorkflowCallable("revokeRecorderGrant", { uid: grant.uid }),
+      );
+      if (result?.revoked) {
+        showToast("해당 계정의 기록관 접근 권한을 취소했습니다.");
+        refreshRecorderGrants();
+      }
+    });
+    row.appendChild(revoke);
+  }
+  return row;
+}
+
+function renderRecorderGrantHistory(history) {
+  const historyDetails = document.getElementById("recorderGrantHistory");
+  const historySummary = document.getElementById("recorderGrantHistorySummary");
+  const historyRoot = document.getElementById("recorderGrantHistoryList");
+  const moreButton = document.getElementById("recorderGrantHistoryMoreBtn");
+  if (!historyDetails || !historySummary || !historyRoot || !moreButton) return;
+  historyRoot.replaceChildren();
+  historySummary.textContent = `이력 (${history.length}건)`;
+  history.slice(0, recorderGrantsHistoryVisibleCount).forEach((grant) => {
+    historyRoot.appendChild(createRecorderGrantCard(grant));
+  });
+  moreButton.hidden = recorderGrantsHistoryVisibleCount >= history.length;
+  moreButton.disabled = false;
+  if (!moreButton.recorderGrantHistoryBound) {
+    moreButton.recorderGrantHistoryBound = true;
+    moreButton.addEventListener("click", () => {
+      recorderGrantsHistoryVisibleCount += 20;
+      renderRecorderGrants();
+    });
+  }
+  historyDetails.hidden = false;
+}
+
 function renderRecorderGrants() {
   const root = document.getElementById("recorderGrantList");
   const status = document.getElementById("recorderGrantStatus");
+  const historyDetails = document.getElementById("recorderGrantHistory");
+  const historyRoot = document.getElementById("recorderGrantHistoryList");
+  const moreButton = document.getElementById("recorderGrantHistoryMoreBtn");
   if (!root || !status) return;
   root.replaceChildren();
+  if (historyRoot) historyRoot.replaceChildren();
+  if (historyDetails) historyDetails.hidden = true;
+  if (moreButton) moreButton.hidden = true;
   if (recorderGrantsLoading) {
-    status.textContent = "권한 목록을 불러오는 중입니다.";
+    status.textContent = `권한 목록을 불러오는 중입니다. ${recorderGrantsLoadedCount}개 확인`;
     return;
   }
   if (recorderGrantsError) {
     status.textContent = recorderGrantsError;
     return;
   }
-  if (!recorderGrants.length) {
-    status.textContent = "발급 또는 폐기된 기록관 권한이 없습니다.";
-    return;
+  const active = recorderGrants.filter((grant) => grant.effectiveStatus === "active");
+  const history = recorderGrants.filter((grant) => grant.effectiveStatus !== "active");
+  status.textContent = active.length
+    ? `${active.length}개 활성 접근 권한`
+    : "활성 접근 권한이 없습니다.";
+  active.forEach((grant) => root.appendChild(createRecorderGrantCard(grant)));
+  renderRecorderGrantHistory(history);
+}
+
+function recorderGrantDateValue(value) {
+  return value === null
+    || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
+function validateRecorderGrant(grant) {
+  if (!grant || typeof grant !== "object" || Array.isArray(grant)) {
+    throw new Error("권한 목록 항목 형식이 올바르지 않습니다.");
   }
-  status.textContent = `${recorderGrants.length}개 계정 권한`;
-  recorderGrants.forEach((grant) => {
-    const state = recorderGrantState(grant);
-    const row = document.createElement("article");
-    row.className = "recorder-grant-card";
-    const uid = document.createElement("button");
-    uid.type = "button";
-    uid.className = "recorder-uid";
-    uid.textContent = shortRecorderUid(grant.uid);
-    uid.title = `${grant.uid} 복사`;
-    uid.setAttribute("aria-label", `기록관 UID ${grant.uid} 복사`);
-    uid.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(grant.uid);
-        showToast("기록관 UID를 복사했습니다.");
-      } catch {
-        showToast("UID 복사에 실패했습니다. 브라우저 권한을 확인하세요.");
-      }
-    });
-    const details = document.createElement("div");
-    details.className = "recorder-grant-details";
-    details.innerHTML = `<span><small>발급</small>${escapeHtml(recorderGrantTime(grant.issuedAt))}</span>`
-      + `<span><small>마지막 사용</small>${escapeHtml(recorderGrantTime(grant.lastUsedAt))}</span>`
-      + `<span><small>만료</small>${escapeHtml(recorderGrantTime(grant.expiresAt))}</span>`;
-    const badge = document.createElement("span");
-    badge.className = `recorder-grant-state ${state.className}`;
-    badge.textContent = state.label;
-    const revoke = document.createElement("button");
-    revoke.type = "button";
-    revoke.className = "btn danger small";
-    revoke.textContent = "이 계정 폐기";
-    revoke.disabled = grant.status === "revoked";
-    revoke.addEventListener("click", async () => {
-      if (!confirm(`UID ${grant.uid} 계정의 기록관 권한만 폐기할까요?\n다른 기록관의 권한, 입력 중인 초안 및 잠금은 변경되지 않습니다.`)) return;
-      const result = await runWorkflowButton(revoke, "계정별 접근 권한 폐기", () => adminWorkflowCallable("revokeRecorderGrant", { uid: grant.uid }));
-      if (result?.revoked) {
-        showToast("해당 계정의 기록관 권한을 폐기했습니다.");
-        refreshRecorderGrants();
-      }
-    });
-    row.append(uid, badge, details, revoke);
-    root.appendChild(row);
+  if (typeof grant.uid !== "string" || !grant.uid
+    || !Number.isInteger(grant.version) || grant.version < 0
+    || !RECORDER_GRANT_STATUSES.has(grant.status)
+    || !RECORDER_GRANT_EFFECTIVE_STATUSES.has(grant.effectiveStatus)
+    || !recorderGrantDateValue(grant.issuedAt)
+    || !recorderGrantDateValue(grant.lastUsedAt)
+    || !recorderGrantDateValue(grant.expiresAt)
+    || !recorderGrantDateValue(grant.revokedAt)
+    || !(typeof grant.email === "string" || grant.email === null)
+    || !(typeof grant.displayName === "string" || grant.displayName === null)
+    || typeof grant.accountDeleted !== "boolean") {
+    throw new Error("권한 목록 항목 형식이 올바르지 않습니다.");
+  }
+  return grant;
+}
+
+function validateRecorderGrantPage(payload, seenUids, seenCursors, currentCursor) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || !Object.prototype.hasOwnProperty.call(payload, "grants")
+    || !Object.prototype.hasOwnProperty.call(payload, "nextCursor")
+    || !Array.isArray(payload.grants)
+    || payload.grants.length > 100
+    || !(payload.nextCursor === null
+      || (typeof payload.nextCursor === "string"
+        && payload.nextCursor.length > 0
+        && payload.nextCursor.length <= 128
+        && !payload.nextCursor.includes("/")))) {
+    throw new Error("권한 목록 응답 형식이 올바르지 않습니다.");
+  }
+  const grants = payload.grants.map((grant) => {
+    const valid = validateRecorderGrant(grant);
+    if (seenUids.has(valid.uid)) throw new Error("권한 목록에 중복된 계정이 있습니다.");
+    seenUids.add(valid.uid);
+    return valid;
   });
+  if (payload.nextCursor !== null
+    && (payload.nextCursor === currentCursor || seenCursors.has(payload.nextCursor))) {
+    throw new Error("권한 목록 페이지 커서가 반복되었습니다.");
+  }
+  if (payload.nextCursor !== null
+    && (grants.length === 0 || grants.at(-1).uid !== payload.nextCursor)) {
+    throw new Error("권한 목록 페이지 커서가 마지막 항목과 일치하지 않습니다.");
+  }
+  if (payload.nextCursor !== null) seenCursors.add(payload.nextCursor);
+  return { grants, nextCursor: payload.nextCursor };
 }
 
 async function refreshRecorderGrants() {
-  if (recorderGrantsLoading) return;
+  if (recorderGrantsLoading || !recorderGrantsAuthUid) return;
+  const requestToken = ++recorderGrantsRefreshToken;
+  const requestUid = recorderGrantsAuthUid;
+  const isCurrentRequest = () => requestToken === recorderGrantsRefreshToken
+    && requestUid === recorderGrantsAuthUid;
   recorderGrantsLoading = true;
+  recorderGrantsError = "";
+  recorderGrants = [];
+  recorderGrantsLoadedCount = 0;
+  recorderGrantsHistoryVisibleCount = 20;
+  const historyDetails = document.getElementById("recorderGrantHistory");
+  if (historyDetails) historyDetails.open = false;
   const refreshButton = document.getElementById("refreshRecorderGrantsBtn");
   if (refreshButton) {
     refreshButton.disabled = true;
     refreshButton.textContent = "불러오는 중…";
   }
   renderRecorderGrants();
+  const grants = [];
+  const seenUids = new Set();
+  const seenCursors = new Set();
+  let cursor = null;
   try {
-    const result = await adminWorkflowCallable("listRecorderGrants");
-    if (!Array.isArray(result?.data?.grants)) throw new Error("권한 목록 응답 형식이 올바르지 않습니다.");
-    if (result.data.grants.some((grant) => typeof grant?.uid !== "string"
-      || !["active", "expired", "revoked", "superseded", "disabled"].includes(grant.effectiveStatus))) {
-      throw new Error("권한 목록 항목 형식이 올바르지 않습니다.");
+    while (true) {
+      const requestData = cursor === null ? {} : { cursor };
+      const result = await adminWorkflowCallable("listRecorderGrants", requestData);
+      if (!isCurrentRequest()) return;
+      const page = validateRecorderGrantPage(
+        result?.data,
+        seenUids,
+        seenCursors,
+        cursor,
+      );
+      grants.push(...page.grants);
+      recorderGrantsLoadedCount = grants.length;
+      renderRecorderGrants();
+      if (page.nextCursor === null) break;
+      cursor = page.nextCursor;
     }
-    recorderGrants = result.data.grants
-      .filter((grant) => typeof grant?.uid === "string" && grant.uid)
-      .sort((a, b) => Number(b.issuedAt) - Number(a.issuedAt));
+    if (!isCurrentRequest()) return;
+    recorderGrants = grants.sort((a, b) => (
+      Number(b.issuedAt || 0) - Number(a.issuedAt || 0)
+    ));
     recorderGrantsError = "";
   } catch (err) {
+    if (!isCurrentRequest()) return;
+    recorderGrants = [];
     recorderGrantsError = "권한 목록을 불러오지 못했습니다. 새로고침해 다시 확인하세요.";
     reportError("기록관 권한 목록", err);
   } finally {
+    if (!isCurrentRequest()) return;
     recorderGrantsLoading = false;
     if (refreshButton) {
       refreshButton.disabled = false;
