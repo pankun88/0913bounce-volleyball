@@ -72,6 +72,105 @@ function check(label, cond) {
     context.messageReason === context.structuredReason);
 }
 
+// Recorder sign-in persists across browser sessions without extending grants.
+{
+  const source = fs.readFileSync(new URL('./recorder-auth-service.js', import.meta.url), 'utf8')
+    .replace(/^import[\s\S]*?;\s*/gm, '')
+    .replace(/^export /gm, '');
+  const events = [];
+  const user = { uid: 'recorder-persistence-test' };
+  const auth = { currentUser: user };
+  const local = { type: 'LOCAL' };
+  const session = { type: 'SESSION' };
+  let now = 1000;
+  let persistenceError = null;
+  let popupError = null;
+  let releasePersistence;
+  let persistenceWait = new Promise((resolve) => { releasePersistence = resolve; });
+  const context = {
+    auth,
+    browserLocalPersistence: local,
+    browserSessionPersistence: session,
+    GoogleAuthProvider: class {
+      setCustomParameters(parameters) { this.parameters = parameters; return this; }
+    },
+    Date: { now: () => now },
+    setPersistence: async (target, persistence) => {
+      assert.equal(target, auth);
+      events.push(['persistence', persistence]);
+      if (persistenceError) throw persistenceError;
+      await persistenceWait;
+    },
+    signInWithPopup: async (target, provider) => {
+      assert.equal(target, auth);
+      events.push(['popup', provider.parameters.prompt]);
+      if (popupError) throw popupError;
+      return { user };
+    },
+    signInWithRedirect: async (target, provider) => {
+      assert.equal(target, auth);
+      events.push(['redirect', provider.parameters.prompt]);
+    },
+    signOut: async (target) => {
+      assert.equal(target, auth);
+      events.push(['logout']);
+      target.currentUser = null;
+    },
+  };
+  vm.runInNewContext(`${source}
+    globalThis.recorderAuth = { loginWithGoogle, logoutRecorder, state };
+  `, context);
+  const recorderAuth = context.recorderAuth;
+  const pendingLogin = recorderAuth.loginWithGoogle();
+  check('recorder waits for local persistence before opening Google sign-in',
+    events.length === 1 && events[0][1] === local);
+  releasePersistence();
+  check('recorder popup sign-in keeps explicit Google account selection',
+    (await pendingLogin).user === user && events[1][0] === 'popup' && events[1][1] === 'select_account');
+  persistenceWait = Promise.resolve();
+  for (const code of ['auth/popup-blocked', 'auth/operation-not-supported-in-this-environment']) {
+    events.length = 0;
+    popupError = Object.assign(new Error(code), { code });
+    check(`recorder redirect retains local persistence for ${code}`,
+      await recorderAuth.loginWithGoogle() === null
+        && events[0][1] === local
+        && events.map(([event]) => event).join(',') === 'persistence,popup,redirect');
+  }
+  events.length = 0;
+  popupError = Object.assign(new Error('popup closed'), { code: 'auth/popup-closed-by-user' });
+  await assert.rejects(recorderAuth.loginWithGoogle(), /popup closed/);
+  check('cancelled Google sign-in does not force a redirect',
+    events.map(([event]) => event).join(',') === 'persistence,popup');
+  events.length = 0;
+  persistenceError = new Error('local storage unavailable');
+  await assert.rejects(recorderAuth.loginWithGoogle(), /local storage unavailable/);
+  check('failed local persistence does not silently sign in with session-only storage',
+    events.length === 1 && events[0][1] === local);
+
+  const root = { recorderFeatureEnabled: true };
+  const challenge = { enabled: true, version: 2 };
+  const expiresAt = now + 12 * 60 * 60 * 1000;
+  const grant = { uid: user.uid, status: 'active', version: 2, expiresAt: { toMillis: () => expiresAt } };
+  const grantState = () => recorderAuth.state(user, root, challenge, grant, false, 'google.com');
+  check('restored recorder login uses an existing valid grant without another code exchange',
+    grantState().kind === 'ready');
+  now = expiresAt;
+  check('persistent Google login does not bypass the twelve-hour grant expiry',
+    grantState().kind === 'staleGrant' && grantState().user === user);
+  now -= 1;
+  grant.status = 'revoked';
+  check('persistent Google login does not bypass revoked recorder access',
+    grantState().kind === 'staleGrant');
+  grant.status = 'active';
+  challenge.version += 1;
+  check('persistent Google login does not bypass access-code rotation',
+    grantState().kind === 'staleGrant');
+  events.length = 0;
+  await recorderAuth.logoutRecorder();
+  check('explicit recorder logout still signs out the stored account',
+    events.length === 1 && events[0][0] === 'logout' && auth.currentUser === null);
+}
+
 // A cached assignment may briefly contain the post-swap court. Only the
 // authoritative snapshot fences the current recorder context.
 {

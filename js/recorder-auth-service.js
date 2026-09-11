@@ -1,5 +1,5 @@
 import {
-  GoogleAuthProvider, browserSessionPersistence, getRedirectResult, onAuthStateChanged,
+  GoogleAuthProvider, browserLocalPersistence, getRedirectResult, onAuthStateChanged,
   setPersistence, signInWithPopup, signInWithRedirect, signOut,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import { doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
@@ -85,7 +85,7 @@ export function watchRecorderAuthState(cb) {
 }
 
 export async function loginWithGoogle() {
-  await setPersistence(auth, browserSessionPersistence);
+  await setPersistence(auth, browserLocalPersistence);
   try { return await signInWithPopup(auth, provider()); }
   catch (error) {
     if (["auth/popup-blocked", "auth/operation-not-supported-in-this-environment"].includes(error.code)) {

@@ -17,7 +17,8 @@
     <section id="authPanel" class="panel" aria-labelledby="authTitle">
       <h2 id="authTitle" tabindex="-1">기록관 접근</h2><p id="authMessage" role="status" aria-live="polite">Google 로그인 후 대회 공용 코드를 입력하세요.</p>
       <ol class="onboarding-steps"><li>Google 계정으로 로그인</li><li>대회 코드 입력</li><li>코트와 이름 선택</li><li>점수 확인 후 제출</li></ol>
-      <p id="identity" class="identity" hidden></p><button id="googleLoginButton" class="primary-button" type="button">Google로 로그인 / 계정 선택</button>
+      <p id="loginPersistenceHelp" class="notice">이 브라우저에서는 다시 열어도 로그인이 유지됩니다. 공용 기기는 사용 후 로그아웃하세요. 대회 접근 권한은 별도로 12시간 후 만료됩니다.</p>
+      <p id="identity" class="identity" hidden></p><button id="googleLoginButton" class="primary-button" type="button" aria-describedby="loginPersistenceHelp">Google로 로그인 / 계정 선택</button>
       <form id="accessCodeForm" hidden><label for="accessCode">대회 공용 코드</label><input id="accessCode" type="password" inputmode="text" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" minlength="24" maxlength="24" pattern="[A-Za-z0-9_-]{24}" aria-describedby="codeHelp" required><p id="codeHelp">운영진에게 받은 24자 영문·숫자·-·_ 코드입니다. 공백 없이 붙여넣을 수 있으며 저장되지 않습니다.</p><button id="accessCodeButton" class="primary-button" type="submit">접근 권한 확인</button></form>
     </section>
     <section id="courtPanel" class="panel" hidden aria-labelledby="courtTitle">
