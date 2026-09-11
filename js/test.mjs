@@ -2025,11 +2025,12 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
 }
 
 const adminHtml = fs.readFileSync(new URL('../admin.html', import.meta.url), 'utf8');
-function readAdminAudienceLink(id) {
-  const anchor = adminHtml.match(new RegExp(`<a\\b[^>]*\\bid="${id}"[^>]*>[^<]*</a>`, 'm'))?.[0];
-  assert.ok(anchor, `admin audience link exists: ${id}`);
+const landingHtml = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+function readAudienceLink(source, id) {
+  const anchor = source.match(new RegExp(`<a\\b[^>]*\\bid="${id}"[^>]*>[^<]*</a>`, 'm'))?.[0];
+  assert.ok(anchor, `audience link exists: ${id}`);
   const href = anchor.match(/\bhref="([^"]+)"/)?.[1];
-  assert.ok(href, `admin audience link has href: ${id}`);
+  assert.ok(href, `audience link has href: ${id}`);
   return {
     href: href.replace(/&amp;/g, '&'),
     label: anchor.match(/>([^<]*)<\/a>/)?.[1]?.trim() || '',
@@ -2038,18 +2039,19 @@ function readAdminAudienceLink(id) {
 }
 
 const primaryAudienceLinks = [
-  { id: 'adminAudienceDashboardLink', ...readAdminAudienceLink('adminAudienceDashboardLink') },
-  { id: 'settingsAudienceDashboardLink', ...readAdminAudienceLink('settingsAudienceDashboardLink') },
+  { id: 'adminAudienceDashboardLink', ...readAudienceLink(adminHtml, 'adminAudienceDashboardLink') },
+  { id: 'settingsAudienceDashboardLink', ...readAudienceLink(adminHtml, 'settingsAudienceDashboardLink') },
+  { id: 'landingAudienceDashboardLink', ...readAudienceLink(landingHtml, 'landingAudienceDashboardLink') },
 ];
 const dashboardBaseUrl = 'https://example.test/';
 const primaryAudienceUrls = primaryAudienceLinks.map(({ href }) => new URL(href, dashboardBaseUrl));
 check(
-  'admin primary audience links share the saved venue URL',
+  'primary audience links share the saved venue URL',
   primaryAudienceLinks.every(({ href }) => href === 'dashboard.html?display=venue&tab=prelim')
     && new Set(primaryAudienceLinks.map(({ href }) => href)).size === 1,
 );
 check(
-  'admin primary audience links use the consistent label and saved-settings title',
+  'primary audience links use the consistent label and saved-settings title',
   primaryAudienceLinks.every(({ label, title }) => (
     label === '관객 대시보드 열기' && title.includes('저장된 경기장 송출 설정')
   )),
@@ -2102,7 +2104,7 @@ for (const [{ id }, url] of primaryAudienceLinks.map((link, index) => [link, pri
   );
 }
 
-const manualAudienceLink = readAdminAudienceLink('manualAudienceDashboardLink');
+const manualAudienceLink = readAudienceLink(adminHtml, 'manualAudienceDashboardLink');
 const manualAudienceUrl = new URL(manualAudienceLink.href, dashboardBaseUrl);
 check(
   'admin settings keeps a separate manual audience link',

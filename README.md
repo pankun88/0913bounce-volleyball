@@ -6,7 +6,7 @@ Firebase 프로젝트 **`bounce-0913-edu-cup-2026`**의 단일 대회 **`main`**
 
 - 관리자: <https://bounce-0913-edu-cup-2026.web.app/admin.html>
 - 기록관: <https://bounce-0913-edu-cup-2026.web.app/recorder.html>
-- 관객 대시보드: <https://bounce-0913-edu-cup-2026.web.app/dashboard.html>
+- 관객 대시보드: <https://bounce-0913-edu-cup-2026.web.app/dashboard.html?display=venue&tab=prelim>
 
 ## 문서 안내
 
