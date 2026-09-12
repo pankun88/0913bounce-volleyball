@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { formatCourtName } from './court-display.js';
+import { courtMatchSummary, formatCourtName, renderMatchMeta } from './court-display.js';
 import {
   activateDependencyEntries,
   classifyCorrectionTarget,
@@ -143,22 +143,26 @@ const queue = (changes = {}) => ({
   const end = source.indexOf('function clearConfirmation()', start);
   assert.ok(start >= 0 && end > start);
   const element = (tagName) => ({
-    tagName, dataset: {}, children: [], textContent: '', hidden: false,
+    tagName, dataset: {}, children: [], hidden: false, ownerDocument: document,
+    classList: { add() {} },
+    get textContent() { return this.text || this.children.map((child) => child.textContent).join(''); },
+    set textContent(value) { this.text = value; this.children = []; },
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
   });
+  const document = { createElement: element };
   const ui = Object.fromEntries([
     'selectedCourtLabel', 'selectedRecorderLabel', 'courtScheduleHeading',
-    'courtScheduleList', 'courtScheduleStatus',
+    'courtScheduleList', 'courtScheduleStatus', 'matchSummary', 'confirmScore', 'confirmMatchLabel',
   ].map((id) => [id, element('div')]));
   const courtAssignments = [
-    { matchKey: 'later', courtOrder: 12, matchType: 'prelim', publicStatus: 'scheduled' },
-    { matchKey: 'earlier', courtOrder: 5, matchType: 'prelim', publicStatus: 'scheduled' },
+    { matchKey: 'later', courtOrder: 12, matchType: 'prelim', division: 'women', publicStatus: 'scheduled' },
+    { matchKey: 'earlier', courtOrder: 5, matchType: 'prelim', division: 'men', publicStatus: 'scheduled' },
     { matchKey: 'unordered', courtOrder: null, matchType: 'prelim', publicStatus: 'scheduled' },
   ];
   const before = structuredClone(courtAssignments);
   const context = {
-    ui, document: { createElement: element },
+    ui, document, courtMatchSummary, renderMatchMeta,
     courts: [{ id: 'court-1', name: '1' }], courtId: 'court-1', pendingCourtId: '',
     recorder: '기록관', displayCourt: formatCourtName, scheduleState: 'ready',
     courtAssignments, queue: null, buildRecorderCourtSchedule,
@@ -171,10 +175,45 @@ const queue = (changes = {}) => ({
   runInNewContext(`${source.slice(start, end)}\nrenderCourtSchedule();`, context);
   assert.equal(ui.courtScheduleHeading.textContent, '1코트 경기 일정');
   assert.deepEqual(
-    Array.from(ui.courtScheduleList.children, (card) => card.children[0].textContent),
-    ['코트 순서 5 · 1조 예선 · 9경기', '코트 순서 12 · 1조 예선 · 3경기', '순서 미정 · 예선'],
+    Array.from(ui.courtScheduleList.children, (card) => (
+      Array.from(card.children[0].children, (badge) => [badge.dataset.kind, badge.textContent])
+    )),
+    [
+      [['court', '1코트'], ['order', '코트 순서 5'], ['division', '남자부'], ['match', '1조 예선 9경기']],
+      [['court', '1코트'], ['order', '코트 순서 12'], ['division', '여자부'], ['match', '1조 예선 3경기']],
+      [['court', '1코트'], ['order', '순서 미정'], ['division', '부문 미정'], ['match', '예선']],
+    ],
   );
   assert.deepEqual(courtAssignments, before, 'rendering preserves court assignments and order');
+  const summaryStart = source.indexOf('function renderSummary()');
+  const summaryEnd = source.indexOf('function renderSaveRecovery()', summaryStart);
+  const confirmationStart = source.indexOf('function renderConfirmation(model)');
+  const confirmationEnd = source.indexOf('function setDataState(', confirmationStart);
+  for (const [division, divisionLabel] of [['men', '남자부'], ['women', '여자부']]) {
+    context.assignment = { matchType: 'final', divisionId: division, courtOrder: 6 };
+    context.official = { roundLabel: '준결승', index: 1, teamA: { name: '추자초' }, teamB: { name: '하귀일초' } };
+    context.name = (side) => side === 'a' ? '추자초' : '하귀일초';
+    runInNewContext(`${source.slice(summaryStart, summaryEnd)}\nrenderSummary();`, context);
+    assert.deepEqual(
+      Array.from(ui.matchSummary.children[0].children, (badge) => badge.textContent),
+      ['1코트', '코트 순서 6', divisionLabel, '준결승 2경기'],
+    );
+    assert.equal(ui.matchSummary.children[1].textContent, '추자초 vs 하귀일초');
+    runInNewContext(`${source.slice(confirmationStart, confirmationEnd)}
+      renderConfirmation({matchLabel: '준결승 2경기'});`, context);
+    assert.deepEqual(
+      Array.from(ui.confirmMatchLabel.children, (badge) => badge.textContent),
+      ['코트 순서 6', divisionLabel, '준결승 2경기'],
+    );
+  }
+  const meta = element('div');
+  renderMatchMeta(meta, { courtName: '<img src=x onerror=alert(1)>', division: 'women', courtOrder: -1, label: '8강 1경기' });
+  assert.equal(meta.children[0].textContent, '<img src=x onerror=alert(1)>', 'names are rendered as text, not HTML');
+  assert.equal(meta.children[1].textContent, '순서 미정', 'invalid execution order is not displayed as a valid slot');
+  assert.equal(meta.children[2].dataset.division, 'women');
+  renderMatchMeta(meta, { division: null, label: '결승' });
+  assert.deepEqual(Array.from(meta.children, (badge) => badge.textContent), ['부문 미정', '결승'],
+    're-rendering removes previous court and division badges');
 }
 
 // A submit request keeps its original operation and storage context while a

@@ -372,7 +372,6 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   box-shadow: var(--shadow-soft);
 }
 .review-card-header,
-.review-tags,
 .review-meta,
 .review-actions {
   display: flex;
@@ -381,28 +380,11 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   gap: 7px;
 }
 .review-card-header { justify-content: space-between; }
-.review-tag,
 .review-state,
 .review-info-chip {
   display: inline-flex;
   align-items: center;
   border-radius: 999px;
-}
-.review-tag {
-  padding: 5px 10px;
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, .72);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-.review-tag.court {
-  color: #2f688f;
-  background: rgba(54, 116, 166, .12);
-}
-.review-tag.division {
-  color: var(--red-dark);
-  background: var(--cream);
 }
 .review-state {
   padding: 6px 12px;
@@ -833,43 +815,6 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 #correctionSection .correction-match-checkbox:focus-visible {
   outline: 3px solid var(--theme-glow);
   outline-offset: 2px;
-}
-#correctionSection .correction-card-meta {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-width: 0;
-}
-#correctionSection .correction-card-meta > *,
-#correctionSection .correction-meta-badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 25px;
-  max-width: 100%;
-  padding: 4px 9px;
-  border: 1px solid var(--theme-line);
-  border-radius: 999px;
-  color: var(--muted);
-  background: rgba(255, 255, 255, .66);
-  font-size: 11px;
-  font-weight: 800;
-  overflow-wrap: anywhere;
-}
-#correctionSection .correction-meta-badge[data-kind="court"] {
-  color: #2f688f;
-  background: rgba(54, 116, 166, .12);
-}
-#correctionSection .correction-meta-badge[data-kind="division"] {
-  color: var(--theme-primary-dark);
-  background: var(--theme-control);
-}
-#correctionSection .correction-meta-badge[data-kind="group-phase"] {
-  color: var(--red-dark);
-  background: var(--cream);
-}
-#correctionSection .correction-meta-badge[data-kind="match"] {
-  color: var(--ink);
 }
 #correctionSection .correction-match-card .review-matchup {
   width: 100%;

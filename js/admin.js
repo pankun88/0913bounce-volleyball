@@ -21,6 +21,7 @@ import {
   buildQualificationSnapshot,
   computeQualificationState,
   validateQualificationSelection,
+  normalizePlayedSets,
 } from "./match-logic.js";
 import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
 import { renderBracket } from "./bracket-render.js";
@@ -41,7 +42,7 @@ import {
 import { upgradeLegacyBackup } from "./backup-format.js";
 import {
   courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName,
-  getPrelimRingEdgeLabels, projectPrelimCourtSchedule,
+  getPrelimRingEdgeLabels, projectPrelimCourtSchedule, renderMatchMeta,
 } from "./court-display.js";
 import {
   correctionConfirmationState,
@@ -1496,7 +1497,7 @@ function syncPrelimExecutionProjection() {
         if (!rowsByLane.has(laneKey)) rowsByLane.set(laneKey, []);
         rowsByLane.get(laneKey).push(row);
         const executionLabel = row.querySelector("[data-prelim-execution-label]");
-        if (executionLabel) executionLabel.textContent = scheduleRow.label;
+        if (executionLabel) renderPrelimMatchMeta(executionLabel, scheduleRow.match, scheduleRow);
         const courtBadge = row.querySelector("[data-prelim-court-badge]");
         if (courtBadge) {
           courtBadge.textContent = scheduleRow.label;
@@ -2135,14 +2136,19 @@ function createWorkflowBoardCard(
   const prelimMatch = option.matchType === "prelim"
     ? allPrelimMatches.find((match) => match.id === option.matchKey)
     : null;
-  const boardLabel = document.createElement("b");
-  // 예선 카드는 구조상 "대진 N" 대신 코트별 배정 위치(코트·N라운드)를 그대로 보여준다.
-  const executionLabel = prelimMatch
-    ? prelimScheduleRow(option.matchKey, prelimSchedule)?.label
-    : null;
-  boardLabel.textContent = prelimMatch
-    ? (executionLabel || "순서 미배정")
-    : option.label;
+  const division = option.divisionId || option.division;
+  const officialMatch = prelimMatch
+    || reviewFinalMatchesByDivision[division]?.find((match) => match.id === option.matchId);
+  const boardLabel = document.createElement("div");
+  renderMatchMeta(boardLabel, {
+    ...courtMatchSummary(option, officialMatch, {
+      groupsById: new Map(allGroups.map((group) => [group.id, group])),
+    }),
+    courtName: boardCourtName,
+    courtOrder: prelimMatch
+      ? prelimScheduleRow(option.matchKey, prelimSchedule)?.courtOrder ?? null
+      : assignment?.courtOrder ?? null,
+  });
   card.appendChild(boardLabel);
   const teams = document.createElement("span");
   teams.textContent = option.teams;
@@ -2409,6 +2415,7 @@ function scoreReviewDisplay(assignment) {
       divisionName,
       view.label,
     ].filter(Boolean).join(" · "),
+    division,
     courtName,
     divisionName,
     matchParts,
@@ -2518,12 +2525,11 @@ function renderScoreReviews() {
     const header = document.createElement("div");
     header.className = "review-card-header";
     const tags = document.createElement("div");
-    tags.className = "review-tags";
-    tags.innerHTML = [
-      `<span class="review-tag court">${escapeHtml(display.courtName)}</span>`,
-      `<span class="review-tag division">${escapeHtml(display.divisionName)}</span>`,
-      ...display.matchParts.map((part) => `<span class="review-tag">${escapeHtml(part)}</span>`),
-    ].join("");
+    renderMatchMeta(tags, {
+      courtName: display.courtName,
+      division: display.division,
+      label: display.matchParts.join(" "),
+    });
     const state = document.createElement("span");
     state.className = `review-state ${isSubmitted ? "submitted" : "editing"}`;
     state.textContent = isSubmitted ? "검수 대기" : "입력 중";
@@ -2966,35 +2972,12 @@ function correctionEligibleCandidates() {
   return eligibleCorrectionCandidates(correctionCandidates());
 }
 
-function correctionMetadataBadges(display) {
-  const parts = display.matchParts || [];
-  const combined = parts.join(" · ") || "경기";
-  let groupPhase = parts.length > 1 ? parts[0] : combined;
-  let match = parts.length > 1 ? parts.slice(1).join(" · ") : "";
-  if (!match) {
-    const parsed = combined.match(/^(.*?)(?:\s+(\d+경기))$/u);
-    if (parsed) {
-      groupPhase = parsed[1];
-      match = parsed[2];
-    }
-  }
-  return [
-    ["court", display.courtName],
-    ["division", display.divisionName],
-    ["group-phase", groupPhase],
-    ["match", match || "경기"],
-  ];
-}
-
 function appendCorrectionMeta(parent, display) {
   const meta = document.createElement("div");
-  meta.className = "correction-card-meta correction-meta";
-  correctionMetadataBadges(display).forEach(([kind, text]) => {
-    const badge = document.createElement("span");
-    badge.className = "correction-meta-badge";
-    badge.dataset.kind = kind;
-    badge.textContent = text;
-    meta.appendChild(badge);
+  renderMatchMeta(meta, {
+    courtName: display.courtName,
+    division: display.division,
+    label: (display.matchParts || []).join(" ") || "경기",
   });
   parent.appendChild(meta);
 }
@@ -3279,13 +3262,17 @@ function stageSubmittedFinalReview(assignment, workflow) {
   }
   if (!finalMutationAllowed()) return;
   const match = finalMatches.find((item) => item.id === assignment.matchId);
-  const sets = workflow.submittedSnapshot?.sets || workflow.draft?.sets;
-  if (!match || !Array.isArray(sets) || evaluateFinalMatch(sets).status !== "done") {
+  const sets = workflow.submittedSnapshot?.sets;
+  if (!match || workflow.draftState !== "submitted"
+      || !Number.isInteger(workflow.submissionVersion)
+      || workflow.submission?.version !== workflow.submissionVersion
+      || !Array.isArray(sets) || evaluateFinalMatch(sets).status !== "done") {
     showToast("현재 본선 대진과 제출 점수를 확인할 수 없습니다.", 4000);
     return;
   }
   const official = authoritativeFinalMatches.find((item) => item.id === match.id);
-  const changed = JSON.stringify(official?.sets || []) !== JSON.stringify(sets);
+  const changed = JSON.stringify(normalizePlayedSets(official?.sets, true))
+    !== JSON.stringify(normalizePlayedSets(sets, true));
   const reason = (official?.officialRevision || 0) > 0 && changed
     ? requiredReason("승인된 본선 점수 정정")
     : "";
@@ -3293,7 +3280,7 @@ function stageSubmittedFinalReview(assignment, workflow) {
     showToast("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
     return;
   }
-  stageFinalScoreDraft(match.id, sets, reason);
+  stageFinalScoreDraft(match.id, sets, reason, workflow.submissionVersion);
   showToast("제출 점수를 로컬 본선 초안에 반영했습니다. 관객 화면에 공개해야 확정됩니다.");
 }
 
@@ -4440,6 +4427,16 @@ function renderPrelimViews() {
   syncPrelimWorkflowHints();
 }
 
+function renderPrelimMatchMeta(container, match, scheduleRow) {
+  renderMatchMeta(container, {
+    ...courtMatchSummary({ matchType: "prelim" }, match, {
+      groupsById: new Map(allGroups.map((group) => [group.id, group])),
+    }),
+    courtName: formatCourtName(scheduleRow?.courtName),
+    courtOrder: scheduleRow?.courtOrder ?? null,
+  });
+}
+
 function createPrelimMatchup(match, scheduleRow) {
   const matchup = document.createElement("span");
   matchup.className = "prelim-matchup";
@@ -4455,8 +4452,8 @@ function createPrelimMatchup(match, scheduleRow) {
   const execution = document.createElement("span");
   execution.className = "prelim-execution-label";
   execution.dataset.prelimExecutionLabel = match.id;
-  execution.textContent = scheduleRow?.label || "미배정";
-  matchup.append(line, execution);
+  renderPrelimMatchMeta(execution, match, scheduleRow);
+  matchup.append(execution, line);
   return matchup;
 }
 
@@ -5011,14 +5008,15 @@ function updateQualificationProofUi() {
   if (!banner) return;
   const status = qualificationProofStatus();
   const messages = qualificationGuidanceForBlockers(qualificationState);
+  const current = status === "current" && !messages.length && !qualificationPreparationError;
   banner.hidden = (!qualificationHasFinalBracket() && !messages.length && !qualificationPreparationError)
     || (status === "current" && !messages.length && !qualificationPreparationError);
   banner.style.padding = "8px 10px";
   banner.style.margin = "0 0 10px";
   banner.style.borderRadius = "6px";
-  banner.style.background = status === "current" ? "var(--surface-2, #eef8f0)" : "var(--surface-warn, #fff4e5)";
-  banner.style.color = status === "current" ? "var(--green-dark, #176b35)" : "var(--red-dark, #8a2d1f)";
-  banner.className = `qualification-proof-banner ${status === "current" ? "is-current" : "is-review"}`;
+  banner.style.background = current ? "var(--surface-2, #eef8f0)" : "var(--surface-warn, #fff4e5)";
+  banner.style.color = current ? "var(--green-dark, #176b35)" : "var(--red-dark, #8a2d1f)";
+  banner.className = `qualification-proof-banner ${current ? "is-current" : "is-review"}`;
   if (status === "stale") {
     banner.textContent = qualificationHasFinalPlay()
       ? "예선 원본이 바뀌어 본선 진출 근거가 오래되었습니다. 실제 진행 경기가 있어 대진 교체로 우회할 수 없습니다. ‘진출팀 다시 확인’으로 같은 진출팀이 여전히 유효한지 확인하세요."
@@ -5032,7 +5030,8 @@ function updateQualificationProofUi() {
   } else {
     banner.textContent = "예선 진출 근거가 최신입니다.";
   }
-  if (qualificationPreparationError && status !== "stale") {
+  if (qualificationPreparationError && status !== "stale"
+      && banner.textContent !== qualificationPreparationError) {
     banner.textContent += ` ${qualificationPreparationError}`;
   }
 }
@@ -5503,6 +5502,17 @@ function updateBracketPublishBar() {
   }
 }
 
+function finalPublicationErrorMessage(error) {
+  const reason = error?.details?.reason;
+  if (reason === "final_submission_changed") {
+    return "검수한 제출 점수나 제출 버전이 현재 기록과 다릅니다. ‘기록·검수’에서 해당 경기의 최신 제출을 확인하고 ‘공개 초안에 반영’을 다시 누르세요. 기존 기록은 유지됩니다.";
+  }
+  if (reason === "final_workflow_busy") {
+    return "입력·검수 중인 본선 경기의 대진이나 점수를 변경할 수 없습니다. 해당 경기의 입력·검수를 마친 뒤 다시 공개하세요. 기존 기록은 유지됩니다.";
+  }
+  return error?.message || String(error);
+}
+
 /** "관객 화면에 공개" — 그동안 로컬에서만 조정/입력해 둔 대진·경기 기록을 한 번에 Firestore에
  * 반영해서 대시보드(관객 화면)에 실제로 공유한다. 6강·준결승·결승 등 매 라운드 결과를 입력한 뒤
  * 이 버튼을 눌러 그때그때 공개할 수 있다. */
@@ -5571,10 +5581,11 @@ async function handlePublishBracket() {
     qualificationDraftStale = false;
     qualificationReplacement = null;
     qualificationPreparationError = "";
+    updateQualificationProofUi();
     updateBracketPublishBar();
     showToast(`${divisionLabel()} 대진표를 관객 화면에 공개했습니다`);
   } catch (err) {
-    qualificationPreparationError = err?.message || String(err);
+    qualificationPreparationError = finalPublicationErrorMessage(err);
     updateQualificationProofUi();
     reportError("관객 화면 공개", err);
   } finally {
@@ -5757,7 +5768,7 @@ function finalScoreModalContextIsCurrent(context) {
     && (match.teamB?.id || null) === context.teamBId;
 }
 
-function stageFinalScoreDraft(matchId, sets, reason) {
+function stageFinalScoreDraft(matchId, sets, reason, expectedSubmissionVersion) {
   const current = finalMatches.find((item) => item.id === matchId);
   if (!current) throw new Error("본선 경기를 찾을 수 없습니다.");
   const result = evaluateFinalMatch(sets);
@@ -5766,11 +5777,12 @@ function stageFinalScoreDraft(matchId, sets, reason) {
   if (previousWinnerId && previousWinnerId !== (result.winner === "A" ? current.teamA?.id : current.teamB?.id)) {
     invalidateDescendantResults(finalMatches, matchId).forEach((id) => finalScoreDrafts.delete(id));
   }
-  recordMatchResult(finalMatches, matchId, sets, evaluateFinalMatch);
+  const playedSets = normalizePlayedSets(sets, true);
+  recordMatchResult(finalMatches, matchId, structuredClone(playedSets), evaluateFinalMatch);
   const workflow = reviewWorkflows.get(`final:${activeDivision}:${matchId}`);
   finalScoreDrafts.set(matchId, {
-    matchId, sets: structuredClone(sets), reason,
-    expectedSubmissionVersion: workflow?.submissionVersion || 0,
+    matchId, sets: structuredClone(playedSets), reason,
+    expectedSubmissionVersion: expectedSubmissionVersion ?? workflow?.submissionVersion ?? 0,
   });
   bracketPublishPending = true;
   renderFinalBracket();
@@ -5890,6 +5902,10 @@ function reportError(action, err) {
   }
   if (/preliminary match has official history/i.test(String(err?.message || ""))) {
     showToast(`${action}을(를) 중단했습니다. ${PRELIM_HISTORY_GUIDANCE}`, 7000);
+    return;
+  }
+  if (action === "관객 화면 공개" && ["final_submission_changed", "final_workflow_busy"].includes(err?.details?.reason)) {
+    showToast(finalPublicationErrorMessage(err), 7000);
     return;
   }
   const code = err && err.code ? ` (${err.code})` : "";

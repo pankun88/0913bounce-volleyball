@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore, FieldPath, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { HttpsError } from 'firebase-functions/v2/https';
@@ -1503,7 +1504,7 @@ export async function publishFinalStructure(request) {
         || draft.expectedSubmissionVersion < 0 || staged.has(draft.matchId)) {
       throw new HttpsError('invalid-argument', 'Score drafts must be unique matchId, sets and reason records.');
     }
-    staged.set(draft.matchId, draft);
+    staged.set(draft.matchId, { ...draft, sets: evaluate({ matchType: 'final' }, draft.sets).sets });
   }
   const byId = new Map();
   for (const input of matches) {
@@ -1748,7 +1749,7 @@ export async function publishFinalStructure(request) {
       } else if (draft) {
         if (!item.teamA || !item.teamB) bad('A final score requires both derived entrants.');
         const evaluated = evaluate({ matchType: 'final' }, draft.sets);
-        const changed = !old?.officialRevision || JSON.stringify(old.sets) !== JSON.stringify(evaluated.sets);
+        const changed = !old?.officialRevision || !isDeepStrictEqual(old.sets, evaluated.sets);
         if (old?.officialRevision && changed && !draft.reason.trim()) bad('A final score correction reason is required.');
         const revision = old?.officialRevision ? (old.officialRevision + (changed ? 1 : 0)) : 1;
         Object.assign(item, evaluated, {
@@ -1835,21 +1836,45 @@ export async function publishFinalStructure(request) {
         bad(`Final workflow has no matching assignment: ${key}.`);
       }
     }
+    const retainedActiveKeys = new Set();
     for (const key of desiredKeys) {
       const assignment = assignments.get(key); const workflow = workflows.get(key);
       const matchId = key.slice(`final:${division}:`.length);
+      if (assignment && (!workflow || assignment.matchKey !== key || assignment.matchType !== 'final'
+          || assignment.divisionId !== division || assignment.matchId !== matchId)) {
+        bad(`Final assignment selector is inconsistent: ${key}.`);
+      }
+      const active = assignment && (
+        ['in_progress', 'under_review', 'replay_required', 'rework_required'].includes(assignment.publicStatus)
+        || ['editing', 'submitted', 'rejected'].includes(workflow.draftState)
+        || workflow.lock
+      );
+      const old = existing.get(matchId);
+      const match = canonical.get(matchId);
+      // Publishing one reviewed match must not approve, clear, or block another untouched input/review.
+      const unchanged = old && [
+        'round', 'index', 'teamA', 'teamB', 'teamASource', 'teamBSource',
+        'status', 'byeCandidate', 'nextMatchId', 'nextSlot', 'sets', 'officialRevision',
+      ].every((field) => isDeepStrictEqual(old[field] ?? null, match[field] ?? null));
+      if (active && !staged.has(matchId) && unchanged) {
+        retainedActiveKeys.add(key);
+        canonical.set(matchId, { ...old, id: matchId });
+        continue;
+      }
       const submittedPublish = workflow?.draftState === 'submitted'
         && staged.has(matchId)
         && workflow.submission?.version === workflow.submissionVersion
         && workflow.submissionVersion === staged.get(matchId).expectedSubmissionVersion
-        && JSON.stringify(workflow.submittedSnapshot?.sets) === JSON.stringify(staged.get(matchId).sets);
-      if (assignment && (!workflow || assignment.matchKey !== key || assignment.matchType !== 'final'
-          || assignment.divisionId !== division || assignment.matchId !== key.slice(`final:${division}:`.length)
-          || (['in_progress', 'under_review', 'replay_required', 'rework_required'].includes(assignment.publicStatus)
+        && isDeepStrictEqual(workflow.submittedSnapshot?.sets, staged.get(matchId).sets);
+      if (assignment && ((['in_progress', 'under_review', 'replay_required', 'rework_required'].includes(assignment.publicStatus)
             && !submittedPublish)
           || ['editing', 'rejected'].includes(workflow.draftState) || (workflow.draftState === 'submitted' && !submittedPublish)
           || workflow.lock)) {
-        bad(`Final assignment is not publishable: ${key}.`);
+        throw new HttpsError('failed-precondition', 'Final assignment is not publishable.', {
+          reason: workflow.draftState === 'submitted' && staged.has(matchId)
+            ? 'final_submission_changed' : 'final_workflow_busy',
+          matchKey: key,
+        });
       }
     }
     const affectedCourts = new Set(obsolete.map((key) => assignments.get(key).courtId).filter(Boolean));
@@ -1881,11 +1906,14 @@ export async function publishFinalStructure(request) {
     });
     writes.add(root().path); writes.add(ref('auditEvents', transition).path);
     if (writes.size > 499) bad('Final publication exceeds transaction write limit.');
-    for (const match of canonical.values()) tx.set(collectionRef.doc(match.id), match);
+    for (const match of canonical.values()) {
+      if (!retainedActiveKeys.has(finalAssignmentKey(division, match.id))) tx.set(collectionRef.doc(match.id), match);
+    }
     for (const snap of existingSnap.docs) if (!canonical.has(snap.id)) tx.delete(snap.ref);
     const postAssignments = new Map(assignments);
     const postWorkflows = new Map(workflows);
     for (const key of desiredKeys) {
+      if (retainedActiveKeys.has(key)) continue;
       const match = canonical.get(key.slice(`final:${division}:`.length));
       const oldAssignment = assignments.get(key); const oldWorkflow = workflows.get(key);
       const revision = match.officialRevision || 0;
@@ -1922,7 +1950,11 @@ export async function publishFinalStructure(request) {
       }]));
       for (const item of Object.values(normalized)) {
         postAssignments.set(item.matchKey, item);
-        if (!desiredKeys.has(item.matchKey)) tx.update(ref('courtAssignments', item.matchKey), {
+        const retained = retainedActiveKeys.has(item.matchKey);
+        const prior = assignments.get(item.matchKey);
+        if (retained && prior.courtOrder === item.courtOrder
+            && prior.nextCourtMatchKey === item.nextCourtMatchKey) continue;
+        if (!desiredKeys.has(item.matchKey) || retained) tx.update(ref('courtAssignments', item.matchKey), {
           courtOrder: item.courtOrder, nextCourtMatchKey: item.nextCourtMatchKey, lastTransitionId: transition,
         });
       }
@@ -1943,7 +1975,9 @@ export async function publishFinalStructure(request) {
         lastTransitionId: transition,
       }, normalized, planned.workflows));
     }
-    for (const key of desiredKeys) tx.set(ref('courtAssignments', key), postAssignments.get(key));
+    for (const key of desiredKeys) {
+      if (!retainedActiveKeys.has(key)) tx.set(ref('courtAssignments', key), postAssignments.get(key));
+    }
     const topologyChanged = obsolete.length > 0 || [...desiredKeys].some((key) => !assignments.has(key));
     const topologyRevision = (tournamentSnap.data()?.courtTopologyRevision || 0) + (topologyChanged ? 1 : 0);
     const finalQualification = {

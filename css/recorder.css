@@ -178,11 +178,6 @@ button:active:not(:disabled) { transform: translateY(0); }
   border: 1px solid var(--border); border-radius: 15px;
   background: var(--surface-muted);
 }
-.match-meta { display: flex; flex-wrap: wrap; gap: 6px; }
-.match-meta span {
-  padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px;
-  background: #fff; color: var(--muted); font-size: .69rem; font-weight: 750;
-}
 .matchup { display: grid; grid-template-columns: minmax(0, 1fr) 34px minmax(0, 1fr); align-items: center; gap: 8px; }
 .matchup strong {
   display: flex; align-items: center; justify-content: center; min-width: 0; min-height: 58px; padding: 9px;

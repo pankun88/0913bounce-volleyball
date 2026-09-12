@@ -30,7 +30,7 @@ import {
 } from './backup-format.js';
 import {
   courtMatchSummary, courtTeamNames, formatCourtName, normalizeCourtName,
-  projectPrelimCourtSchedule, getPrelimRingEdgeLabels,
+  projectPrelimCourtSchedule, getPrelimRingEdgeLabels, renderMatchMeta,
 } from './court-display.js';
 import {
   correctionConfirmationState,
@@ -333,6 +333,15 @@ const finalCourtView = courtMatchSummary(
 check('final court display resolves embedded team names', finalCourtView.teams === '남자 1위 vs 남자 2위');
 check('final court display resolves round label', finalCourtView.label === '결승 1경기');
 check('unresolved final teams are explicit', courtTeamNames({ teamA: null, teamB: null }).a === '대진 미정');
+check('match metadata retains the assigned final division before the official fixture loads',
+  courtMatchSummary({ matchType: 'final', divisionId: 'women' }, null).division === 'women');
+check('match metadata resolves a preliminary division from the official match or its group',
+  courtMatchSummary({ matchType: 'prelim' }, { division: 'men' }).division === 'men'
+    && courtMatchSummary({ matchType: 'prelim' }, { groupId: 'g' }, {
+      groupsById: new Map([['g', { division: 'women' }]]),
+    }).division === 'women');
+check('missing division information never defaults to the mens division',
+  courtMatchSummary({ matchType: 'final' }, null).division === null);
 const prelimProjectionMatches = [
   { id: 'p1', groupId: 'g', round: 1, teamA: 't1', teamB: 't2' },
   { id: 'p2', groupId: 'g', round: 2, teamA: 't2', teamB: 't3' },
@@ -3203,6 +3212,7 @@ function createAdminProjectionHarness() {
   const context = {
     window,
     document,
+    Map,
     Option,
     URLSearchParams,
     sessionStorage: storage,
@@ -3288,6 +3298,7 @@ function createAdminProjectionHarness() {
     isCorrectionCandidateEligible: () => false,
     upgradeLegacyBackup: () => ({}),
     courtMatchSummary,
+    renderMatchMeta,
     courtTeamNames,
     formatCourtName,
     normalizeCourtName,
@@ -3381,8 +3392,10 @@ function createAdminProjectionHarness() {
         scoreIds: scoreRows.map((row) => row.dataset.prelimMatchRow),
         setupRowChildren: setupRows[0]?.children.map((child) => child.className) || [],
         setupCourtControlChildren: setupRows[0]?.children[1]?.children.map((child) => child.tagName) || [],
-        setupExecution: setupRows.map((row) => row.querySelector("[data-prelim-execution-label]")?.textContent),
-        scoreExecution: scoreRows.map((row) => row.querySelector("[data-prelim-execution-label]")?.textContent),
+        setupExecution: setupRows.map((row) => [...row.querySelector("[data-prelim-execution-label]").children]
+          .map((badge) => badge.textContent).join("|")),
+        scoreExecution: scoreRows.map((row) => [...row.querySelector("[data-prelim-execution-label]").children]
+          .map((badge) => badge.textContent).join("|")),
         setupRing: projectionRingLabels("prelimSetupGroups"),
         scoreRing: projectionRingLabels("prelimGroups"),
         dirty: workflowDirty,
@@ -3508,6 +3521,10 @@ function createAdminProjectionHarness() {
         workflowDirty = false;
         if (mixed) {
           activeDivision = "men";
+          allGroups = [
+            { id: "group-men", division: "men", name: "1조" },
+            { id: "group-women", division: "women", name: "2조" },
+          ];
           allPrelimMatches = [
             {
               id: "board-prelim-men",
@@ -3658,7 +3675,8 @@ function createAdminProjectionHarness() {
           restrict,
           move: (matchKey, courtId) => {
             setMatchCourt(matchKey, courtId);
-            return cardFor(matchKey)?.children[0]?.textContent || "";
+            return [...(cardFor(matchKey)?.children[0]?.children || [])]
+              .map((badge) => badge.textContent).join("|");
           },
           matches: () => allPrelimMatches.map((match) => ({ ...match })),
         };
@@ -3740,8 +3758,8 @@ check(
     ])
     && JSON.stringify(savedProjectionUi.setupCourtControlChildren) === JSON.stringify(["SPAN", "SELECT"])
     && JSON.stringify(savedProjectionUi.setupExecution) === JSON.stringify(savedProjectionUi.scoreExecution)
-    && savedProjectionUi.setupExecution[0] === 'A코트 · 1라운드'
-    && savedProjectionUi.setupExecution[2] === 'A코트 · 5라운드',
+    && savedProjectionUi.setupExecution[0] === 'A코트|코트 순서 1|남자부|A조 예선 3경기'
+    && savedProjectionUi.setupExecution[2] === 'A코트|코트 순서 5|남자부|A조 예선 1경기',
 );
 check(
   'saved planner projection keeps preliminary hints hidden',
@@ -3803,26 +3821,28 @@ check(
 );
 
 const mixedDivisionBoard = adminProjectionUi.board(true);
+const boardMetadata = (card) => [...(card?.children[0]?.children || [])]
+  .map((badge) => badge.textContent).join("|");
 check(
-  "unified board projects an opposite-division preliminary assignment",
-  mixedDivisionBoard.cardFor("board-prelim-women")?.children[0]?.textContent === "A코트 · 2라운드"
-    && mixedDivisionBoard.cardFor("board-prelim-men")?.children[0]?.textContent === "A코트 · 1라운드",
+  "unified board separates court order, division and preliminary match into badges",
+  boardMetadata(mixedDivisionBoard.cardFor("board-prelim-women")) === "A코트|코트 순서 2|여자부|2조 예선 2경기"
+    && boardMetadata(mixedDivisionBoard.cardFor("board-prelim-men")) === "A코트|코트 순서 1|남자부|1조 예선 1경기",
 );
 const mixedWomenMatchesBefore = JSON.stringify(mixedDivisionBoard.matches());
 mixedDivisionBoard.move("board-prelim-men", "court-a");
 check(
-  "unified board refreshes preliminary round labels after a draft reorder",
-  mixedDivisionBoard.cardFor("board-prelim-women")?.children[0]?.textContent === "A코트 · 1라운드",
+  "unified board refreshes execution order without relabeling the preliminary fixture",
+  boardMetadata(mixedDivisionBoard.cardFor("board-prelim-women")) === "A코트|코트 순서 1|여자부|2조 예선 2경기",
 );
 const movedMixedWomen = mixedDivisionBoard.move("board-prelim-women", "court-b");
 check(
   "unified board reflects a draft court move in the preliminary execution label",
-  movedMixedWomen === "B코트 · 1라운드"
+  movedMixedWomen === "B코트|코트 순서 1|여자부|2조 예선 2경기"
     && JSON.stringify(mixedDivisionBoard.matches()) === mixedWomenMatchesBefore,
 );
 check(
   "unified board keeps an explicit unassigned fallback after a draft removal",
-  mixedDivisionBoard.move("board-prelim-women", null) === "미배정",
+  mixedDivisionBoard.move("board-prelim-women", null) === "미배정|순서 미정|여자부|2조 예선 2경기",
 );
 
 const boardTop = adminProjectionUi.board();

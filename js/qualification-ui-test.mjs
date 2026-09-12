@@ -5,8 +5,10 @@ import {
   buildQualificationSnapshot,
   computeQualificationState,
   validateQualificationSelection,
+  evaluateFinalMatch,
+  normalizePlayedSets,
 } from "./match-logic.js";
-import { buildCrossGroupSeedOrder, generateBracket } from "./bracket.js";
+import { buildCrossGroupSeedOrder, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
 
 const adminSource = fs.readFileSync(new URL("./admin.js", import.meta.url), "utf8");
 
@@ -95,6 +97,10 @@ function loadAdminFunctions(names, values = {}) {
     buildQualificationSnapshot,
     computeQualificationState,
     validateQualificationSelection,
+    evaluateFinalMatch,
+    normalizePlayedSets,
+    recordMatchResult,
+    invalidateDescendantResults,
     buildCrossGroupSeedOrder,
     generateBracket,
     ...values,
@@ -354,8 +360,10 @@ function finalUiFixture() {
     "handleQualificationRevalidation", "updateQualificationProofUi",
     "onGenerateBracket", "handleClearBracket", "updateBracketPublishBar",
     "handlePublishBracket", "finalStructureMatch",
+    "stageSubmittedFinalReview", "stageFinalScoreDraft", "finalPublicationErrorMessage",
   ], {
     activeDivision: "men",
+    DIVISION_LABELS: { men: "남자부", women: "여자부" },
     qualificationState: state,
     qualificationStateForCurrentData: () => state,
     qualificationProof: null,
@@ -539,6 +547,41 @@ async function testInvalidQualificationAndFailedResetStayBlocked() {
   assert.equal(errors.length, 1);
 }
 
+async function testSubmittedFinalStagingAndPublicationErrors() {
+  const { context, elements, calls } = finalUiFixture();
+  await call(context, "onGenerateBracket");
+  const matchId = context.finalMatches[0].id;
+  const key = `final:men:${matchId}`;
+  context.reviewWorkflows.set(key, { submissionVersion: 3 });
+  const workflow = {
+    draftState: "submitted", submissionVersion: 1, submission: { version: 1 },
+    submittedSnapshot: { sets: [{ b: 8, a: 10 }, { b: 8, a: 10 }, { a: 0, b: 0 }] },
+  };
+  call(context, "stageSubmittedFinalReview", { matchId, divisionId: "men" }, workflow);
+  const draft = context.finalScoreDrafts.get(matchId);
+  assert.equal(draft.expectedSubmissionVersion, 1, "capture the reviewed version, not a later subscription");
+  assert.deepEqual(jsonValue(draft.sets), finishedSets, "capture canonical played sets");
+  context.finalMatches[0].sets[0].a = 11;
+  assert.equal(draft.sets[0].a, 10, "bracket display and publication draft do not alias");
+  assert.equal(workflow.submittedSnapshot.sets[0].a, 10, "staging never mutates submitted evidence");
+
+  const rejected = { code: "functions/failed-precondition", details: { reason: "final_submission_changed" } };
+  const beforeCalls = calls.length;
+  context.publishFinalBracket = async () => { throw rejected; };
+  await call(context, "handlePublishBracket");
+  const message = call(context, "finalPublicationErrorMessage", rejected);
+  assert.equal(elements.qualificationProofBanner.textContent, message, "publication error appears once");
+  assert.match(message, /최신 제출/);
+  assert.match(elements.qualificationProofBanner.className, /is-review/);
+  assert.equal(context.finalScoreDrafts.get(matchId), draft, "failed publication preserves the reviewed draft");
+  assert.equal(context.bracketPublishPending, true);
+  assert.equal(calls.length, beforeCalls);
+
+  const invalid = { ...workflow, submission: { version: 2 } };
+  call(context, "stageSubmittedFinalReview", { matchId, divisionId: "men" }, invalid);
+  assert.equal(context.finalScoreDrafts.get(matchId), draft, "inconsistent submission metadata cannot replace a reviewed draft");
+}
+
 async function runQualificationUiSuite() {
   testActualSourceInvalidationAndForeignRecords();
   testActualSelectionState();
@@ -547,6 +590,7 @@ async function runQualificationUiSuite() {
   await testRevalidationCanActuallyPublish();
   await testRealFinalPlayStillBlocksReset();
   await testInvalidQualificationAndFailedResetStayBlocked();
+  await testSubmittedFinalStagingAndPublicationErrors();
   console.log("qualification UI fixtures passed");
 }
 

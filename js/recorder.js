@@ -10,7 +10,7 @@ import {
   fetchRecorderWorkflow,
 } from "./workflow-service.js";
 import { evaluateFinalMatch, evaluatePrelimMatch, finalNeedsThirdSet, normalizePlayedSets, validateSetScore } from "./match-logic.js";
-import { courtMatchSummary, courtTeamNames, formatCourtName } from "./court-display.js";
+import { courtMatchSummary, courtTeamNames, formatCourtName, renderMatchMeta } from "./court-display.js";
 import {
   buildRecorderConfirmationModel, buildRecorderSubmitContext, reconcileRecorderSelections,
   buildRecorderCourtSchedule, reconcileRecorderSubmit, recorderRouteState, sortRecorderCourts,
@@ -252,8 +252,11 @@ function renderCourtSchedule() {
     card.className = `court-schedule-item schedule-status-${item.status}`;
     card.dataset.matchKey = item.matchKey;
     const heading = document.createElement("h3");
-    const orderLabel = item.courtOrder === null ? "순서 미정" : `코트 순서 ${item.courtOrder}`;
-    heading.textContent = `${orderLabel} · ${item.label || item.matchKey}`;
+    renderMatchMeta(heading, {
+      ...courtMatchSummary(item.assignment, item.official, { groupsById: groups }),
+      courtName: displayCourt(selectedCourt()),
+      courtOrder: item.courtOrder,
+    });
     const matchup = document.createElement("p");
     matchup.className = "court-schedule-matchup";
     matchup.textContent = item.matchup;
@@ -301,7 +304,11 @@ function renderConfirmation(model) {
   if (!ui.confirmScore) return;
   if (ui.confirmCourt) ui.confirmCourt.textContent = model.court;
   if (ui.confirmRecorder) ui.confirmRecorder.textContent = model.recorder;
-  if (ui.confirmMatchLabel) ui.confirmMatchLabel.textContent = model.matchLabel;
+  if (ui.confirmMatchLabel) renderMatchMeta(ui.confirmMatchLabel, {
+    ...courtMatchSummary(assignment, official, { groupsById: groups }),
+    courtOrder: assignment?.courtOrder ?? null,
+    label: model.matchLabel,
+  });
   if (ui.confirmTeamA) ui.confirmTeamA.textContent = model.teamA;
   if (ui.confirmTeamB) ui.confirmTeamB.textContent = model.teamB;
   if (ui.confirmOutcome) ui.confirmOutcome.textContent = model.outcome;
@@ -531,7 +538,18 @@ function renderForm() {
   updateThird(); renderedFormKey = formKey; ui.scoreForm.hidden = false;
 }
 function renderSummary() {
-  if (!assignment) return; const view = courtMatchSummary(assignment, official, { teamsById: teams, groupsById: groups }); ui.matchSummary.textContent = `${view.label || "현재 경기"} · ${name("a")} vs ${name("b")}`;
+  if (!assignment) return;
+  const view = courtMatchSummary(assignment, official, { teamsById: teams, groupsById: groups });
+  const meta = document.createElement("div");
+  renderMatchMeta(meta, {
+    ...view,
+    courtName: displayCourt(selectedCourt()),
+    courtOrder: assignment.courtOrder ?? null,
+  });
+  const matchup = document.createElement("strong");
+  matchup.className = "court-schedule-matchup";
+  matchup.textContent = `${name("a")} vs ${name("b")}`;
+  ui.matchSummary.replaceChildren(meta, matchup);
 }
 function renderSaveRecovery() {
   if (!ui.saveRecoveryNotice) return;

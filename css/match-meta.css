@@ -1,0 +1,50 @@
+.match-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.match-meta-badge {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 28px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border: 1px solid #d3e3e2;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .82);
+  color: #566e6c;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: keep-all;
+}
+
+.match-meta-badge[data-kind="court"] {
+  color: #2f688f;
+  background: #e4eff4;
+  border-color: #c8dde5;
+}
+
+.match-meta-badge[data-kind="order"] {
+  color: #526b7b;
+  background: #f0f5f8;
+  border-color: #d5e1e8;
+  font-variant-numeric: tabular-nums;
+}
+
+.match-meta-badge[data-division="men"] {
+  color: #1e7165;
+  background: #e0f2ec;
+  border-color: #bfdfd6;
+}
+
+.match-meta-badge[data-division="women"] {
+  color: #735098;
+  background: #f1eafa;
+  border-color: #dfcfee;
+}

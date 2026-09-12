@@ -605,7 +605,12 @@ export async function runFunctionsSuite() {
       division: 'men',
       expectedMatches: recordedBase,
       matches: recordedStructure(),
-      scoreDrafts: [{ matchId: 'recorded-final', sets: score, reason: '', expectedSubmissionVersion: 1 }],
+      scoreDrafts: [{
+        matchId: 'recorded-final',
+        sets: [...score.map(({ a, b }) => ({ b, a })), { a: 0, b: 0 }],
+        reason: '',
+        expectedSubmissionVersion: 1,
+      }],
     });
     assert.equal(identicalResubmission.scoreRevisions['recorded-final'], 1, 'identical-final-resubmission-keeps-official-revision');
     const identicalReviewState = await f.seed(async (db) => Promise.all([
@@ -699,23 +704,96 @@ export async function runFunctionsSuite() {
         teamA: null, teamB: null, teamASource: null, teamBSource: null, nextMatchId: null, nextSlot: null,
       },
     ];
-    const dependencyFirst = await publishWithQualification({
+    const dependencyInitial = await publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: [], matches: dependencyStructure,
-      scoreDrafts: [{ matchId: 'dependency-semi-a', sets: score, reason: '', expectedSubmissionVersion: 0 }],
+      scoreDrafts: [],
     });
+    const initialDependencyBaseline = dependencyInitial.matches.map((match) => ({
+      id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
+    })).sort((a, b) => a.id.localeCompare(b.id));
+    const dependencyScoreA = [{ a: 5, b: 10 }, { a: 10, b: 8 }, { a: 4, b: 7 }];
+    const submittedDependency = async (id, draftState = 'submitted', lock = null) => f.seed(async (db) => {
+      const key = `final:men:${id}`;
+      const sets = id === 'dependency-semi-a' ? dependencyScoreA : score;
+      await updateDoc(doc(db, path('courtAssignments', key)), {
+        publicStatus: draftState === 'editing' ? 'in_progress' : 'under_review',
+        courtId: 'dependency-court', courtOrder: id === 'dependency-semi-a' ? 1 : 2,
+        nextCourtMatchKey: id === 'dependency-semi-a' ? 'final:men:dependency-semi-b' : dependencyFinalKey,
+      });
+      await updateDoc(doc(db, path('scoreWorkflows', key)), {
+        draftState, lock, draft: { sets }, submittedSnapshot: { sets },
+        submissionVersion: 1, submission: { version: 1 },
+      });
+    });
+    await submittedDependency('dependency-semi-a');
+    await submittedDependency('dependency-semi-b');
+    await f.seed((db) => updateDoc(doc(db, path('courtAssignments', dependencyFinalKey)), { courtOrder: 3 }));
+    const readDependencyState = (id) => f.seed(async (db) => {
+      const snapshots = await Promise.all([
+        getDoc(doc(db, path('courtAssignments', `final:men:${id}`))),
+        getDoc(doc(db, path('scoreWorkflows', `final:men:${id}`))),
+        getDoc(doc(db, `tournaments/main/divisions/men/finalMatches/${id}`)),
+      ]);
+      return snapshots.map((snapshot) => snapshot.data());
+    });
+    const untouchedSubmitted = await readDependencyState('dependency-semi-b');
+    for (const draft of [
+      { sets: dependencyScoreA, expectedSubmissionVersion: 0 },
+      { sets: [{ a: 10, b: 6 }, { a: 10, b: 7 }], expectedSubmissionVersion: 1 },
+    ]) {
+      await assert.rejects(publishWithQualification({
+        tournamentId: 'main', division: 'men', expectedMatches: initialDependencyBaseline, matches: dependencyStructure,
+        scoreDrafts: [{ matchId: 'dependency-semi-a', reason: '', ...draft }],
+      }), (error) => error.details?.reason === 'final_submission_changed',
+      'final-publication-still-rejects-unreviewed-version-or-score');
+    }
+    const dependencyFirst = await publishWithQualification({
+      tournamentId: 'main', division: 'men', expectedMatches: initialDependencyBaseline, matches: dependencyStructure,
+      scoreDrafts: [{
+        matchId: 'dependency-semi-a', sets: dependencyScoreA.map(({ a, b }) => ({ b, a })),
+        reason: '', expectedSubmissionVersion: 1,
+      }],
+    });
+    assert.deepEqual(await readDependencyState('dependency-semi-b'), untouchedSubmitted,
+      'publishing-one-semifinal-does-not-approve-or-alter-another-submitted-review');
+    const approvedFirstSemi = await readDependencyState('dependency-semi-a');
+    assert.equal(approvedFirstSemi[0].publicStatus, 'completed');
+    assert.equal(approvedFirstSemi[1].draftState, 'approved');
+    assert.deepEqual(approvedFirstSemi[2].sets, dependencyScoreA);
     const dependencyBaseline = dependencyFirst.matches.map((match) => ({
       id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
     })).sort((a, b) => a.id.localeCompare(b.id));
-    await publishWithQualification({
+    await submittedDependency('dependency-semi-b', 'editing', { token: 'active-recorder-lock', uid: 'other-recorder' });
+    const untouchedEditing = await readDependencyState('dependency-semi-b');
+    await assert.rejects(publishWithQualification({
       tournamentId: 'main', division: 'men', expectedMatches: dependencyBaseline, matches: dependencyStructure,
-      scoreDrafts: [{ matchId: 'dependency-semi-b', sets: score, reason: '', expectedSubmissionVersion: 0 }],
+      scoreDrafts: [{ matchId: 'dependency-semi-b', sets: score, reason: '', expectedSubmissionVersion: 1 }],
+    }), (error) => error.details?.reason === 'final_workflow_busy', 'active-recorder-input-cannot-be-overwritten');
+    const whileEditing = await publishWithQualification({
+      tournamentId: 'main', division: 'men', expectedMatches: dependencyBaseline, matches: dependencyStructure,
+      scoreDrafts: [{
+        matchId: 'dependency-semi-a',
+        sets: [{ a: 6, b: 10 }, { a: 10, b: 8 }, { a: 4, b: 7 }],
+        reason: '동일 승자 점수 정정', expectedSubmissionVersion: 1,
+      }],
+    });
+    assert.deepEqual(await readDependencyState('dependency-semi-b'), untouchedEditing,
+      'unrelated-publication-retains-recorder-lock-draft-and-official-baseline');
+    await submittedDependency('dependency-semi-b');
+    await publishWithQualification({
+      tournamentId: 'main', division: 'men',
+      expectedMatches: whileEditing.matches.map((match) => ({
+        id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
+      })).sort((a, b) => a.id.localeCompare(b.id)),
+      matches: dependencyStructure,
+      scoreDrafts: [{ matchId: 'dependency-semi-b', sets: score, reason: '', expectedSubmissionVersion: 1 }],
     });
     const dependencyFinal = await f.seed((db) => getDoc(
       doc(db, 'tournaments/main/divisions/men/finalMatches/dependency-final'),
     ));
     const dependencyAssignment = await f.seed((db) => getDoc(doc(db, path('courtAssignments', dependencyFinalKey))));
     const dependencyQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'dependency-court'))));
-    assert.equal(dependencyFinal.data().teamA.id, 'dependency-a', 'final-publish-propagates-first-semifinal-entrant');
+    assert.equal(dependencyFinal.data().teamA.id, 'dependency-b', 'final-publish-propagates-first-semifinal-entrant');
     assert.equal(dependencyFinal.data().teamB.id, 'dependency-c', 'final-publish-propagates-second-semifinal-entrant');
     assert.equal(dependencyAssignment.data().dependencyReady, true, 'final-publish-activates-preassigned-final-dependency');
     assert.equal(dependencyQueue.data().priorityEntries[0].eligibility, 'ready', 'final-publish-activates-blocked-final-priority');

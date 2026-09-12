@@ -61,10 +61,35 @@ export function courtMatchLabel(assignment, officialMatch, groupsById) {
 /** 기록관 화면과 관객 대시보드가 함께 쓰는 표시 문구. */
 export function courtMatchSummary(assignment, officialMatch, lookups = {}) {
   const teams = courtTeamNames(officialMatch, lookups.teamsById);
+  const group = lookups.groupsById instanceof Map
+    ? lookups.groupsById.get(officialMatch?.groupId)
+    : lookups.groupsById?.[officialMatch?.groupId];
   return {
+    division: assignment?.divisionId || assignment?.division || officialMatch?.division || group?.division || null,
     label: courtMatchLabel(assignment, officialMatch, lookups.groupsById),
     teams: teams ? `${teams.a} vs ${teams.b}` : null,
   };
+}
+
+/** 코트·실행 순서·부문·경기 이름을 모든 운영 화면에서 같은 배지로 표시한다. */
+export function renderMatchMeta(container, { courtName, courtOrder, division, label }) {
+  const badges = [];
+  if (courtName) badges.push(["court", courtName]);
+  if (courtOrder !== undefined) {
+    badges.push(["order", Number.isInteger(courtOrder) && courtOrder > 0
+      ? `코트 순서 ${courtOrder}` : "순서 미정"]);
+  }
+  badges.push(["division", { men: "남자부", women: "여자부" }[division] || "부문 미정"]);
+  if (label) badges.push(["match", String(label).replaceAll(" · ", " ")]);
+  container.classList.add("match-meta");
+  container.replaceChildren(...badges.map(([kind, text]) => {
+    const badge = container.ownerDocument.createElement("span");
+    badge.className = "match-meta-badge";
+    badge.dataset.kind = kind;
+    if (kind === "division" && ["men", "women"].includes(division)) badge.dataset.division = division;
+    badge.textContent = text;
+    return badge;
+  }));
 }
 
 /**
