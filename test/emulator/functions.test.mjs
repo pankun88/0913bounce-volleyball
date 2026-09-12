@@ -921,6 +921,11 @@ export async function runFunctionsSuite() {
         matches: initial.matches.map(finalStructureMatch),
         scoreDrafts: semis.map((match) => ({ matchId: match.id, sets: score, reason: '', expectedSubmissionVersion: 0 })),
       });
+      await f.seed(async (db) => {
+        for (const match of semis) await updateDoc(doc(db, path('scoreWorkflows', keyFor(match.id))), {
+          submissionVersion: 1, submission: { version: 1 }, submittedSnapshot: { sets: score },
+        });
+      });
       const previewFor = (id) => call(functions, 'previewApprovedCorrection', { ...data, matchKeys: [keyFor(id)] });
       const applyPlan = (planToken) => call(functions, 'applyApprovedCorrection', {
         ...data, planToken, reason: '준결승 두 경기 기록지 재확인',
@@ -998,21 +1003,53 @@ export async function runFunctionsSuite() {
         afterSecond.queue.priorityEntries.length);
 
       const correctedSets = [{ a: 8, b: 10 }, { a: 7, b: 10 }];
-      await f.seed(async (db) => {
-        for (const match of semis) {
-          await updateDoc(doc(db, path('courtAssignments', keyFor(match.id))), { publicStatus: 'under_review' });
-          await updateDoc(doc(db, path('scoreWorkflows', keyFor(match.id))), {
-            draftState: 'submitted', submissionVersion: 1, submission: { version: 1 },
-            submittedSnapshot: { sets: correctedSets },
-          });
-        }
-      });
-      const republished = await publishWithQualification({
+      const reentryPayload = {
         tournamentId: 'main', division, expectedMatches: baselineFor(Object.values(afterSecond.matches)),
         matches: Object.values(afterSecond.matches).map(finalStructureMatch),
         scoreDrafts: semis.map((match) => ({
-          matchId: match.id, sets: correctedSets, reason: '기록지 대조 후 정정', expectedSubmissionVersion: 1,
+          matchId: match.id, sets: correctedSets, reason: '기록지 대조 후 정정', expectedSubmissionVersion: separateCourt ? 2 : 1,
         })),
+      };
+      if (separateCourt) {
+        await f.seed(async (db) => {
+          for (const match of semis) {
+            await updateDoc(doc(db, path('courtAssignments', keyFor(match.id))), { publicStatus: 'under_review' });
+            await updateDoc(doc(db, path('scoreWorkflows', keyFor(match.id))), {
+              draftState: 'submitted', submissionVersion: 2, submission: { version: 2 },
+              submittedSnapshot: { sets: correctedSets },
+            });
+          }
+        });
+      } else {
+        await assert.rejects(publishWithQualification({
+          ...reentryPayload, scoreDrafts: reentryPayload.scoreDrafts.map((draft) => ({ ...draft, expectedSubmissionVersion: 0 })),
+        }), (error) => error.details?.reason === 'final_submission_changed',
+        'administrator-reentry-must-use-the-observed-submission-version');
+        await assert.rejects(publishWithQualification({
+          ...reentryPayload, scoreDrafts: reentryPayload.scoreDrafts.map((draft) => ({ ...draft, reason: '' })),
+        }), /correction reason is required/, 'administrator-reentry-requires-a-correction-reason');
+        await f.seed((db) => updateDoc(doc(db, path('scoreWorkflows', keyFor(semis[0].id))), {
+          lock: { token: 'active-recorder-reentry' },
+        }));
+        await assert.rejects(publishWithQualification(reentryPayload),
+          (error) => error.details?.reason === 'final_workflow_busy',
+          'administrator-reentry-cannot-overwrite-a-recorder-lock');
+        const locked = await f.seed((db) => getDoc(doc(db, path('scoreWorkflows', keyFor(semis[0].id)))));
+        assert.equal(locked.data().lock.token, 'active-recorder-reentry');
+        assert.deepEqual((await readState()).matches, afterSecond.matches);
+        await f.seed((db) => updateDoc(doc(db, path('scoreWorkflows', keyFor(semis[0].id))), { lock: null }));
+      }
+      const republished = await publishWithQualification(reentryPayload);
+      await f.seed(async (db) => {
+        for (const match of semis) {
+          const workflow = (await getDoc(doc(db, path('scoreWorkflows', keyFor(match.id))))).data();
+          assert.equal(workflow.draftState, 'approved');
+          assert.equal(workflow.officialRevision, 2);
+          assert.equal(workflow.submissionVersion, separateCourt ? 2 : 1);
+          assert.deepEqual(workflow.officialSnapshot.sets, correctedSets);
+          assert.deepEqual(workflow.submittedSnapshot.sets, separateCourt ? correctedSets : score,
+            'administrator-reentry-preserves-original-recorder-submission-evidence');
+        }
       });
       const recovered = await readState();
       assert.equal(recovered.assignment.dependencyReady, true);

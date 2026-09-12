@@ -5765,7 +5765,7 @@ async function handleBracketSlotSwap(fromSlot, toSlot) {
 function openFinalScoreModal(match) {
   if (!finalMutationAllowed()) return;
   if (isFinalScoreStagingBlocked(match)) {
-    showToast("기록관 워크플로가 진행 중인 본선 경기는 로컬로 점수를 수정할 수 없습니다.", 4000);
+    showToast("기록관이 실제 입력 중이거나 제출 검수 중인 경기입니다. 입력권·검수 상태를 먼저 확인하세요.", 5000);
     return;
   }
   const modalContext = finalScoreModalContext(match);
@@ -5783,6 +5783,13 @@ function openFinalScoreModal(match) {
         updateBracketPublishBar();
         throw new Error("대진 또는 공개 기준이 변경되었습니다. 로컬 초안을 버리고 최신 대진표를 확인하세요.");
       }
+      if (isFinalScoreStagingBlocked(match)) {
+        throw new Error("기록관의 입력 또는 제출이 시작되었습니다. 입력한 점수는 이 창에 남아 있으니 현재 기록·검수 상태를 확인하세요.");
+      }
+      const submissionVersion = reviewWorkflows.get(`final:${activeDivision}:${modalContext.matchId}`)?.submissionVersion ?? 0;
+      if (submissionVersion !== modalContext.submissionVersion) {
+        throw new Error("점수 입력 중 제출 기록이 바뀌었습니다. 입력한 값을 보관하고 최신 제출을 확인하세요.");
+      }
       const result = evaluateFinalMatch(sets);
       if (result.status !== "done") throw new Error("본선 점수는 승자가 확정된 완전한 경기 결과여야 합니다.");
       const official = authoritativeFinalMatches.find((item) => item.id === modalContext.matchId);
@@ -5796,7 +5803,7 @@ function openFinalScoreModal(match) {
       const correctionReason = approved && scoreChanged ? requiredReason("승인된 본선 점수 정정") : null;
       if (approved && scoreChanged && !correctionReason) throw new Error("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
 
-      stageFinalScoreDraft(modalContext.matchId, sets, correctionReason || "");
+      stageFinalScoreDraft(modalContext.matchId, sets, correctionReason || "", modalContext.submissionVersion);
       showToast("본선 점수를 로컬 초안에 저장했습니다. 아직 관객 화면에 공개되지 않았습니다.");
     },
   });
@@ -5810,6 +5817,7 @@ function finalScoreModalContext(match) {
     matchId: match.id,
     teamAId: match.teamA?.id || null,
     teamBId: match.teamB?.id || null,
+    submissionVersion: reviewWorkflows.get(`final:${activeDivision}:${match.id}`)?.submissionVersion ?? 0,
   };
 }
 
@@ -5851,8 +5859,7 @@ function isFinalScoreStagingBlocked(match) {
     .filter(Boolean)
     .map((state) => String(state).toLowerCase());
   return Boolean(workflow?.lock) || states.some((state) => [
-    "editing", "locked", "submitted", "rejected", "replay", "replay_required",
-    "rework_required", "under_review", "in_progress",
+    "editing", "locked", "submitted", "under_review", "in_progress",
   ].includes(state));
 }
 

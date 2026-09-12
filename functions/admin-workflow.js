@@ -1935,13 +1935,24 @@ export async function publishFinalStructure(request) {
         && workflow.submission?.version === workflow.submissionVersion
         && workflow.submissionVersion === staged.get(matchId).expectedSubmissionVersion
         && isDeepStrictEqual(workflow.submittedSnapshot?.sets, staged.get(matchId).sets);
+      const adminReentry = workflow?.draftState === 'rejected'
+        && ['replay_required', 'rework_required'].includes(assignment?.publicStatus)
+        && !workflow.lock
+        && staged.has(matchId)
+        && (workflow.submissionVersion ?? 0) === staged.get(matchId).expectedSubmissionVersion;
+      const reviewedPublish = submittedPublish || adminReentry;
+      const submissionChanged = staged.has(matchId)
+        && ['submitted', 'rejected'].includes(workflow?.draftState)
+        && ((workflow.submissionVersion ?? 0) !== staged.get(matchId).expectedSubmissionVersion
+          || (workflow.draftState === 'submitted' && !submittedPublish));
       if (assignment && ((['in_progress', 'under_review', 'replay_required', 'rework_required'].includes(assignment.publicStatus)
-            && !submittedPublish)
-          || ['editing', 'rejected'].includes(workflow.draftState) || (workflow.draftState === 'submitted' && !submittedPublish)
+            && !reviewedPublish)
+          || workflow.draftState === 'editing'
+          || (workflow.draftState === 'rejected' && !adminReentry)
+          || (workflow.draftState === 'submitted' && !submittedPublish)
           || workflow.lock)) {
         throw new HttpsError('failed-precondition', 'Final assignment is not publishable.', {
-          reason: workflow.draftState === 'submitted' && staged.has(matchId)
-            ? 'final_submission_changed' : 'final_workflow_busy',
+          reason: submissionChanged ? 'final_submission_changed' : 'final_workflow_busy',
           matchKey: key,
         });
       }
