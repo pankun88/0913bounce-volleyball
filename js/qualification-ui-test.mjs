@@ -582,6 +582,44 @@ async function testSubmittedFinalStagingAndPublicationErrors() {
   assert.equal(context.finalScoreDrafts.get(matchId), draft, "inconsistent submission metadata cannot replace a reviewed draft");
 }
 
+function testFinalStructureProjection() {
+  const context = loadAdminFunctions(["finalStructureMatch"]);
+  const root = {
+    id: "semi-a", round: 1, roundLabel: "준결승", index: 0,
+    teamA: { id: "a", name: "A" }, teamB: { id: "b", name: "B" },
+    teamASource: { type: "fixedTeam", teamId: "a" },
+    teamBSource: { type: "fixedTeam", teamId: "b" },
+    status: "done", byeCandidate: null, nextMatchId: "final", nextSlot: "A",
+    officialCurrent: true, officialRevision: 2, lastTransitionId: "approved",
+    sets: finishedSets, winnerTeam: { id: "a", name: "A" }, winnerSide: "A",
+    pointsForA: 20, attemptCount: 1, officialSnapshot: { sets: finishedSets },
+    serverMetadata: { revision: 3 },
+  };
+  const before = structuredClone(root);
+  const projected = call(context, "finalStructureMatch", root);
+  assert.deepEqual(jsonValue(projected), {
+    id: "semi-a", round: 1, roundLabel: "준결승", index: 0,
+    teamA: { id: "a", name: "A" }, teamB: { id: "b", name: "B" },
+    teamASource: { type: "fixedTeam", teamId: "a" },
+    teamBSource: { type: "fixedTeam", teamId: "b" },
+    status: "pending", byeCandidate: null, nextMatchId: "final", nextSlot: "A",
+  }, "server result and workflow fields never re-enter the structure payload");
+  projected.teamA.name = "Changed locally";
+  assert.deepEqual(root, before, "projection does not mutate or alias saved server results");
+  const final = call(context, "finalStructureMatch", {
+    ...root, id: "final", round: 2, nextMatchId: null, nextSlot: "A",
+  });
+  assert.equal(final.teamA, null);
+  assert.equal(final.teamB, null);
+  assert.equal(final.teamASource, null);
+  assert.equal(final.teamBSource, null);
+  assert.equal(final.nextSlot, null);
+  const bye = call(context, "finalStructureMatch", {
+    ...root, status: "bye", teamB: null, teamBSource: null,
+  });
+  assert.equal(bye.status, "bye", "confirmed byes remain structural outcomes");
+}
+
 async function runQualificationUiSuite() {
   testActualSourceInvalidationAndForeignRecords();
   testActualSelectionState();
@@ -591,6 +629,7 @@ async function runQualificationUiSuite() {
   await testRealFinalPlayStillBlocksReset();
   await testInvalidQualificationAndFailedResetStayBlocked();
   await testSubmittedFinalStagingAndPublicationErrors();
+  testFinalStructureProjection();
   console.log("qualification UI fixtures passed");
 }
 

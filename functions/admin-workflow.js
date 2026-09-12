@@ -128,6 +128,40 @@ function correctionProjection(queue, planned, targets) {
     inPlaceMatchKeys: targets.filter((key) => !replayMatchKeys.includes(key)),
   };
 }
+function finalCorrectionInvalidations(context, matchIds) {
+  const targets = new Set(matchIds);
+  const invalidated = new Set(targets);
+  const queue = [...targets];
+  while (queue.length) {
+    const matchId = queue.shift();
+    const match = context.finals.get(matchId);
+    if (!match) bad(`Final correction match not found: ${matchId}.`);
+    if (match.nextMatchId && !invalidated.has(match.nextMatchId)) {
+      const descendant = context.finals.get(match.nextMatchId);
+      if (!descendant) bad(`Downstream final match not found: ${match.nextMatchId}.`);
+      if (hasFinalScoreHistory(descendant)) {
+        throw new HttpsError('failed-precondition',
+          '후속 본선 경기에 점수 기록이 있어 앞선 경기의 승인을 취소할 수 없습니다. 기존 경기 기록은 유지됩니다.',
+          { reason: 'downstream_final_history', matchKey: finalAssignmentKey(context.division, match.nextMatchId) });
+      }
+      invalidated.add(match.nextMatchId);
+      queue.push(match.nextMatchId);
+    }
+  }
+  for (const matchId of invalidated) {
+    if (targets.has(matchId)) continue;
+    const key = finalAssignmentKey(context.division, matchId);
+    const assignment = context.assignments.get(key);
+    const workflow = context.workflows.get(key);
+    if (assignment && (!workflow
+        || !downstreamFinalWorkflowIsUnplayed(assignment, workflow, context.finals.get(matchId)))) {
+      throw new HttpsError('failed-precondition',
+        '후속 본선 경기에 실제 입력·제출 또는 승인 이력이 있어 앞선 경기의 승인을 취소할 수 없습니다. 기존 경기 기록은 유지됩니다.',
+        { reason: 'downstream_final_workflow_history', matchKey: key });
+    }
+  }
+  return invalidated;
+}
 async function correctionPreviewPlan(tx, targets) {
   await assertTournamentWritable(tx);
   const targetSnaps = await Promise.all(targets.map((key) => tx.get(ref('courtAssignments', key))));
@@ -155,6 +189,13 @@ async function correctionPreviewPlan(tx, targets) {
         && hasRealFinalPlay(context.finals, context.assignments, context.workflows, division)) {
       bad('A preliminary correction is blocked after real final play.');
     }
+  }
+  const finalInvalidations = new Map();
+  for (const [division, context] of qualificationContexts) {
+    const matchIds = targets.map((key) => state.assignments[key])
+      .filter((assignment) => assignment.matchType === 'final' && assignment.divisionId === division)
+      .map((assignment) => assignment.matchId);
+    if (matchIds.length) finalInvalidations.set(division, finalCorrectionInvalidations(context, matchIds));
   }
   let planned;
   try {
@@ -190,6 +231,15 @@ async function correctionPreviewPlan(tx, targets) {
     qualification: Object.fromEntries([...qualificationContexts].map(([division, context]) => [
       division, qualificationContextProof(context),
     ])),
+    finalDescendants: Object.fromEntries([...finalInvalidations].map(([division, matchIds]) => {
+      const context = qualificationContexts.get(division);
+      return [division, [...matchIds].sort().map((matchId) => ({
+        matchId,
+        official: context.finals.get(matchId),
+        assignment: context.assignments.get(finalAssignmentKey(division, matchId)),
+        workflow: context.workflows.get(finalAssignmentKey(division, matchId)),
+      }))];
+    })),
   };
   const qualification = Object.fromEntries([...qualificationContexts].map(([division, context]) => [
     division, qualificationContextProof(context),
@@ -198,6 +248,7 @@ async function correctionPreviewPlan(tx, targets) {
     courtId, state, planned, projection,
     qualificationContexts,
     targetDivisions,
+    finalInvalidations,
     planToken: {
       courtId,
       matchKeys: targets,
@@ -1741,10 +1792,10 @@ export async function publishFinalStructure(request) {
       const old = existing.get(match.id);
       const draft = staged.get(match.id);
       const preserved = old?.officialRevision > 0 && !draft
-        && JSON.stringify(old.teamA ?? null) === JSON.stringify(item.teamA)
-        && JSON.stringify(old.teamB ?? null) === JSON.stringify(item.teamB);
+        && isDeepStrictEqual(old.teamA ?? null, item.teamA)
+        && isDeepStrictEqual(old.teamB ?? null, item.teamB);
       if (preserved) {
-        Object.assign(item, ...['sets', 'setsWonA', 'setsWonB', 'pointsForA', 'pointsForB', 'result', 'winner', 'winnerSide', 'winnerTeam', 'status', 'officialRevision']
+        Object.assign(item, ...['sets', 'setsWonA', 'setsWonB', 'pointsForA', 'pointsForB', 'result', 'winner', 'winnerSide', 'winnerTeam', 'status', 'officialRevision', 'officialCurrent']
           .map((key) => ({ [key]: old[key] })));
       } else if (draft) {
         if (!item.teamA || !item.teamB) bad('A final score requires both derived entrants.');
@@ -2280,16 +2331,30 @@ function prelimHasHistory(match) {
       && match.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0));
 }
 
-function workflowIsPristine(assignment, workflow) {
+function workflowHasNoScoreHistory(assignment, workflow) {
   const draft = workflow.draft;
-  return assignment.publicStatus === 'scheduled'
-    && !(assignment.attemptCount || assignment.officialRevision)
-    && workflow.draftState === 'idle'
+  return !(assignment.attemptCount || assignment.officialRevision)
     && !workflow.lock
     && !(workflow.draftRevision || workflow.submissionVersion || workflow.officialRevision || workflow.attemptCount)
     && !workflow.submittedSnapshot
     && !workflow.officialSnapshot
     && (!draft || (Object.keys(draft).length === 1 && Array.isArray(draft.sets) && draft.sets.length === 0));
+}
+
+function workflowIsPristine(assignment, workflow) {
+  return assignment.publicStatus === 'scheduled'
+    && workflow.draftState === 'idle'
+    && workflowHasNoScoreHistory(assignment, workflow);
+}
+
+function downstreamFinalWorkflowIsUnplayed(assignment, workflow, match) {
+  if (workflowIsPristine(assignment, workflow)) return true;
+  return assignment.dependencyReady === false
+    && assignment.publicStatus === 'replay_required'
+    && workflow.draftState === 'rejected'
+    && match.status === 'waiting'
+    && (!match.teamA || !match.teamB)
+    && workflowHasNoScoreHistory(assignment, workflow);
 }
 
 function officialPrelimIsPristine(match) {
@@ -3557,41 +3622,15 @@ export async function applyApprovedCorrection(request) {
       preview.courtId,
       { queue: plan.queue, assignments: plan.assignments, workflows: plan.workflows },
     ]]);
-    for (const divisionId of new Set(finalTargets.map((assignment) => assignment.divisionId))) {
-      const matchesSnap = await tx.get(root().collection('divisions').doc(divisionId).collection('finalMatches'));
-      const finals = new Map(matchesSnap.docs.map((snap) => [snap.id, { ref: snap.ref, ...snap.data() }]));
-      const queue = finalTargets
-        .filter((assignment) => assignment.divisionId === divisionId)
-        .map((assignment) => assignment.matchId);
-      const invalidated = new Set(queue);
-      while (queue.length) {
-        const matchId = queue.shift();
-        const match = finals.get(matchId);
-        if (!match) bad(`Final correction match not found: ${matchId}.`);
-        if (match.nextMatchId && !invalidated.has(match.nextMatchId)) {
-          const descendant = finals.get(match.nextMatchId);
-          if (!descendant) bad(`Downstream final match not found: ${match.nextMatchId}.`);
-          if (hasFinalScoreHistory(descendant)) {
-            bad('A correction cannot invalidate downstream final history.');
-          }
-          invalidated.add(match.nextMatchId);
-          queue.push(match.nextMatchId);
-        }
-      }
+    for (const [divisionId, invalidated] of preview.finalInvalidations) {
+      const context = preview.qualificationContexts.get(divisionId);
+      const finals = new Map(context.finalsSnap.docs.map((snap) => [snap.id, { ref: snap.ref, ...snap.data() }]));
       for (const matchId of invalidated) {
         if (finalTargets.some((assignment) => assignment.divisionId === divisionId && assignment.matchId === matchId)) continue;
         const matchKey = finalAssignmentKey(divisionId, matchId);
-        const [assignmentSnap, workflowSnap] = await Promise.all([
-          tx.get(ref('courtAssignments', matchKey)),
-          tx.get(ref('scoreWorkflows', matchKey)),
-        ]);
-        if (assignmentSnap.exists
-            && (!workflowSnap.exists || !workflowIsPristine(assignmentSnap.data(), workflowSnap.data()))) {
-          bad('A correction cannot invalidate downstream workflow history.');
-        }
-        if (assignmentSnap.exists) {
-          invalidatedAssignments.set(matchKey, assignmentSnap.data());
-          invalidatedWorkflows.set(matchKey, workflowSnap.data());
+        if (context.assignments.has(matchKey)) {
+          invalidatedAssignments.set(matchKey, context.assignments.get(matchKey));
+          invalidatedWorkflows.set(matchKey, context.workflows.get(matchKey));
         }
       }
       invalidatedFinals.set(divisionId, { finals, invalidated });
@@ -3646,7 +3685,8 @@ export async function applyApprovedCorrection(request) {
             update[`team${side}Source`] = null;
           }
         }
-        const dependencyInvalidated = update.teamA === null || update.teamB === null;
+        const dependencyInvalidated = update.teamA === null || update.teamB === null
+          || (!isTarget && (!match.teamA || !match.teamB));
         if (!dependencyInvalidated) {
           if (!isTarget) tx.update(match.ref, update);
           continue;
@@ -3668,23 +3708,25 @@ export async function applyApprovedCorrection(request) {
         const assignment = invalidatedAssignments.get(matchKey) || preview.state.assignments[matchKey];
         const workflow = invalidatedWorkflows.get(matchKey) || preview.state.workflows[matchKey];
         if (!assignment) continue;
+        const publicStatus = isTarget ? 'replay_required' : 'scheduled';
+        const draftState = isTarget ? 'rejected' : 'idle';
         const nextAssignment = {
           ...assignment,
           dependencyReady: false,
-          publicStatus: 'replay_required',
+          publicStatus,
           lastTransitionId: id,
         };
         const nextWorkflow = {
           ...workflow,
-          draftState: 'rejected',
+          draftState,
           lock: null,
           lastTransitionId: id,
         };
         tx.update(ref('courtAssignments', matchKey), {
-          dependencyReady: false, publicStatus: 'replay_required', lastTransitionId: id,
+          dependencyReady: false, publicStatus, lastTransitionId: id,
         });
         tx.update(ref('scoreWorkflows', matchKey), {
-          draftState: 'rejected', lock: null, lastTransitionId: id,
+          draftState, lock: null, lastTransitionId: id,
         });
         if (assignment.courtId) {
           const state = descendantStates.get(assignment.courtId);
@@ -3694,7 +3736,9 @@ export async function applyApprovedCorrection(request) {
       }
     }
     for (const [courtId, state] of descendantStates) {
-      const priorityEntries = (state.queue.priorityEntries || []).map((entry) => {
+      const priorityEntries = (state.queue.priorityEntries || []).filter((entry) => (
+        !(invalidatedAssignments.has(entry.matchKey) && entry.kind === 'correction_replay')
+      )).map((entry) => {
         const assignment = state.assignments[entry.matchKey];
         if (assignment?.dependencyReady === false) return { ...entry, eligibility: 'blocked_dependency' };
         return entry.eligibility === 'blocked_dependency' ? { ...entry, eligibility: 'ready' } : entry;

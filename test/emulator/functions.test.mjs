@@ -5,6 +5,8 @@ import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/
 import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, setDoc, Timestamp, updateDoc } from 'firebase/firestore';
 import { createFixture, IDS, PROJECT_ID, path } from './fixtures.mjs';
 import { activateDependencyEntries, consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
+import { generateBracket } from '../../js/bracket.js';
+import { loadAdminFunctions } from '../../js/qualification-ui-test.mjs';
 
 const host = process.env.FUNCTIONS_EMULATOR_HOST || '127.0.0.1:5001';
 const [functionsHost, functionsPort] = host.split(':');
@@ -780,7 +782,7 @@ export async function runFunctionsSuite() {
     assert.deepEqual(await readDependencyState('dependency-semi-b'), untouchedEditing,
       'unrelated-publication-retains-recorder-lock-draft-and-official-baseline');
     await submittedDependency('dependency-semi-b');
-    await publishWithQualification({
+    const dependencySecond = await publishWithQualification({
       tournamentId: 'main', division: 'men',
       expectedMatches: whileEditing.matches.map((match) => ({
         id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
@@ -797,6 +799,31 @@ export async function runFunctionsSuite() {
     assert.equal(dependencyFinal.data().teamB.id, 'dependency-c', 'final-publish-propagates-second-semifinal-entrant');
     assert.equal(dependencyAssignment.data().dependencyReady, true, 'final-publish-activates-preassigned-final-dependency');
     assert.equal(dependencyQueue.data().priorityEntries[0].eligibility, 'ready', 'final-publish-activates-blocked-final-priority');
+    const { finalStructureMatch } = loadAdminFunctions(['finalStructureMatch']);
+    const baselineFor = (matches) => matches.map((match) => ({
+      id: match.id, lastTransitionId: match.lastTransitionId, officialRevision: match.officialRevision,
+    })).sort((a, b) => a.id.localeCompare(b.id));
+    assert.ok(dependencySecond.matches.some((match) => match.officialCurrent === true),
+      'roundtrip-fixture-must-include-real-server-result-metadata');
+    const championship = await publishWithQualification({
+      tournamentId: 'main', division: 'men', expectedMatches: baselineFor(dependencySecond.matches),
+      matches: dependencySecond.matches.map(finalStructureMatch),
+      scoreDrafts: [{
+        matchId: 'dependency-final', sets: [{ a: 4, b: 10 }, { a: 4, b: 10 }],
+        reason: '', expectedSubmissionVersion: 0,
+      }],
+    });
+    const champion = championship.matches.find((match) => match.id === 'dependency-final');
+    assert.equal(champion.winnerTeam.id, 'dependency-c', 'actual-server-response-can-publish-the-championship-score');
+    assert.equal(champion.officialRevision, 1);
+    const unchangedChampionship = await publishWithQualification({
+      tournamentId: 'main', division: 'men', expectedMatches: baselineFor(championship.matches),
+      matches: championship.matches.map(finalStructureMatch), scoreDrafts: [],
+    });
+    assert.equal(unchangedChampionship.scoreRevisions['dependency-final'], 1,
+      'republishing-the-championship-preserves-its-approved-score-revision');
+    assert.ok(unchangedChampionship.matches.every((match) => match.officialCurrent === true),
+      'championship-publication-keeps-earlier-approved-results-official');
     await f.seed(async (db) => {
       for (const id of ['dependency-semi-a', 'dependency-semi-b', 'dependency-final']) {
         await deleteDoc(doc(db, 'tournaments/main/divisions/men/finalMatches', id));
@@ -806,6 +833,206 @@ export async function runFunctionsSuite() {
       await deleteDoc(doc(db, path('courtQueues', 'dependency-court')));
       for (const id of dependencyTeams) await deleteDoc(doc(db, path('teams', id)));
     });
+
+    const womenTeams = Array.from({ length: 8 }, (_, index) => ({
+      id: `women-roundtrip-${index + 1}`, name: `여자 ${index + 1}팀`,
+    }));
+    let womenPublished = await publishWithQualification({
+      tournamentId: 'main', division: 'women', expectedMatches: [],
+      matches: generateBracket(womenTeams).matches.map(finalStructureMatch), scoreDrafts: [],
+    });
+    for (const round of [1, 2, 3]) {
+      const drafts = womenPublished.matches.filter((match) => match.round === round).map((match) => ({
+        matchId: match.id, sets: score, reason: '', expectedSubmissionVersion: 0,
+      }));
+      assert.equal(drafts.length, 8 / (2 ** round));
+      womenPublished = await publishWithQualification({
+        tournamentId: 'main', division: 'women', expectedMatches: baselineFor(womenPublished.matches),
+        matches: womenPublished.matches.map(finalStructureMatch), scoreDrafts: drafts,
+      });
+      assert.ok(womenPublished.matches.filter((match) => match.round <= round).every((match) => match.status === 'done'),
+        `women-round-${round}-publishes-real-server-response-without-metadata-leakage`);
+      assert.ok(womenPublished.matches.filter((match) => match.round <= round).every((match) => match.officialCurrent === true),
+        `women-round-${round}-retains-all-earlier-official-scores`);
+    }
+    const womenChampion = womenPublished.matches.find((match) => match.round === 3);
+    assert.equal(womenChampion.winnerTeam.id, womenTeams[0].id);
+    assert.equal(womenChampion.officialRevision, 1);
+    await f.seed(async (db) => {
+      for (const match of womenPublished.matches) {
+        await deleteDoc(doc(db, `tournaments/main/divisions/women/finalMatches/${match.id}`));
+        await deleteDoc(doc(db, path('courtAssignments', `final:women:${match.id}`)));
+        await deleteDoc(doc(db, path('scoreWorkflows', `final:women:${match.id}`)));
+      }
+    });
+
+    for (const separateCourt of [false, true]) {
+      const division = 'men';
+      const courtId = `sequential-correction-${separateCourt}`;
+      const finalCourtId = separateCourt ? `${courtId}-final` : courtId;
+      const correctionTeams = Array.from({ length: 4 }, (_, index) => ({
+        id: `sequential-${index}`, name: `정정 ${index + 1}팀`,
+      }));
+      const initial = await publishWithQualification({
+        tournamentId: 'main', division, expectedMatches: [],
+        matches: generateBracket(correctionTeams).matches.map(finalStructureMatch), scoreDrafts: [],
+      });
+      const semis = initial.matches.filter((match) => match.round === 1);
+      const finalId = initial.matches.find((match) => match.round === 2).id;
+      const keyFor = (id) => `final:men:${id}`;
+      const finalKey = keyFor(finalId);
+      const officialPath = (id) => `tournaments/main/divisions/men/finalMatches/${id}`;
+      const readState = () => f.seed(async (db) => ({
+        matches: Object.fromEntries((await getDocs(collection(db, 'tournaments/main/divisions/men/finalMatches')))
+          .docs.map((snapshot) => [snapshot.id, snapshot.data()])),
+        assignment: (await getDoc(doc(db, path('courtAssignments', finalKey)))).data(),
+        workflow: (await getDoc(doc(db, path('scoreWorkflows', finalKey)))).data(),
+        queue: (await getDoc(doc(db, path('courtQueues', finalCourtId)))).data(),
+      }));
+      await f.seed(async (db) => {
+        for (const id of new Set([courtId, finalCourtId])) {
+          await setDoc(doc(db, path('courts', id)), { name: id, recorderName: '', status: 'active' });
+          await setDoc(doc(db, path('courtQueues', id)), {
+            queueRevision: 0, normalCursorMatchKey: id === courtId ? keyFor(semis[0].id) : null,
+            currentMatchKey: id === courtId ? keyFor(semis[0].id) : null,
+            nextMatchKey: id === courtId ? keyFor(semis[1].id) : null,
+            priorityEntries: [], nextPrioritySequence: 0,
+          });
+        }
+        for (let index = 0; index < semis.length; index += 1) {
+          await updateDoc(doc(db, path('courtAssignments', keyFor(semis[index].id))), {
+            courtId, courtOrder: index + 1,
+            nextCourtMatchKey: index === 0 ? keyFor(semis[1].id) : separateCourt ? null : finalKey,
+          });
+        }
+        await setDoc(doc(db, path('courtAssignments', finalKey)), {
+          matchKey: finalKey, matchType: 'final', matchId: finalId, divisionId: division, division,
+          courtId: finalCourtId, courtOrder: separateCourt ? 1 : 3, nextCourtMatchKey: null,
+          dependencyReady: false, publicStatus: 'scheduled', attemptCount: 0, officialRevision: 0,
+        });
+        await setDoc(doc(db, path('scoreWorkflows', finalKey)), {
+          matchKey: finalKey, draftState: 'idle', lock: null, draft: { sets: [] },
+          draftRevision: 0, submissionVersion: 0, officialRevision: 0,
+          submittedSnapshot: null, officialSnapshot: null,
+        });
+      });
+      await publishWithQualification({
+        tournamentId: 'main', division, expectedMatches: baselineFor(initial.matches),
+        matches: initial.matches.map(finalStructureMatch),
+        scoreDrafts: semis.map((match) => ({ matchId: match.id, sets: score, reason: '', expectedSubmissionVersion: 0 })),
+      });
+      const previewFor = (id) => call(functions, 'previewApprovedCorrection', { ...data, matchKeys: [keyFor(id)] });
+      const applyPlan = (planToken) => call(functions, 'applyApprovedCorrection', {
+        ...data, planToken, reason: '준결승 두 경기 기록지 재확인',
+      });
+      const firstPlan = await previewFor(semis[0].id);
+      const firstCorrection = await applyPlan(firstPlan.planToken);
+      const afterFirst = await readState();
+      assert.equal(afterFirst.matches[finalId].status, 'waiting');
+      assert.equal(afterFirst.assignment.publicStatus, 'scheduled');
+      assert.equal(afterFirst.workflow.draftState, 'idle');
+      assert.equal(afterFirst.assignment.dependencyReady, false);
+      assert.equal(afterFirst.queue.priorityEntries.some((entry) => entry.matchKey === finalKey), false,
+        'an-unplayed-final-does-not-become-priority-rework');
+
+      // Reproduce the automatic waiting state already present in the live tournament.
+      await f.seed(async (db) => {
+        await updateDoc(doc(db, path('courtAssignments', finalKey)), { publicStatus: 'replay_required' });
+        await updateDoc(doc(db, path('scoreWorkflows', finalKey)), { draftState: 'rejected' });
+        await updateDoc(doc(db, path('courtQueues', finalCourtId)), {
+          priorityEntries: [...afterFirst.queue.priorityEntries, {
+            entryId: `correction_replay:${finalKey}`, matchKey: finalKey, kind: 'correction_replay',
+            enqueueSequence: afterFirst.queue.nextPrioritySequence, pathDepth: 1,
+            courtOrder: afterFirst.assignment.courtOrder, eligibility: 'blocked_dependency',
+            sourceTransitionIds: [firstCorrection.transitionId],
+          }],
+          nextPrioritySequence: afterFirst.queue.nextPrioritySequence + 1,
+        });
+      });
+      const waiting = await readState();
+      for (const mutation of [
+        { workflow: { draftRevision: 1 } },
+        { workflow: { submissionVersion: 1 } },
+        { workflow: { officialRevision: 1 } },
+        { assignment: { attemptCount: 1 } },
+        { workflow: { lock: { token: 'active-input' } } },
+        { workflow: { draft: { sets: [{ a: 1, b: 0 }] } } },
+        { workflow: { submittedSnapshot: { sets: score } } },
+        { workflow: { officialSnapshot: { sets: score } } },
+        { assignment: { dependencyReady: true } },
+        { official: { officialRevision: 1 } },
+      ]) {
+        await f.seed(async (db) => {
+          await setDoc(doc(db, path('courtAssignments', finalKey)), { ...waiting.assignment, ...mutation.assignment });
+          await setDoc(doc(db, path('scoreWorkflows', finalKey)), { ...waiting.workflow, ...mutation.workflow });
+          await setDoc(doc(db, officialPath(finalId)), { ...waiting.matches[finalId], ...mutation.official });
+        });
+        const beforeBlocked = await readState();
+        await assert.rejects(previewFor(semis[1].id), (error) => (
+          ['downstream_final_history', 'downstream_final_workflow_history'].includes(error.details?.reason)
+        ), 'actual-downstream-history-is-rejected-before-confirmation');
+        assert.deepEqual(await readState(), beforeBlocked, 'blocked-preview-never-clears-final-records');
+      }
+      await f.seed(async (db) => {
+        await setDoc(doc(db, path('courtAssignments', finalKey)), waiting.assignment);
+        await setDoc(doc(db, path('scoreWorkflows', finalKey)), waiting.workflow);
+        await setDoc(doc(db, officialPath(finalId)), waiting.matches[finalId]);
+      });
+      const stalePlan = await previewFor(semis[1].id);
+      await f.seed((db) => updateDoc(doc(db, path('scoreWorkflows', finalKey)), {
+        lastTransitionId: 'descendant-changed-after-preview',
+      }));
+      await assert.rejects(applyPlan(stalePlan.planToken), /Correction plan changed/,
+        'descendant-state-changes-invalidate-preview-even-on-another-court');
+      const secondPlan = await previewFor(semis[1].id);
+      await applyPlan(secondPlan.planToken);
+      const afterSecond = await readState();
+      assert.equal(afterSecond.matches[finalId].teamA, null);
+      assert.equal(afterSecond.matches[finalId].teamB, null);
+      assert.equal(afterSecond.assignment.publicStatus, 'scheduled');
+      assert.equal(afterSecond.workflow.draftState, 'idle');
+      assert.equal(afterSecond.workflow.submissionVersion, 0);
+      assert.equal(afterSecond.workflow.officialRevision, 0);
+      assert.equal(afterSecond.queue.priorityEntries.some((entry) => entry.matchKey === finalKey), false);
+      assert.equal(new Set(afterSecond.queue.priorityEntries.map((entry) => entry.matchKey)).size,
+        afterSecond.queue.priorityEntries.length);
+
+      const correctedSets = [{ a: 8, b: 10 }, { a: 7, b: 10 }];
+      await f.seed(async (db) => {
+        for (const match of semis) {
+          await updateDoc(doc(db, path('courtAssignments', keyFor(match.id))), { publicStatus: 'under_review' });
+          await updateDoc(doc(db, path('scoreWorkflows', keyFor(match.id))), {
+            draftState: 'submitted', submissionVersion: 1, submission: { version: 1 },
+            submittedSnapshot: { sets: correctedSets },
+          });
+        }
+      });
+      const republished = await publishWithQualification({
+        tournamentId: 'main', division, expectedMatches: baselineFor(Object.values(afterSecond.matches)),
+        matches: Object.values(afterSecond.matches).map(finalStructureMatch),
+        scoreDrafts: semis.map((match) => ({
+          matchId: match.id, sets: correctedSets, reason: '기록지 대조 후 정정', expectedSubmissionVersion: 1,
+        })),
+      });
+      const recovered = await readState();
+      assert.equal(recovered.assignment.dependencyReady, true);
+      assert.equal(recovered.assignment.publicStatus, 'scheduled');
+      assert.equal(recovered.workflow.draftState, 'idle');
+      assert.equal(recovered.queue.currentMatchKey, finalKey);
+      const final = republished.matches.find((match) => match.id === finalId);
+      assert.deepEqual(new Set([final.teamA.id, final.teamB.id]), new Set(semis.map((match) => match.teamB.id)));
+      await f.seed(async (db) => {
+        for (const match of initial.matches) {
+          await deleteDoc(doc(db, officialPath(match.id)));
+          await deleteDoc(doc(db, path('courtAssignments', keyFor(match.id))));
+          await deleteDoc(doc(db, path('scoreWorkflows', keyFor(match.id))));
+        }
+        for (const id of new Set([courtId, finalCourtId])) {
+          await deleteDoc(doc(db, path('courtQueues', id)));
+          await deleteDoc(doc(db, path('courts', id)));
+        }
+      });
+    }
 
     await clearQualificationFixture();
     await f.seed(async (db) => {

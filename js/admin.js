@@ -5595,12 +5595,15 @@ async function handlePublishBracket() {
 }
 
 function finalStructureMatch(match) {
-  const {
-    sets, result, winner, winnerSide, winnerTeam,
-    setsWonA, setsWonB, pointsForA, pointsForB,
-    officialRevision, lastTransitionId,
-    ...structure
-  } = match;
+  const structure = {};
+  for (const field of [
+    "id", "round", "roundLabel", "index", "teamA", "teamB", "teamASource", "teamBSource",
+    "status", "byeCandidate", "nextMatchId", "nextSlot",
+  ]) {
+    if (Object.hasOwn(match, field) && match[field] !== undefined) {
+      structure[field] = structuredClone(match[field]);
+    }
+  }
   if (structure.status === "done" || structure.status === "in_progress") structure.status = "pending";
   if (structure.round > 1) {
     structure.teamA = null;
