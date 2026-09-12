@@ -5,7 +5,7 @@ import { getFunctions, connectFunctionsEmulator, httpsCallable } from 'firebase/
 import { collection, deleteDoc, deleteField, doc, getDoc, getDocs, setDoc, Timestamp, updateDoc } from 'firebase/firestore';
 import { createFixture, IDS, PROJECT_ID, path } from './fixtures.mjs';
 import { activateDependencyEntries, consumeCurrentAndAdvance, insertPriorityEntry, planCorrectionReplay, planRejectedRework, projectForceRelease, selectQueueView } from '../../functions/workflow-core.js';
-import { generateBracket } from '../../js/bracket.js';
+import { generateBracket, placeByeTeam, confirmBye, swapFinalSeedSlots, finalSlotsLocked } from '../../js/bracket.js';
 import { loadAdminFunctions } from '../../js/qualification-ui-test.mjs';
 
 const host = process.env.FUNCTIONS_EMULATOR_HOST || '127.0.0.1:5001';
@@ -1030,6 +1030,94 @@ export async function runFunctionsSuite() {
         for (const id of new Set([courtId, finalCourtId])) {
           await deleteDoc(doc(db, path('courtQueues', id)));
           await deleteDoc(doc(db, path('courts', id)));
+        }
+      });
+    }
+
+    {
+      const candidates = Array.from({ length: 6 }, (_, index) => ({
+        id: `bye-drag-${index + 1}`, name: `6강 ${index + 1}팀`,
+      }));
+      const draft = generateBracket(candidates).matches;
+      for (const match of draft.filter((match) => match.status === 'empty')) {
+        assert.equal(placeByeTeam(draft, match.id).ok, true);
+      }
+      const regular = draft.find((match) => match.round === 1 && match.teamA && match.teamB);
+      const bye = draft.find((match) => match.status === 'bye_pending');
+      assert.equal(swapFinalSeedSlots(draft,
+        { matchId: regular.id, side: 'A' },
+        { matchId: bye.id, side: bye.teamA ? 'B' : 'A' }).ok, true);
+      for (const match of draft.filter((match) => match.round === 1)) {
+        for (const side of ['A', 'B']) {
+          if (!match[`team${side}`]) assert.equal(match[`team${side}Source`], null,
+            'a-dragged-empty-slot-has-no-source');
+        }
+      }
+      for (const match of draft.filter((match) => match.status === 'bye_pending')) {
+        assert.equal(confirmBye(draft, match.id).ok, true);
+      }
+      let published = await publishWithQualification({
+        tournamentId: 'main', division: 'men', expectedMatches: [],
+        matches: draft.map(finalStructureMatch), scoreDrafts: [],
+      });
+      const publishCurrent = async (payload) => {
+        const prepared = await call(functions, 'prepareFinalQualification', { ...data, division: 'men' });
+        assert.equal(prepared.state.ready, true);
+        return call(functions, 'publishFinalStructure', {
+          ...data, division: 'men', expectedPrelimFingerprint: prepared.fingerprint, tieSelections: {}, ...payload,
+        });
+      };
+      let recordedSnapshots;
+      for (const round of [1, 2, 3]) {
+        const matches = published.matches.map((match) => {
+          const structure = finalStructureMatch(match);
+          for (const key of ['teamA', 'teamB', 'teamASource', 'teamBSource']) {
+            if (structure[key]) structure[key] = Object.fromEntries(Object.entries(structure[key]).reverse());
+          }
+          return structure;
+        });
+        if (round === 2) {
+          recordedSnapshots = published.matches.filter((match) => match.round === 1).map((match) => ({
+            id: match.id, teamA: match.teamA, teamB: match.teamB,
+            sets: match.sets, status: match.status, revision: match.officialRevision,
+          }));
+          await f.seed(async (db) => {
+            for (const team of candidates) await updateDoc(doc(db, path('teams', team.id)), { name: `${team.name} 이름 수정` });
+          });
+        }
+        published = await publishCurrent({
+          expectedMatches: baselineFor(published.matches), matches,
+          scoreDrafts: published.matches.filter((match) => match.round === round && match.status !== 'bye')
+            .map((match) => ({ matchId: match.id, sets: score, reason: '', expectedSubmissionVersion: 0 })),
+        });
+        assert.ok(published.matches.filter((match) => match.round <= round)
+          .every((match) => match.status === 'bye' || (match.status === 'done' && match.officialCurrent === true)),
+        'bye-drag-name-edits-and-key-order-changes-can-publish-every-round');
+        if (recordedSnapshots) {
+          assert.deepEqual(published.matches.filter((match) => match.round === 1).map((match) => ({
+            id: match.id, teamA: match.teamA, teamB: match.teamB,
+            sets: match.sets, status: match.status, revision: match.officialRevision,
+          })), recordedSnapshots, 'name-edits-do-not-rewrite-approved-entrant-or-score-snapshots');
+        }
+      }
+      assert.equal(finalSlotsLocked(published.matches), true);
+      const protectedStructure = published.matches.map(finalStructureMatch);
+      const recorded = protectedStructure.find((match) => match.round === 1 && match.teamA && match.teamB);
+      [recorded.teamA, recorded.teamB] = [recorded.teamB, recorded.teamA];
+      [recorded.teamASource, recorded.teamBSource] = [recorded.teamBSource, recorded.teamASource];
+      await assert.rejects(publishCurrent({
+        expectedMatches: baselineFor(published.matches), matches: protectedStructure, scoreDrafts: [],
+      }), (error) => error.details?.reason === 'recorded_final_structure_changed',
+      'recorded-participant-reversal-still-fails-at-the-server-boundary');
+      await f.seed(async (db) => {
+        for (const match of published.matches) {
+          const current = await getDoc(doc(db, `tournaments/main/divisions/men/finalMatches/${match.id}`));
+          assert.deepEqual(current.data().teamA, match.teamA);
+          assert.deepEqual(current.data().teamB, match.teamB);
+          assert.equal(current.data().officialRevision, match.officialRevision);
+          await deleteDoc(current.ref);
+          await deleteDoc(doc(db, path('courtAssignments', `final:men:${match.id}`)));
+          await deleteDoc(doc(db, path('scoreWorkflows', `final:men:${match.id}`)));
         }
       });
     }

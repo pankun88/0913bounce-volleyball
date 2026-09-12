@@ -5451,10 +5451,36 @@ function renderFinalBracket() {
   const container = document.getElementById("finalBracketContainer");
   renderBracket(container, finalMatches, {
     editable: true,
+    slotsLocked: qualificationHasFinalPlay(),
+    canEditScore: (match) => !isFinalScoreStagingBlocked(match),
     onEdit: openFinalScoreModal,
     onSwapSlot: handleBracketSlotSwap,
     onConfirmBye: handleConfirmBye,
     getTeamLabel: teamGroupRankLabel,
+  });
+}
+
+function hasRecordedFinalStructureChanges() {
+  const canonicalValue = (value) => {
+    if (Array.isArray(value)) return value.map(canonicalValue);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])]));
+    }
+    return value ?? null;
+  };
+  return authoritativeFinalMatches.some((official) => {
+    if (!(official.officialRevision > 0) && official.status !== "bye") return false;
+    const local = finalMatches.find((match) => match.id === official.id);
+    if (!local) return true;
+    const structure = finalStructureMatch(local);
+    const fields = ["round", "index", "nextMatchId", "nextSlot"];
+    if (official.status === "bye") fields.push("status");
+    if (structure.round === 1) fields.push("teamA", "teamB", "teamASource", "teamBSource");
+    return fields.some((field) => (
+      ["teamA", "teamB"].includes(field)
+        ? (official[field]?.id ?? null) !== (structure[field]?.id ?? null)
+        : JSON.stringify(canonicalValue(official[field])) !== JSON.stringify(canonicalValue(structure[field]))
+    ));
   });
 }
 
@@ -5484,10 +5510,13 @@ function updateBracketPublishBar() {
       && qualificationProofStatus() !== "current")
     || (!authoritativeFinalMatches.length && !bracketPublishPending
       && qualificationProofStatus() !== "current");
+  const structureChanged = hasRecordedFinalStructureChanges();
 
   if (msg) {
     msg.textContent = bracketPublishConflict
       ? "공개 기준이 변경되었습니다. 로컬 초안을 버린 뒤 최신 대진표를 확인하세요."
+      : structureChanged
+      ? "기록이 있는 경기의 팀 자리가 바뀌었습니다. 저장된 대진으로 복구한 뒤 같은 팀 순서로 점수를 입력하세요."
       : qualificationNeedsReview
       ? "예선 진출 근거를 다시 확인해야 공개할 수 있습니다. 현재 초안과 점수는 보존됩니다."
       : bracketPublishPending
@@ -5495,10 +5524,10 @@ function updateBracketPublishBar() {
       : "모든 변경사항이 관객 화면에 공개되어 있습니다.";
   }
   if (btn) {
-    btn.disabled = (!bracketPublishPending && !bracketPublishConflict)
+    btn.disabled = (!bracketPublishPending && !bracketPublishConflict && !structureChanged)
       || bracketPublishInFlight
-      || (qualificationNeedsReview && !bracketPublishConflict);
-    btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : bracketPublishPending ? "관객 화면에 공개" : "공개 완료";
+      || (qualificationNeedsReview && !bracketPublishConflict && !structureChanged);
+    btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : structureChanged ? "저장된 대진으로 복구" : bracketPublishPending ? "관객 화면에 공개" : "공개 완료";
   }
 }
 
@@ -5510,6 +5539,9 @@ function finalPublicationErrorMessage(error) {
   if (reason === "final_workflow_busy") {
     return "입력·검수 중인 본선 경기의 대진이나 점수를 변경할 수 없습니다. 해당 경기의 입력·검수를 마친 뒤 다시 공개하세요. 기존 기록은 유지됩니다.";
   }
+  if (reason === "recorded_final_structure_changed") {
+    return "기록이 있는 경기의 팀 자리나 대진 연결이 바뀌었습니다. 저장된 대진으로 복구하고 점수만 정정하세요. 기존 기록은 유지됩니다.";
+  }
   return error?.message || String(error);
 }
 
@@ -5517,11 +5549,26 @@ function finalPublicationErrorMessage(error) {
  * 반영해서 대시보드(관객 화면)에 실제로 공유한다. 6강·준결승·결승 등 매 라운드 결과를 입력한 뒤
  * 이 버튼을 눌러 그때그때 공개할 수 있다. */
 async function handlePublishBracket() {
-  if ((!bracketPublishPending && !bracketPublishConflict) || bracketPublishInFlight) return;
+  if (bracketPublishInFlight) return;
+  const structureChanged = hasRecordedFinalStructureChanges();
+  if (!bracketPublishPending && !bracketPublishConflict && !structureChanged) return;
   if (bracketPublishConflict) {
     if (!confirm("최신 공개본과 충돌했습니다. 로컬 본선 초안과 점수 기록을 버릴까요?")) return;
     discardFinalDraft();
     showToast("로컬 본선 초안을 버리고 최신 공개본을 불러왔습니다.");
+    return;
+  }
+  if (structureChanged) {
+    if (finalScoreDrafts.size > 0) {
+      showToast("변경된 팀 자리의 점수 초안이 있어 자동으로 복구하지 않았습니다. ‘본선 점수 초안 JSON 내보내기’로 보관한 뒤 최신 대진을 다시 불러와 팀별 점수를 확인하세요.", 8000);
+      renderFinalTeamPicker();
+      return;
+    }
+    if (!confirm("팀 자리 변경만 취소하고 서버에 저장된 대진으로 복구할까요? 기존 공식 결과와 기록관 제출 기록은 유지됩니다.")) return;
+    qualificationPreparationError = "";
+    discardFinalDraft();
+    updateQualificationProofUi();
+    showToast("저장된 대진으로 복구했습니다. 같은 팀 순서로 점수를 입력하세요.", 6000);
     return;
   }
   const qualificationStateForPublish = qualificationServerState || qualificationStateForCurrentData();
@@ -5696,6 +5743,10 @@ async function handleConfirmBye(match) {
  * Firestore에 저장돼 대시보드에 공유된다. */
 async function handleBracketSlotSwap(fromSlot, toSlot) {
   if (!finalMutationAllowed()) return;
+  if (qualificationHasFinalPlay()) {
+    showToast("경기 입력·승인 이력이 있어 팀 자리를 바꿀 수 없습니다. 승인 취소 후에도 같은 팀 순서로 점수를 다시 입력하세요.", 6000);
+    return;
+  }
   const result = swapFinalSeedSlots(finalMatches, fromSlot, toSlot);
   if (!result.ok) {
     const msg = {
@@ -5736,7 +5787,8 @@ function openFinalScoreModal(match) {
       if (result.status !== "done") throw new Error("본선 점수는 승자가 확정된 완전한 경기 결과여야 합니다.");
       const official = authoritativeFinalMatches.find((item) => item.id === modalContext.matchId);
       const approved = (official?.officialRevision || 0) > 0;
-      const scoreChanged = JSON.stringify(official?.sets || []) !== JSON.stringify(sets);
+      const scoreChanged = JSON.stringify(normalizePlayedSets(official?.sets, true))
+        !== JSON.stringify(normalizePlayedSets(sets, true));
       if (approved && !scoreChanged) {
         showToast("승인된 본선 점수와 동일합니다. 공개할 변경사항이 없습니다.");
         return;
@@ -5907,7 +5959,7 @@ function reportError(action, err) {
     showToast(`${action}을(를) 중단했습니다. ${PRELIM_HISTORY_GUIDANCE}`, 7000);
     return;
   }
-  if (action === "관객 화면 공개" && ["final_submission_changed", "final_workflow_busy"].includes(err?.details?.reason)) {
+  if (action === "관객 화면 공개" && ["final_submission_changed", "final_workflow_busy", "recorded_final_structure_changed"].includes(err?.details?.reason)) {
     showToast(finalPublicationErrorMessage(err), 7000);
     return;
   }

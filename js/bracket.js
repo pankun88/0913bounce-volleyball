@@ -79,7 +79,7 @@ export function publicMatchView(match) {
 }
 
 function fixedTeamSource(team) {
-  return { type: "fixedTeam", teamId: team?.id || null };
+  return team?.id ? { type: "fixedTeam", teamId: team.id } : null;
 }
 
 function seedSource(team) {
@@ -453,16 +453,24 @@ export function invalidateDescendantResults(matches, matchId) {
   return invalidated;
 }
 
+/** 승인 취소로 현재 점수가 비워져도 과거 경기의 팀 기준은 고정한다. */
+export function finalSlotsLocked(matches) {
+  return matches.some((match) => (
+    Number(match.officialRevision || 0) > 0
+    || Number(match.attemptCount || 0) > 0
+    || Number(match.draftRevision || 0) > 0
+    || Number(match.submissionVersion || 0) > 0
+    || (match.sets && match.sets.length > 0)
+    || ['done', 'in_progress', 'bye'].includes(match.status)
+  ));
+}
+
 /**
- * 이미 생성된 본선 대진표에서, 아직 경기가 시작되지 않은 1라운드 두 자리(팀)를 서로 바꾼다.
- * 표준 시딩으로 자동 배정된 자리를 관리자가 직접 조정하거나, 부전승을 다른 팀에게
- * 주고 싶을 때(부전승 자리로 팀을 끌어다 놓으면, 원래 부전승이던 팀이 그 팀의 옛 상대와
- * 맞붙게 된다) 쓴다.
- * @param {object[]} matches generateBracket() 결과(또는 Firestore에서 읽은 동일 구조) - 직접 변형됨
+ * 아직 시작되지 않은 대진표의 1라운드 두 팀 자리를 바꾼다.
+ * @param {object[]} matches 직접 변형되는 대진표
  * @param {{matchId:string, side:'A'|'B'}} slotA
  * @param {{matchId:string, side:'A'|'B'}} slotB
- * @returns {{ok:boolean, reason?:string}} 실패 시 reason:
- *   'NOT_FOUND'|'ROUND1_ONLY'|'UNASSIGNED_SLOT'|'ALREADY_STARTED'|'SAME_SLOT'|'EMPTY_MATCH'
+ * @returns {{ok:boolean, reason?:string}}
  */
 export function swapFinalSeedSlots(matches, slotA, slotB) {
   const byId = indexById(matches);
@@ -476,10 +484,7 @@ export function swapFinalSeedSlots(matches, slotA, slotB) {
 
   // 부전승을 확정(confirmBye)하면 다음 라운드까지 전파되므로, 점수가 입력된 경기와 마찬가지로
   // 이미 진행된 결과로 취급해 자리 교체를 막는다. 아직 확정 전인 'bye_pending'은 막지 않는다.
-  const hasAnyResult = matches.some(
-    (m) => (m.sets && m.sets.length) || m.status === 'done' || m.status === 'in_progress' || m.status === 'bye'
-  );
-  if (hasAnyResult) return { ok: false, reason: 'ALREADY_STARTED' };
+  if (finalSlotsLocked(matches)) return { ok: false, reason: 'ALREADY_STARTED' };
 
   const getTeam = (m, side) => (side === 'A' ? m.teamA : m.teamB);
   const setTeam = (m, side, team) => { if (side === 'A') m.teamA = team; else m.teamB = team; };

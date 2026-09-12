@@ -1,4 +1,4 @@
-import { groupByRound, publicMatchView } from "./bracket.js";
+import { groupByRound, publicMatchView, finalSlotsLocked } from "./bracket.js";
 import { evaluateFinalMatch } from "./match-logic.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -34,17 +34,19 @@ export function renderBracket(container, matches, options = {}) {
   const publicMatches = options.editable ? matches : matches.map(publicMatchView);
   const { rounds } = groupByRound(publicMatches);
 
-  // 아무 경기도 시작되지 않았을 때만(=점수가 하나도 입력되지 않았을 때만) 1라운드 카드에서
-  // 팀을 드래그해 자리를 바꿀 수 있게 한다. 점수가 들어간 뒤에는 대진을 되돌리기 까다로워지므로 막는다.
-  const locked = publicMatches.some(
-    (m) => (m.sets && m.sets.length) || m.status === "done" || m.status === "in_progress" || m.status === "bye"
-  );
+  // 승인 취소로 점수가 비워져도 기존 기록과 입력권의 팀 기준은 바뀌지 않는다.
+  const locked = options.slotsLocked || finalSlotsLocked(matches);
   const canSwapSlots = Boolean(options.editable && options.onSwapSlot && !locked);
 
   if (canSwapSlots) {
     const hint = document.createElement("div");
     hint.className = "empty-hint bracket-swap-hint";
     hint.textContent = "1라운드 팀명을 드래그해서 대진(부전승 포함)을 직접 조정할 수 있습니다.";
+    container.appendChild(hint);
+  } else if (options.editable && options.onSwapSlot && locked) {
+    const hint = document.createElement("div");
+    hint.className = "empty-hint bracket-history-hint";
+    hint.textContent = "경기 입력·승인 이력이 있어 팀 자리는 고정됩니다. 승인 취소 후에도 같은 팀 순서로 점수를 다시 입력하세요.";
     container.appendChild(hint);
   }
 
@@ -283,7 +285,12 @@ function renderMatchCard(match, options) {
     const canConfirmBye = match.status === "bye_pending" && Boolean(options.onConfirmBye);
     const btn = document.createElement("button");
     btn.type = "button";
-    if (canEdit) {
+    if (canEdit && options.canEditScore?.(match) === false) {
+      btn.className = "match-edit-btn is-disabled";
+      btn.disabled = true;
+      btn.textContent = "기록관 입력·검수 중";
+      btn.title = "기록관 제출 점수는 ‘기록·검수’에서 확인하고 공개 초안에 반영하세요.";
+    } else if (canEdit) {
       btn.className = "match-edit-btn";
       btn.textContent = match.status === "done" ? "점수 수정" : "점수 입력";
       btn.addEventListener("click", () => options.onEdit && options.onEdit(match));

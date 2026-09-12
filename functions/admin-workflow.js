@@ -1720,9 +1720,14 @@ export async function publishFinalStructure(request) {
           || (replacement && !existingFinalPlay)) continue;
       const fields = ['round', 'index', 'nextMatchId', 'nextSlot'];
       if (old.status === 'bye') fields.push('status');
-      if (match.round === 1) fields.push('teamA', 'teamB', 'teamASource', 'teamBSource');
-      if (fields.some((field) => JSON.stringify(old[field] ?? null) !== JSON.stringify(match[field] ?? null))) {
-        bad(`Recorded final structure cannot change: ${match.id}.`);
+      if (match.round === 1) fields.push('teamASource', 'teamBSource');
+      const changedEntrants = match.round === 1 && ['teamA', 'teamB'].some((field) => (
+        (old[field]?.id ?? null) !== (match[field]?.id ?? null)
+      ));
+      if (changedEntrants || fields.some((field) => !isDeepStrictEqual(old[field] ?? null, match[field] ?? null))) {
+        throw new HttpsError('failed-precondition',
+          '입력·승인 이력이 있는 본선 경기의 팀 자리나 대진 연결은 바꿀 수 없습니다. 저장된 대진을 유지하고 점수만 정정하세요.',
+          { reason: 'recorded_final_structure_changed', matchId: match.id });
       }
     }
     const divisionTeamDocs = new Map(teamsSnap.docs.map((snap) => [snap.id, snap]));
@@ -1791,6 +1796,11 @@ export async function publishFinalStructure(request) {
       const item = canonical.get(match.id);
       const old = existing.get(match.id);
       const draft = staged.get(match.id);
+      if (old?.officialRevision > 0 || old?.status === 'bye') {
+        for (const field of ['teamA', 'teamB']) {
+          if (old[field]?.id && old[field].id === item[field]?.id) item[field] = { ...old[field] };
+        }
+      }
       const preserved = old?.officialRevision > 0 && !draft
         && isDeepStrictEqual(old.teamA ?? null, item.teamA)
         && isDeepStrictEqual(old.teamB ?? null, item.teamB);
@@ -1827,7 +1837,8 @@ export async function publishFinalStructure(request) {
         item.winnerSide = item.teamA ? 'A' : (item.teamB ? 'B' : null);
         item.winnerTeam = item.teamA || item.teamB || null;
       }
-      if ((item.officialRevision > 0 || item.status === 'bye') && item.nextMatchId) {
+      if (((item.officialRevision > 0 && item.officialCurrent !== false && item.status === 'done')
+          || item.status === 'bye') && item.nextMatchId) {
         const next = canonical.get(item.nextMatchId);
         const side = item.nextSlot;
         next[`team${side}`] = item.winnerTeam;
@@ -1839,10 +1850,12 @@ export async function publishFinalStructure(request) {
       const item = canonical.get(id);
       if (!item || (!(old.officialRevision > 0) && old.status !== 'bye')) continue;
       if (['teamA', 'teamB', 'teamASource', 'teamBSource', 'round', 'index', 'nextMatchId', 'nextSlot']
-        .some((field) => JSON.stringify(old[field] ?? null) !== JSON.stringify(item[field] ?? null))
+        .some((field) => !isDeepStrictEqual(old[field] ?? null, item[field] ?? null))
         || (old.status === 'bye' && item.status !== 'bye')) {
         if (allowUnplayedReplacement) continue;
-        bad(`Recorded final participants cannot change: ${id}.`);
+        throw new HttpsError('failed-precondition',
+          '기록이 있는 본선 경기의 참가팀이나 대진 연결이 바뀌었습니다. 기존 기록을 보호하기 위해 공개하지 않았습니다.',
+          { reason: 'recorded_final_structure_changed', matchId: id });
       }
     }
     for (const matchId of winnerChangingScoreChanges) {
@@ -1902,6 +1915,11 @@ export async function publishFinalStructure(request) {
       );
       const old = existing.get(matchId);
       const match = canonical.get(matchId);
+      if (active && old && !staged.has(matchId)) {
+        for (const field of ['teamA', 'teamB']) {
+          if (old[field]?.id && old[field].id === match[field]?.id) match[field] = { ...old[field] };
+        }
+      }
       // Publishing one reviewed match must not approve, clear, or block another untouched input/review.
       const unchanged = old && [
         'round', 'index', 'teamA', 'teamB', 'teamASource', 'teamBSource',
@@ -1938,7 +1956,7 @@ export async function publishFinalStructure(request) {
       const match = canonical.get(assignment.matchId);
       const old = existing.get(assignment.matchId);
       if (match && ['teamA', 'teamB', 'status', 'officialRevision']
-        .some((field) => JSON.stringify(match[field] ?? null) !== JSON.stringify(old?.[field] ?? null))) {
+        .some((field) => !isDeepStrictEqual(match[field] ?? null, old?.[field] ?? null))) {
         affectedCourts.add(assignment.courtId);
       }
     }

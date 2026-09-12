@@ -8,7 +8,7 @@ import {
   evaluateFinalMatch,
   normalizePlayedSets,
 } from "./match-logic.js";
-import { buildCrossGroupSeedOrder, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
+import { buildCrossGroupSeedOrder, generateBracket, recordMatchResult, invalidateDescendantResults, swapFinalSeedSlots, finalSlotsLocked } from "./bracket.js";
 
 const adminSource = fs.readFileSync(new URL("./admin.js", import.meta.url), "utf8");
 
@@ -101,6 +101,8 @@ function loadAdminFunctions(names, values = {}) {
     normalizePlayedSets,
     recordMatchResult,
     invalidateDescendantResults,
+    swapFinalSeedSlots,
+    finalSlotsLocked,
     buildCrossGroupSeedOrder,
     generateBracket,
     ...values,
@@ -359,7 +361,8 @@ function finalUiFixture() {
     "qualificationPublishContext", "prepareFinalQualificationFromServer",
     "handleQualificationRevalidation", "updateQualificationProofUi",
     "onGenerateBracket", "handleClearBracket", "updateBracketPublishBar",
-    "handlePublishBracket", "finalStructureMatch",
+    "handlePublishBracket", "finalStructureMatch", "hasRecordedFinalStructureChanges", "discardFinalDraft",
+    "handleBracketSlotSwap",
     "stageSubmittedFinalReview", "stageFinalScoreDraft", "finalPublicationErrorMessage",
   ], {
     activeDivision: "men",
@@ -620,6 +623,64 @@ function testFinalStructureProjection() {
   assert.equal(bye.status, "bye", "confirmed byes remain structural outcomes");
 }
 
+async function testRetractedBracketLocksAndRecovery() {
+  const { context, elements, calls, toasts } = finalUiFixture();
+  await call(context, "onGenerateBracket");
+  const matches = structuredClone(context.finalMatches);
+  Object.assign(matches[0], { officialRevision: 1, officialCurrent: false, sets: [], status: "pending" });
+  call(context, "resetFinalDraft", matches);
+  context.qualificationProof = { status: "current", fingerprint: "f".repeat(64) };
+  const id = context.finalMatches[0].id;
+  const before = jsonValue(context.finalMatches);
+  assert.equal(finalSlotsLocked(context.finalMatches), true, "retracted approvals still lock slots");
+  assert.deepEqual(swapFinalSeedSlots(context.finalMatches, { matchId: id, side: "A" }, { matchId: id, side: "B" }),
+    { ok: false, reason: "ALREADY_STARTED" });
+  await call(context, "handleBracketSlotSwap", { matchId: id, side: "A" }, { matchId: id, side: "B" });
+  assert.deepEqual(jsonValue(context.finalMatches), before, "UI handler and bracket helper both preserve recorded orientation");
+
+  // A draft already altered by an older screen can recover without a failing server write.
+  const swapLocal = () => {
+    const match = context.finalMatches[0];
+    [match.teamA, match.teamB] = [match.teamB, match.teamA];
+    [match.teamASource, match.teamBSource] = [match.teamBSource, match.teamASource];
+    context.bracketPublishPending = true;
+  };
+  swapLocal();
+  call(context, "updateBracketPublishBar");
+  assert.equal(elements.publishBracketBtn.textContent, "저장된 대진으로 복구");
+  const beforeCalls = calls.length;
+  context.confirm = () => false;
+  await call(context, "handlePublishBracket");
+  assert.equal(call(context, "hasRecordedFinalStructureChanges"), true, "cancelled recovery leaves local changes intact");
+  context.confirm = () => true;
+  await call(context, "handlePublishBracket");
+  assert.deepEqual(jsonValue(context.finalMatches), before);
+  assert.equal(calls.length, beforeCalls, "recovery does not publish or rewrite official results");
+  assert.equal(context.bracketPublishPending, false);
+  assert.equal(call(context, "hasRecordedFinalStructureChanges"), false);
+
+  swapLocal();
+  context.finalScoreDrafts.set(id, { matchId: id, sets: finishedSets });
+  const scoredDraft = context.finalScoreDrafts.get(id);
+  await call(context, "handlePublishBracket");
+  assert.equal(context.finalScoreDrafts.get(id), scoredDraft, "ambiguous score orientation is not silently reversed or discarded");
+  assert.equal(call(context, "hasRecordedFinalStructureChanges"), true);
+  assert.equal(calls.length, beforeCalls);
+  assert.match(toasts.at(-1), /자동으로 복구하지 않았습니다/);
+
+  call(context, "resetFinalDraft", matches);
+  const source = context.finalMatches[0].teamASource;
+  context.finalMatches[0].teamASource = Object.fromEntries(Object.entries(source).reverse());
+  assert.equal(call(context, "hasRecordedFinalStructureChanges"), false, "object key order is not a bracket change");
+  context.finalMatches[0].officialRevision = 0;
+  context.authoritativeFinalMatches[0].officialRevision = 0;
+  context.reviewAssignments.push({ id: `final:men:${id}`, matchType: "final", divisionId: "men" });
+  context.reviewWorkflows.set(`final:men:${id}`, { draftState: "editing", draftRevision: 1 });
+  const activeBefore = jsonValue(context.finalMatches);
+  await call(context, "handleBracketSlotSwap", { matchId: id, side: "A" }, { matchId: id, side: "B" });
+  assert.deepEqual(jsonValue(context.finalMatches), activeBefore, "private recorder activity also locks displayed slots");
+}
+
 async function runQualificationUiSuite() {
   testActualSourceInvalidationAndForeignRecords();
   testActualSelectionState();
@@ -630,6 +691,7 @@ async function runQualificationUiSuite() {
   await testInvalidQualificationAndFailedResetStayBlocked();
   await testSubmittedFinalStagingAndPublicationErrors();
   testFinalStructureProjection();
+  await testRetractedBracketLocksAndRecovery();
   console.log("qualification UI fixtures passed");
 }
 
