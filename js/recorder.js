@@ -50,6 +50,7 @@ const storageFailureMessages = {
 };
 const ownershipLostMessage = "입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.";
 let ownershipWarning = null;
+let submissionWarning = null;
 const isFinal = () => ["final", "tournament", "finals"].includes(assignment?.matchType) || ["final", "finals"].includes(assignment?.phase);
 const scoreKey = () => auth.currentUser && matchKey ? `recorder-score:${TOURNAMENT_ID}:${matchKey}:${auth.currentUser.uid}` : "";
 const storageKeyForEdit = () => activeStorageKey || scoreKey();
@@ -404,7 +405,7 @@ function setBusy(value) {
 function fenceAmbiguousOperation() {
   if (edit.pendingSubmit) {
     ui.backToEditButton.disabled = true;
-    ui.submitButton.disabled = !actionsReady() || ownershipLostFor(edit.pendingSubmit);
+    ui.submitButton.disabled = busy || !actionsReady() || ownershipLostFor(edit.pendingSubmit);
   }
   if (edit.pendingEnd) {
     ui.scoreFields.disabled = true;
@@ -704,6 +705,15 @@ function clearVerifiedOperationWarning(operation) {
   if (ownershipWarning && ui.connectionStatus?.textContent === ownershipWarning.message) status("");
   else if (ui.connectionStatus?.textContent === ownershipLostMessage) status("");
   ownershipWarning = null;
+}
+function showSubmissionWarning(operation, message) {
+  submissionWarning = { operation, message };
+  status(message);
+}
+function clearSubmissionWarning(operation) {
+  if (submissionWarning?.operation !== operation) return;
+  if (ui.connectionStatus.textContent === submissionWarning.message) status("");
+  submissionWarning = null;
 }
 function preserveOwnershipWarning(operation) {
   return ownershipWarning?.source === "loss"
@@ -1110,6 +1120,16 @@ function subscribeCourtSchedule(expectedCourtVersion) {
     renderDataState();
   }));
 }
+function followCourtQueue() {
+  // A successful submit advances the live queue before its RPC may resolve.
+  // Keep its confirmation and retry context until that response is reconciled.
+  if (edit.pendingSubmit && operationContextIsCurrent(edit.pendingSubmit)) return;
+  if (queue?.currentMatchKey && queue.currentMatchKey !== matchKey) {
+    attachMatch(queue.currentMatchKey);
+  } else if (!queue?.currentMatchKey && !edit.token && (!edit.pendingSubmit || !assignment)) {
+    clearCurrentMatch();
+  }
+}
 function subscribeCourtStreams(expectedCourtVersion = courtContextVersion) {
   setDataState("queue", "loading");
   setDataState("court", "loading");
@@ -1117,11 +1137,7 @@ function subscribeCourtStreams(expectedCourtVersion = courtContextVersion) {
     if (expectedCourtVersion !== courtContextVersion || viewState !== "operations") return;
     setSnapshotState("queue", snap.metadata);
     queue = snap.exists() ? {id:snap.id,...snap.data()} : null;
-    if (queue?.currentMatchKey && queue.currentMatchKey !== matchKey) {
-      attachMatch(queue.currentMatchKey);
-    } else if (!queue?.currentMatchKey && !edit.token && (!edit.pendingSubmit || !assignment)) {
-      clearCurrentMatch();
-    }
+    followCourtQueue();
     render();
   }, (error) => {
     if (expectedCourtVersion !== courtContextVersion) return;
@@ -1639,9 +1655,10 @@ ui.reviewButton.onclick=()=>{
 };
 ui.backToEditButton.onclick=()=>{edit.reviewedPayload=null;clearConfirmation();render();focus(ui.scoreFields.querySelector("input"));};
 ui.submitButton.onclick=async()=>{
-  if ((!edit.reviewedPayload && !edit.pendingSubmit) || !actionsReady()) return;
+  if (busy || (!edit.reviewedPayload && !edit.pendingSubmit) || !actionsReady()) return;
   const submittedMatchKey = matchKey;
   const submittedCourtId = courtId;
+  const submittedConfirmation = edit.reviewedPayload;
   let pending = edit.pendingSubmit;
   if (!pending) {
     pending = buildRecorderSubmitContext({
@@ -1665,6 +1682,7 @@ ui.submitButton.onclick=async()=>{
     await submitRecorderDraft(pending);
     if (edit.pendingSubmit !== pending) return;
     clearVerifiedOperationWarning(pending);
+    clearSubmissionWarning(pending);
     const completion = reconcileRecorderSubmit({
       pendingSubmit: pending,
       currentMatchKey: matchKey,
@@ -1673,6 +1691,12 @@ ui.submitButton.onclick=async()=>{
       outcome: "success",
     });
     edit.pendingSubmit = completion.pendingSubmit;
+    if (edit.reviewedPayload === submittedConfirmation) {
+      edit.reviewedPayload = null;
+      clearConfirmation();
+    }
+    ui.successTitle.textContent = `제출 완료 · ${draftTeamPair(pending.fixtureIdentity)}`;
+    ui.successPanel.hidden = false;
     if (completion.status === "completed_stale") {
       const preserved = preserveStoredRecorderDraft(getLocalStorage(), pending.storageKey, {
         draft: pending.score,
@@ -1681,33 +1705,27 @@ ui.submitButton.onclick=async()=>{
         identity: pending.fixtureIdentity,
       });
       if (!preserved.ok) setStorageStatus(preserved.reason);
-      status("이전 경기 제출 응답을 확인했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+      if (!edit.token && !edit.dirty && !edit.reviewedPayload && !edit.pendingSave
+          && !edit.pendingEnd && !edit.pendingDiscard && viewState === "operations"
+          && authActionsReady() && dataHealth.queue?.status === "ready") {
+        followCourtQueue();
+      }
       return;
     }
     const cleared = clearStoredKey(completion.clearStorageKey, pending.fixtureIdentity);
     if (completion.resetCurrent) {
       resetMatchEditor();
-      if (!queue?.currentMatchKey) clearCurrentMatch();
-    } else {
-      edit.token = null;
-      edit.dirty = false;
-      edit.localDraft = null;
-      edit.serverDraft = null;
-      edit.touched.clear();
-      renderedFormKey = "";
-      edit.reviewedPayload = null;
-      clearConfirmation();
-      stopHeartbeat();
+      ui.scoreError.textContent = "";
+      followCourtQueue();
+      action(cleared ? "제출 완료" : "제출 완료 · 임시 저장 정리에 실패했습니다.");
+      focus(ui.successTitle);
     }
-    ui.successPanel.hidden = false;
-    action(cleared ? "제출 완료" : "제출 완료 · 임시 저장 정리에 실패했습니다.");
-    focus(ui.successTitle);
   } catch(error) {
     const ambiguous = ambiguousNetworkResult(error);
     if (!operationContextIsCurrent(pending)) {
       if (!ambiguous && edit.pendingSubmit === pending) edit.pendingSubmit = null;
       if (!preserveOwnershipWarning(pending)) {
-        status("이전 경기 제출 응답을 확인하지 못했습니다. 현재 경기 입력은 변경하지 않았습니다.");
+        showSubmissionWarning(pending, "이전 경기 제출 응답을 확인하지 못했습니다. 현재 경기 입력은 변경하지 않았습니다.");
       }
       return;
     }
@@ -1720,11 +1738,23 @@ ui.submitButton.onclick=async()=>{
       }
     }
     ui.scoreError.textContent = recorderReason(error);
+    if (!ambiguous && queue && dataHealth.queue?.status === "ready"
+        && queue.currentMatchKey !== pending.matchKey) {
+      if (edit.localDraft && !storeDraft()) {
+        showSubmissionWarning(pending, "제출하지 못했고 임시 초안도 보관하지 못했습니다. 화면을 닫지 말고 입력한 점수를 별도로 기록하세요.");
+        return;
+      }
+      resetMatchEditor();
+      followCourtQueue();
+      ui.scoreError.textContent = "";
+      showSubmissionWarning(pending, `${draftTeamPair(pending.fixtureIdentity)} 제출 실패: ${recorderReason(error)} 입력은 임시 초안으로 보관하고 현재 경기 목록을 갱신했습니다.`);
+      return;
+    }
     const submitStatus = ambiguous
       ? "제출 여부를 확인하지 못했습니다. ‘점수 제출’을 다시 눌러 확인하세요."
       : `${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`;
     if (ambiguous && ui.confirmOutcome) ui.confirmOutcome.textContent = `제출 상태: ${submitStatus}`;
-    if (!preserveOwnershipWarning(pending)) status(submitStatus);
+    if (!preserveOwnershipWarning(pending)) showSubmissionWarning(pending, submitStatus);
   } finally {
     setBusy(false);
     fenceAmbiguousOperation();

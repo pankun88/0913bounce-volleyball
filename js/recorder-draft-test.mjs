@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
 import {
   buildRecorderFixtureIdentity,
   buildRecorderSubmitContext,
+  cloneRecorderFixtureIdentity,
   normalizeRecorderFixtureIdentity,
   parseStoredRecorderDraft,
   preserveStoredRecorderDraft,
@@ -273,4 +276,234 @@ assert.equal(staleSnapshot.stale, true);
   assert.equal(writes, 1);
 }
 
-console.log("recorder draft identity fixtures passed");
+// Exercise the real submit handler and live queue callback in both delivery orders.
+const recorderSource = readFileSync(new URL("./recorder.js", import.meta.url), "utf8");
+function recorderFunction(name) {
+  const start = recorderSource.indexOf(`function ${name}(`);
+  assert.ok(start >= 0, name);
+  const end = recorderSource.indexOf("\n}", start);
+  assert.ok(end > start, name);
+  return recorderSource.slice(start, end + 2);
+}
+function submitRaceHarness() {
+  const local = storage();
+  const score = { sets: [{ a: 5, b: 10 }, { a: 5, b: 10 }] };
+  const nextDraft = { sets: [{ a: 7, b: 6 }] };
+  const identities = new Map(["M1", "M2"].map((key) => [key, {
+    ...current, matchKey: key, teamAName: `${key} A팀`, teamBName: `${key} B팀`,
+  }]));
+  for (const [key, identity] of identities) {
+    writeStoredRecorderDraft(local, `score:${key}`, {
+      draft: key === "M1" ? score : nextDraft, touched: [], revision: 0, identity,
+    });
+  }
+  const ui = Object.fromEntries([
+    "authPanel", "courtPanel", "confirmPanel", "courtOperationsPanel", "workflowPanel", "backToEditButton",
+    "submitButton", "scoreFields", "scoreLegend", "scoreError", "successPanel", "successTitle", "confirmOutcome", "connectionStatus",
+  ].map((id) => [id, { hidden: false, disabled: false, textContent: "", replaceChildren() {} }]));
+  ui.authPanel.hidden = true;
+  ui.successPanel.hidden = true;
+  const edit = {
+    token: "M1-token", localDraft: score, serverDraft: score, dirty: true, touched: new Set(["0-a"]),
+    savedRevision: 0,
+    reviewedPayload: score, pendingSubmit: null, pendingSave: null, pendingEnd: null, pendingDiscard: null,
+  };
+  const requests = [], warnings = [], actions = [], attachments = [];
+  let queueListener;
+  const context = {
+    ui, edit, busy: false, viewState: "operations", courtId: "court-a", matchKey: "M1",
+    courtContextVersion: 1, contextVersion: 0, fixtureIdentity: identities.get("M1"),
+    workflow: { submissionVersion: 0 }, assignment: { id: "M1" },
+    dataHealth: { queue: { status: "ready" } },
+    submissionWarning: null,
+    queue: { currentMatchKey: "M1", queueRevision: 1 }, courtStops: [], db: {}, TOURNAMENT_ID: "test",
+    buildRecorderSubmitContext, reconcileRecorderSubmit, recorderFixtureIdentityEqual, cloneRecorderFixtureIdentity,
+    preserveStoredRecorderDraft, removeStoredRecorderDraft, writeStoredRecorderDraft,
+    actionsReady: () => true, authActionsReady: () => true, ownershipLostFor: () => false, clearVerifiedOperationWarning() {},
+    preserveOwnershipWarning: () => false, reconcileFailedOperationOwnership() {},
+    ambiguousNetworkResult: (error) => error.code === "functions/unavailable",
+    recorderReason: (error) => error.message,
+    stopHeartbeat() {}, clearStorageStatus() {}, focus() {}, renderCourtSelectors() {},
+    setStorageStatus: (reason) => warnings.push(reason),
+    getLocalStorage: () => local, storageKeyForEdit: () => `score:${context.matchKey}`,
+    isFinal: () => false, operationId: () => "submit-operation-1",
+    draftTeamPair: (identity) => `${identity.teamAName} vs ${identity.teamBName}`,
+    action: (message) => actions.push(message),
+    status: (message) => { warnings.push(message); ui.connectionStatus.textContent = message; },
+    doc: (_db, ...parts) => parts.join("/"),
+    onSnapshot: (_ref, _options, callback) => { queueListener = callback; return () => {}; },
+    subscribeCourt: () => () => {}, subscribeCourtSchedule() {}, setDataState() {}, setSnapshotState() {},
+    clearConfirmation: () => { ui.confirmPanel.hidden = true; },
+    clearCurrentMatch: () => { context.matchKey = ""; context.fixtureIdentity = null; },
+    attachMatch: (key) => {
+      attachments.push(key);
+      context.contextVersion += 1;
+      context.matchKey = key;
+      context.fixtureIdentity = identities.get(key);
+    },
+    render: () => { context.syncScreenVisibility(); context.fenceAmbiguousOperation(); },
+    setBusy: (value) => { context.busy = value; context.render(); },
+    submitRecorderDraft: (pending) => new Promise((resolve, reject) => {
+      requests.push({ pending, resolve, reject });
+    }),
+  };
+  vm.createContext(context);
+  const names = ["currentFixtureIdentity", "operationContextIsCurrent", "syncScreenVisibility",
+    "resetMatchEditor", "clearStoredKey", "storeDraft", "fenceAmbiguousOperation", "followCourtQueue", "subscribeCourtStreams",
+    "showSubmissionWarning", "clearSubmissionWarning"];
+  const start = recorderSource.indexOf("ui.submitButton.onclick=async()=>{");
+  const end = recorderSource.indexOf("\nui.endButton.onclick", start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(`${names.map(recorderFunction).join("\n")}\n${recorderSource.slice(start, end)}`, context);
+  context.subscribeCourtStreams();
+  const snapshot = (key) => queueListener({
+    id: "court-a", exists: () => true, data: () => ({ currentMatchKey: key, queueRevision: 2 }),
+    metadata: { fromCache: false },
+  });
+  return { context, ui, edit, requests, warnings, actions, attachments, local, identities, snapshot, score, nextDraft };
+}
+
+for (const queueFirst of [true, false]) {
+  for (const nextMatch of ["M2", null]) {
+    const h = submitRaceHarness();
+    const sending = h.ui.submitButton.onclick();
+    if (queueFirst) {
+      h.snapshot(nextMatch);
+      assert.equal(h.context.matchKey, "M1", "queue advancement waits for the pending submit response");
+      assert.equal(h.ui.confirmPanel.hidden, false);
+      assert.equal(h.ui.submitButton.disabled, true, "live snapshots cannot enable a duplicate in-flight submit");
+      await h.ui.submitButton.onclick();
+      assert.equal(h.requests.length, 1);
+    }
+    h.requests[0].resolve({ submitted: true });
+    await sending;
+    if (!queueFirst) h.snapshot(nextMatch);
+    assert.equal(h.context.matchKey, nextMatch || "");
+    assert.equal(h.edit.pendingSubmit, null);
+    assert.equal(h.edit.reviewedPayload, null);
+    assert.equal(h.edit.token, null);
+    assert.equal(h.edit.dirty, false);
+    assert.equal(h.ui.confirmPanel.hidden, true, "the submitted confirmation does not reappear");
+    assert.equal(h.ui.successPanel.hidden, false);
+    assert.match(h.ui.successTitle.textContent, /M1 A팀 vs M1 B팀/);
+    assert.equal(h.actions.at(-1), "제출 완료");
+    assert.deepEqual(h.warnings, []);
+    assert.equal(h.local.getItem("score:M1"), null);
+    assert.deepEqual(readStoredRecorderDraft(h.local, "score:M2").value.draft, h.nextDraft);
+  }
+}
+
+{
+  const h = submitRaceHarness();
+  const first = h.ui.submitButton.onclick();
+  const pending = h.edit.pendingSubmit;
+  h.snapshot("M2");
+  h.requests[0].reject(Object.assign(new Error("response lost"), { code: "functions/unavailable" }));
+  await first;
+  assert.equal(h.edit.pendingSubmit, pending);
+  assert.equal(h.context.matchKey, "M1");
+  assert.equal(h.ui.confirmPanel.hidden, false);
+  assert.equal(h.ui.submitButton.disabled, false, "an ambiguous response remains retryable without reloading");
+  const retry = h.ui.submitButton.onclick();
+  assert.equal(h.requests[1].pending, pending, "retry uses the original score, token, match, and operation ID");
+  h.requests[1].resolve({ submitted: true, idempotent: true });
+  await retry;
+  assert.equal(h.context.matchKey, "M2");
+  assert.equal(h.ui.confirmPanel.hidden, true);
+  assert.equal(h.ui.successPanel.hidden, false);
+  assert.equal(h.edit.pendingSubmit, null);
+  assert.equal(h.local.getItem("score:M1"), null);
+  assert.equal(h.ui.connectionStatus.textContent, "", "confirmed retry clears only its own obsolete failure notice");
+  assert.equal(h.ui.scoreError.textContent, "");
+}
+
+{
+  const h = submitRaceHarness();
+  const sending = h.ui.submitButton.onclick();
+  h.requests[0].reject(Object.assign(new Error("response lost"), { code: "functions/unavailable" }));
+  await sending;
+  h.context.status("다른 탭의 입력권 변경을 확인하세요.");
+  const retry = h.ui.submitButton.onclick();
+  h.requests[1].resolve({ submitted: true });
+  await retry;
+  assert.equal(h.ui.connectionStatus.textContent, "다른 탭의 입력권 변경을 확인하세요.",
+    "submission success does not erase unrelated warnings");
+}
+
+for (const storageFails of [false, true]) {
+  const h = submitRaceHarness();
+  const editedScore = { sets: [{ a: 7, b: 10 }, { a: 8, b: 10 }] };
+  h.edit.localDraft = editedScore;
+  h.edit.reviewedPayload = editedScore;
+  const sending = h.ui.submitButton.onclick();
+  h.snapshot("M2");
+  if (storageFails) h.local.setItem = () => { throw new Error("quota"); };
+  h.requests[0].reject(Object.assign(new Error("queue_changed"), { code: "functions/failed-precondition" }));
+  await sending;
+  assert.equal(h.ui.successPanel.hidden, true, "a rejected request is never presented as submitted");
+  assert.equal(h.edit.pendingSubmit, null);
+  if (storageFails) {
+    assert.equal(h.context.matchKey, "M1");
+    assert.equal(h.edit.localDraft, editedScore);
+    assert.equal(h.edit.reviewedPayload, editedScore);
+    assert.match(h.warnings.at(-1), /화면을 닫지 말고/);
+  } else {
+    assert.equal(h.context.matchKey, "M2", "a terminal rejection consumes the already received queue cursor");
+    assert.deepEqual(readStoredRecorderDraft(h.local, "score:M1").value.draft, editedScore);
+    assert.deepEqual(readStoredRecorderDraft(h.local, "score:M2").value.draft, h.nextDraft);
+    assert.match(h.warnings.at(-1), /입력은 임시 초안으로 보관/);
+    assert.equal(h.ui.confirmPanel.hidden, true);
+  }
+}
+
+{
+  const h = submitRaceHarness();
+  const sending = h.ui.submitButton.onclick();
+  h.snapshot("M2");
+  // An administrator approves before the callable response: the real fixture
+  // fence clears the old editor, but no newer local input has started.
+  h.context.contextVersion += 1;
+  h.context.fixtureIdentity = { ...h.context.fixtureIdentity, officialRevision: 3, lastTransitionId: "approved" };
+  h.edit.token = null;
+  h.edit.localDraft = null;
+  h.edit.reviewedPayload = null;
+  h.edit.dirty = false;
+  h.requests[0].resolve({ submitted: true });
+  await sending;
+  assert.equal(h.context.matchKey, "M2", "an early approval does not strand an idle editor on the previous match");
+  assert.equal(h.ui.successPanel.hidden, false);
+  assert.equal(h.ui.confirmPanel.hidden, true);
+  assert.deepEqual(h.warnings, []);
+}
+
+for (const regenerateSameKey of [false, true]) {
+  const h = submitRaceHarness();
+  const sending = h.ui.submitButton.onclick();
+  h.context.contextVersion += 1;
+  h.context.matchKey = regenerateSameKey ? "M1" : "M2";
+  h.context.fixtureIdentity = {
+    ...h.identities.get(h.context.matchKey), lastTransitionId: "new-fixture",
+  };
+  const newer = { sets: [{ a: 10, b: 8 }, { a: 10, b: 6 }] };
+  h.edit.localDraft = newer;
+  h.edit.reviewedPayload = newer;
+  h.edit.token = "newer-token";
+  h.edit.dirty = true;
+  const key = `score:${h.context.matchKey}`;
+  writeStoredRecorderDraft(h.local, key, {
+    draft: newer, touched: ["0-a"], revision: 3, identity: h.context.fixtureIdentity,
+  });
+  const before = h.local.getItem(key);
+  h.requests[0].resolve({ submitted: true });
+  await sending;
+  assert.equal(h.edit.localDraft, newer, "a real context change still protects the newer input");
+  assert.equal(h.edit.reviewedPayload, newer);
+  assert.equal(h.edit.token, "newer-token");
+  assert.equal(h.edit.dirty, true);
+  assert.equal(h.local.getItem(key), before);
+  assert.equal(h.ui.successPanel.hidden, false);
+  assert.match(h.ui.successTitle.textContent, /M1 A팀 vs M1 B팀/, "the receipt identifies the submitted match");
+  assert.deepEqual(h.warnings, [], "successful stale responses are not reported as submission errors");
+}
+
+console.log("recorder draft identity and submit ordering fixtures passed");
