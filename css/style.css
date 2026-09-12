@@ -1469,19 +1469,18 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 
 .ring-edge-label {
   position: absolute;
-  transform: translate(-50%, -50%);
   min-width: 19px;
   max-width: 150px;
   min-height: 19px;
   height: auto;
   padding: 3px 7px;
-  border-radius: 999px;
+  border-radius: 9px;
   background: var(--white);
   border: 1.5px solid var(--line);
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 800;
-  line-height: 1.15;
+  line-height: 1.35;
   text-align: center;
   white-space: normal;
   overflow-wrap: anywhere;
@@ -1793,7 +1792,7 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
 .court-settings-list { display: grid; gap: 8px; margin-top: 12px; }
 .court-settings-row {
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) minmax(120px, 1fr) auto;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto;
   gap: 8px;
   align-items: center;
   padding: 10px;
@@ -1803,23 +1802,6 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-}
-.court-settings-order {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, .72);
-  background: linear-gradient(145deg, var(--theme-raised-a), var(--theme-raised-b));
-  box-shadow:
-    3px 4px 8px var(--theme-shadow-color),
-    -2px -2px 6px rgba(255, 255, 255, .8),
-    inset 1px 1px 1px rgba(255, 255, 255, .85);
-  color: var(--theme-primary-dark);
-  font-size: 12px;
-  font-weight: 700;
 }
 .court-setting-field {
   display: grid;
@@ -2059,9 +2041,9 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   .match-court-select { width: 100%; max-width: none; }
   .match-court-control { padding-top: 9px; }
   .workflow-save-row .btn { width: 100%; }
-  .court-settings-row { grid-template-columns: auto 1fr; }
-  .court-setting-field { grid-column: 2; }
-  .court-settings-row .btn { grid-column: 2; justify-self: start; }
+  .court-settings-row { grid-template-columns: 1fr; }
+  .court-setting-field { grid-column: 1; }
+  .court-settings-row .btn { grid-column: 1; justify-self: start; }
 }
 
 /* ---- Claymorphism theme ---- */

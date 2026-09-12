@@ -1601,7 +1601,6 @@ function prelimCourtDisplay(matchKey) {
     : null;
   return {
     label: scheduleRow?.label || "미배정",
-    shortLabel: scheduleRow?.shortLabel || "—",
     recorderName: court?.recorderName?.trim() || "",
   };
 }
@@ -1629,12 +1628,9 @@ function renderCourtSettings() {
     const row = document.createElement("div");
     row.className = "court-settings-row";
     row.dataset.courtId = court.id;
-    const order = document.createElement("span");
-    order.className = "court-settings-order";
-    order.textContent = `${courtIndex + 1}`;
     const name = document.createElement("input");
     name.type = "text";
-    name.placeholder = "예: A";
+    name.placeholder = "예: 1";
     name.value = court.name;
     resizeCourtNameInput(name);
     name.setAttribute("aria-label", `${courtIndex + 1}번째 코트 이름, 코트 제외`);
@@ -1689,7 +1685,7 @@ function renderCourtSettings() {
       markWorkflowDirty();
       renderWorkflowCourtPlanner();
     });
-    row.append(order, nameField, recorderField, remove);
+    row.append(nameField, recorderField, remove);
     root.appendChild(row);
   });
 }
@@ -4505,8 +4501,9 @@ function appendPrelimScheduleLanes(parent, groupId, groupMatches, rowFactory) {
     const scheduleRow = scheduleById.get(match.id) || {
       match,
       courtId: null,
+      courtName: "",
+      courtOrder: null,
       label: "미배정",
-      shortLabel: "—",
     };
     const laneKey = scheduleRow.courtId && knownCourtIds.has(scheduleRow.courtId)
       ? scheduleRow.courtId

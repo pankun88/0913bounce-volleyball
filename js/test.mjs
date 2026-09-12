@@ -359,7 +359,6 @@ check(
 check(
   'projection labels use normalized court name and per-court round',
   prelimProjection[0].label === 'A코트 · 1라운드'
-    && prelimProjection[0].shortLabel === 'A·1'
     && prelimProjection[2].label === 'A코트 · 5라운드',
 );
 check(
@@ -434,8 +433,7 @@ check(
   invalidProjection.every((item) => item.courtId === null
     && item.courtName === ""
     && item.courtOrder === null
-    && item.label === "미배정"
-    && item.shortLabel === "—"),
+    && item.label === "미배정"),
 );
 check(
   'unassigned projection rows retain structural round/id order',
@@ -477,28 +475,75 @@ const ringScheduleBefore = JSON.stringify(ringSchedule);
 const ringLabels = getPrelimRingEdgeLabels(ringOrderBefore, ringSchedule);
 check(
   'ring labels resolve reverse team orientation without changing topology',
-  JSON.stringify(ringLabels.map((item) => item.text)) === JSON.stringify(['A·5', 'A·3', 'A·1'])
+  JSON.stringify(ringLabels.map((item) => item.text)) === JSON.stringify([
+    'A코트 - 5라운드',
+    'A코트 - 3라운드',
+    'A코트 - 1라운드',
+  ])
     && JSON.stringify(ringOrderBefore) === JSON.stringify(['a', 'b', 'c'])
     && JSON.stringify(ringSchedule) === ringScheduleBefore,
 );
 check(
   'ring labels support the two-vertex special case',
-  JSON.stringify(getPrelimRingEdgeLabels(['a', 'b'], ringSchedule).map((item) => item.text)) === JSON.stringify(['A·5']),
+  JSON.stringify(getPrelimRingEdgeLabels(['a', 'b'], ringSchedule).map((item) => item.text))
+    === JSON.stringify(['A코트 - 5라운드']),
 );
 check(
   'ring labels preserve structural edge count and use explicit unassigned fallback',
   getPrelimRingEdgeLabels(['a', 'b', 'missing', 'c'], ringSchedule).length === 4
     && getPrelimRingEdgeLabels(['a', 'b', 'missing', 'c'], ringSchedule)
       .every((item, index) => index === 0
-        ? item.text === 'A·5'
+        ? item.text === 'A코트 - 5라운드'
         : index === 3
-          ? item.text === 'A·1'
-          : item.text === '—' && item.title === `미배정 · 대진 ${index + 1}`),
+          ? item.text === 'A코트 - 1라운드'
+          : item.text === '미배정' && item.title === `미배정 · 대진 ${index + 1}`),
 );
 check(
   'ring label text and titles are safe strings',
   ringLabels.every((item) => typeof item.text === 'string' && typeof item.title === 'string')
     && ringLabels[0].title === 'A코트 · 5라운드',
+);
+const numericRingMatches = [
+  { id: 'numeric-12', round: 12, teamA: 'numeric-1', teamB: 'numeric-2' },
+  { id: 'numeric-23', round: 2, teamA: 'numeric-2', teamB: 'numeric-3' },
+  { id: 'numeric-34', round: 3, teamA: 'numeric-3', teamB: 'numeric-4' },
+  { id: 'numeric-41', round: 4, teamA: 'numeric-4', teamB: 'numeric-1' },
+];
+const numericRingMatchesBefore = JSON.stringify(numericRingMatches);
+const numericRingSchedule = projectPrelimCourtSchedule(
+  numericRingMatches,
+  [
+    { matchKey: 'numeric-12', courtId: 'court-1', courtOrder: 12 },
+    { matchKey: 'numeric-23', courtId: 'court-2', courtOrder: 2 },
+    { matchKey: 'numeric-34', courtId: 'court-3', courtOrder: 3 },
+    { matchKey: 'numeric-41', courtId: 'court-12', courtOrder: 12 },
+  ],
+  [
+    { id: 'court-1', name: '1코트' },
+    { id: 'court-2', name: '2' },
+    { id: 'court-3', name: '3' },
+    { id: 'court-12', name: '12' },
+  ],
+);
+const numericRingLabels = getPrelimRingEdgeLabels(
+  ['numeric-1', 'numeric-2', 'numeric-3', 'numeric-4'],
+  numericRingSchedule,
+);
+check(
+  'numeric and multi-digit court labels keep units and assignment rounds explicit',
+  JSON.stringify(numericRingLabels.map((item) => item.text)) === JSON.stringify([
+    '1코트 - 12라운드',
+    '2코트 - 2라운드',
+    '3코트 - 3라운드',
+    '12코트 - 12라운드',
+  ])
+    && numericRingLabels[0].title === '1코트 · 12라운드'
+    && numericRingLabels.every((item) => !item.text.includes('코트코트')),
+);
+check(
+  'numeric court projection preserves source match rounds and normalized names',
+  JSON.stringify(numericRingMatches) === numericRingMatchesBefore
+    && numericRingSchedule.every((row) => !row.courtName.endsWith('코트코트')),
 );
 const shuffledUnassignedMatches = [
   { id: 'z-unassigned', round: 2 },
@@ -519,13 +564,12 @@ const partialRingLabels = getPrelimRingEdgeLabels([null, 'b'], [
     courtName: 'A',
     courtOrder: 1,
     label: 'A코트 · 1라운드',
-    shortLabel: 'A·1',
   },
 ]);
 check(
   'partial ring vertices never match rows with missing team IDs',
   partialRingLabels.length === 1
-    && partialRingLabels[0].text === '—'
+    && partialRingLabels[0].text === '미배정'
     && partialRingLabels[0].title === '미배정 · 대진 1',
 );
 check(
@@ -533,10 +577,27 @@ check(
   getPrelimRingEdgeLabels(["", "b"], [{
     match: { teamA: "", teamB: "b" },
     courtId: "court-a",
+    courtName: "A",
     courtOrder: 1,
     label: "A코트 · 1라운드",
-    shortLabel: "A·1",
-  }])[0].text === "—",
+  }])[0].text === "미배정",
+);
+check(
+  'ring labels reject missing court names and invalid orders',
+  getPrelimRingEdgeLabels(["a", "b"], [{
+    match: { teamA: "a", teamB: "b" },
+    courtId: "court-a",
+    courtName: "",
+    courtOrder: 1,
+    label: "미배정",
+  }])[0].text === "미배정"
+    && getPrelimRingEdgeLabels(["a", "b"], [{
+      match: { teamA: "a", teamB: "b" },
+      courtId: "court-a",
+      courtName: "A",
+      courtOrder: 0,
+      label: "A코트 · 0라운드",
+    }])[0].text === "미배정",
 );
 
 // ---- approved correction selection state ----
@@ -1697,6 +1758,40 @@ check('getRingEdgeLabelPositions -> 변의 중점보다 중심에서 더 먼 위
   });
 })());
 check('getRingEdgeLabelPositions(0) -> 빈 배열', getRingEdgeLabelPositions(0, 260, 38).length === 0);
+
+// Card borders, not centers, keep the same gap from horizontal and sloping edges.
+for (const n of [2, 3, 4, 5, 6, 8, 12, 30]) {
+  const gap = 6;
+  const vertices = getRingPositions(n, 600, 100);
+  const edges = getRingEdges(n);
+  const anchors = getRingEdgeLabelPositions(n, 600, 100, gap);
+  check(`ring ${n}-team card borders keep equal gaps for short, wide and wrapped text`,
+    anchors.every((anchor, index) => {
+      const [a, b] = edges[index].map((vertex) => vertices[vertex]);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const length = Math.hypot(dx, dy);
+      return [[82, 24], [110, 24], [150, 40]].every(([width, height]) => {
+        const left = anchor.x + anchor.translateX / 100 * width;
+        const top = anchor.y + anchor.translateY / 100 * height;
+        const corners = [[left, top], [left + width, top], [left, top + height], [left + width, top + height]];
+        const nearest = Math.min(...corners.map(([x, y]) => ((x - a.x) * dy - (y - a.y) * dx) / length));
+        return Math.abs(nearest - gap) < 1e-6;
+      });
+    }),
+  );
+}
+{
+  const vertices = getRingPositions(3, 454, 88);
+  const labels = getRingEdgeLabelPositions(3, 454, 88);
+  const lower = labels[1];
+  check('triangle bottom label anchors its top border near the horizontal edge',
+    lower.translateX === -50 && lower.translateY === 0
+      && Math.abs(lower.y - (vertices[1].y + vertices[2].y) / 2 - 6) < 1e-6);
+  const collapsed = getRingEdgeLabelPositions(2, 260, 130)[0];
+  check('degenerate ring coordinates remain finite',
+    Number.isFinite(collapsed.x) && Number.isFinite(collapsed.y)
+      && collapsed.translateX === -50 && collapsed.translateY === -50);
+}
 
 // ---- dashboard venue rotation / public schedule ----
 function createDashboardHarness(search = '?display=venue', options = {}) {
@@ -3217,6 +3312,7 @@ function createAdminProjectionHarness() {
     .replace(/^import[\s\S]*?;\s*/gm, "");
   const bridge = `
     const originalRenderCourtBoard = renderCourtBoard;
+    const originalRenderCourtSettings = renderCourtSettings;
     renderGroupList = () => {};
     renderTeamGroupSelect = () => {};
     renderGroupTeamLists = () => {};
@@ -3299,6 +3395,7 @@ function createAdminProjectionHarness() {
         ),
         scoreRowPreserved: projectionRows("prelimGroups").includes(preservedScoreRow),
         scoreInputValue: preservedScoreInput?.value || "",
+        scoreInputFocused: document.activeElement === preservedScoreInput,
       };
     }
     globalThis.__adminProjectionTest = {
@@ -3320,10 +3417,28 @@ function createAdminProjectionHarness() {
         preservedScoreInput = document.createElement("input");
         preservedScoreInput.value = "25";
         preservedScoreRow?.appendChild(preservedScoreInput);
+        preservedScoreInput?.focus();
         return projectionState();
+      },
+      settings() {
+        workflowDraftCourts = [{ id: "court-settings-test", name: "1", recorderName: "" }];
+        originalRenderCourtSettings();
+        const row = document.getElementById("courtSettingsList").children[0];
+        const name = row?.querySelector(".court-name-input input");
+        return {
+          hasOrdinalMarker: Boolean(row?.querySelector(".court-settings-order")),
+          namePlaceholder: name?.placeholder || "",
+          suffix: row?.querySelector(".court-name-input b")?.textContent || "",
+        };
       },
       moveDraft() {
         moveWorkflowMatch("match-ab", -1);
+        return projectionState();
+      },
+      renameDraft() {
+        workflowDraftCourts[0].name = "1";
+        markWorkflowDirty();
+        syncPrelimExecutionProjection();
         return projectionState();
       },
       swapDraft() {
@@ -3598,7 +3713,9 @@ function createAdminProjectionHarness() {
   vm.runInNewContext(`${source}\n${bridge}`, context, { filename: "admin.js" });
   return {
     setup: () => context.__adminProjectionTest.setup(),
+    settings: () => context.__adminProjectionTest.settings(),
     moveDraft: () => context.__adminProjectionTest.moveDraft(),
+    renameDraft: () => context.__adminProjectionTest.renameDraft(),
     swapDraft: () => context.__adminProjectionTest.swapDraft(),
     board: (mixed) => context.__adminProjectionTest.boardSetup(mixed),
     grant: context.__adminGrantTest,
@@ -3606,6 +3723,13 @@ function createAdminProjectionHarness() {
 }
 
 const adminProjectionUi = createAdminProjectionHarness();
+const courtSettingsUi = adminProjectionUi.settings();
+check(
+  'court settings use the displayed suffix without a redundant ordinal marker',
+  !courtSettingsUi.hasOrdinalMarker
+    && courtSettingsUi.namePlaceholder === "예: 1"
+    && courtSettingsUi.suffix === "코트",
+);
 const savedProjectionUi = adminProjectionUi.setup();
 check(
   'admin setup and score views initially share projected court execution order',
@@ -3628,8 +3752,10 @@ check(
   'planner draft reorders existing setup and score rows and updates ring labels',
   JSON.stringify(draftedProjectionUi.setupIds) === JSON.stringify(['match-ca', 'match-ab', 'match-bc'])
     && JSON.stringify(draftedProjectionUi.scoreIds) === JSON.stringify(draftedProjectionUi.setupIds)
-    && draftedProjectionUi.setupRing.map((item) => item.text).join("|") === "A·3|A·5|A·1"
-    && draftedProjectionUi.scoreRing.map((item) => item.text).join("|") === "A·3|A·5|A·1",
+    && draftedProjectionUi.setupRing.map((item) => item.text).join("|")
+      === "A코트 - 3라운드|A코트 - 5라운드|A코트 - 1라운드"
+    && draftedProjectionUi.scoreRing.map((item) => item.text).join("|")
+      === "A코트 - 3라운드|A코트 - 5라운드|A코트 - 1라운드",
 );
 check(
   'planner draft preserves score input node and value while marking both views unsaved',
@@ -3640,6 +3766,21 @@ check(
     && draftedProjectionUi.setupHintVisible
     && draftedProjectionUi.scoreHintVisible
     && draftedProjectionUi.hintText.includes("저장되지 않은 코트"),
+);
+const renamedProjectionUi = adminProjectionUi.renameDraft();
+check(
+  'planner draft rename refreshes full ring labels in setup and score views',
+  renamedProjectionUi.setupRing.map((item) => item.text).join("|")
+    === "1코트 - 3라운드|1코트 - 5라운드|1코트 - 1라운드"
+    && renamedProjectionUi.scoreRing.map((item) => item.text).join("|")
+      === "1코트 - 3라운드|1코트 - 5라운드|1코트 - 1라운드",
+);
+check(
+  'planner draft rename does not rebuild or defocus the score row',
+  renamedProjectionUi.scoreRowPreserved
+    && renamedProjectionUi.scoreInputPreserved
+    && renamedProjectionUi.scoreInputValue === "25"
+    && renamedProjectionUi.scoreInputFocused,
 );
 const swappedProjectionUi = adminProjectionUi.swapDraft();
 check(

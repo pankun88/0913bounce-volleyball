@@ -135,7 +135,6 @@ export function projectPrelimCourtSchedule(matches, assignments, courts) {
             courtName: "",
             courtOrder: null,
             label: "미배정",
-            shortLabel: "—",
           },
         };
       }
@@ -150,7 +149,6 @@ export function projectPrelimCourtSchedule(matches, assignments, courts) {
           courtName,
           courtOrder,
           label: `${formatCourtName(courtName)} · ${courtOrder}라운드`,
-          shortLabel: `${courtName}·${courtOrder}`,
         },
       };
     })
@@ -192,8 +190,8 @@ function assignedScheduleRow(row) {
     row
       && typeof row.courtId === "string"
       && row.courtId.trim()
-      && typeof row.shortLabel === "string"
-      && row.shortLabel !== "—"
+      && typeof row.courtName === "string"
+      && normalizeCourtName(row.courtName)
       && typeof row.label === "string"
       && Number.isInteger(row.courtOrder)
       && Number.isFinite(row.courtOrder)
@@ -215,7 +213,10 @@ export function getPrelimRingEdgeLabels(ringOrder, schedule) {
       assignedScheduleRow(item) && ringPairMatches(item.match, teamA, teamB)
     ));
     return row
-      ? { text: row.shortLabel, title: row.label }
-      : { text: "—", title: `미배정 · 대진 ${edgeIndex + 1}` };
+      ? {
+        text: `${formatCourtName(row.courtName)} - ${row.courtOrder}라운드`,
+        title: row.label,
+      }
+      : { text: "미배정", title: `미배정 · 대진 ${edgeIndex + 1}` };
   });
 }

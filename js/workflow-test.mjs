@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { formatCourtName } from './court-display.js';
 import {
   activateDependencyEntries,
   classifyCorrectionTarget,
@@ -133,6 +134,47 @@ const queue = (changes = {}) => ({
   assert.equal(recorderRouteState('selection', 'enter', { canEnter: true }), 'operations');
   assert.equal(recorderRouteState('operations', 'change', { blocked: true }), 'operations');
   assert.equal(recorderRouteState('operations', 'change', { blocked: false }), 'selection');
+}
+
+// The recorder displays actual court order, not the array index or match ID.
+{
+  const source = readFileSync(new URL('./recorder.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function selectedCourt()');
+  const end = source.indexOf('function clearConfirmation()', start);
+  assert.ok(start >= 0 && end > start);
+  const element = (tagName) => ({
+    tagName, dataset: {}, children: [], textContent: '', hidden: false,
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+  });
+  const ui = Object.fromEntries([
+    'selectedCourtLabel', 'selectedRecorderLabel', 'courtScheduleHeading',
+    'courtScheduleList', 'courtScheduleStatus',
+  ].map((id) => [id, element('div')]));
+  const courtAssignments = [
+    { matchKey: 'later', courtOrder: 12, matchType: 'prelim', publicStatus: 'scheduled' },
+    { matchKey: 'earlier', courtOrder: 5, matchType: 'prelim', publicStatus: 'scheduled' },
+    { matchKey: 'unordered', courtOrder: null, matchType: 'prelim', publicStatus: 'scheduled' },
+  ];
+  const before = structuredClone(courtAssignments);
+  const context = {
+    ui, document: { createElement: element },
+    courts: [{ id: 'court-1', name: '1' }], courtId: 'court-1', pendingCourtId: '',
+    recorder: '기록관', displayCourt: formatCourtName, scheduleState: 'ready',
+    courtAssignments, queue: null, buildRecorderCourtSchedule,
+    scheduleOfficial: new Map([
+      ['earlier', { groupId: 'group', teamA: 'a', teamB: 'b', round: 9 }],
+      ['later', { groupId: 'group', teamA: 'b', teamB: 'c', round: 3 }],
+    ]),
+    teams: new Map(), groups: new Map([['group', { name: '1조' }]]),
+  };
+  runInNewContext(`${source.slice(start, end)}\nrenderCourtSchedule();`, context);
+  assert.equal(ui.courtScheduleHeading.textContent, '1코트 경기 일정');
+  assert.deepEqual(
+    Array.from(ui.courtScheduleList.children, (card) => card.children[0].textContent),
+    ['코트 순서 5 · 1조 예선 · 9경기', '코트 순서 12 · 1조 예선 · 3경기', '순서 미정 · 예선'],
+  );
+  assert.deepEqual(courtAssignments, before, 'rendering preserves court assignments and order');
 }
 
 // A submit request keeps its original operation and storage context while a

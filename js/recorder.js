@@ -247,12 +247,13 @@ function renderCourtSchedule() {
     ui.courtScheduleStatus.hidden = Boolean(schedule.length);
     ui.courtScheduleStatus.textContent = schedule.length ? "" : "이 코트에 배정된 경기가 없습니다.";
   }
-  ui.courtScheduleList.replaceChildren(...schedule.map((item, index) => {
+  ui.courtScheduleList.replaceChildren(...schedule.map((item) => {
     const card = document.createElement("li");
     card.className = `court-schedule-item schedule-status-${item.status}`;
     card.dataset.matchKey = item.matchKey;
     const heading = document.createElement("h3");
-    heading.textContent = `${index + 1}. ${item.label || item.matchKey}`;
+    const orderLabel = item.courtOrder === null ? "순서 미정" : `코트 순서 ${item.courtOrder}`;
+    heading.textContent = `${orderLabel} · ${item.label || item.matchKey}`;
     const matchup = document.createElement("p");
     matchup.className = "court-schedule-matchup";
     matchup.textContent = item.matchup;

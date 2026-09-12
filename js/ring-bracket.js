@@ -4,7 +4,7 @@
  * 링크제: N개 팀을 N각형(폴리곤)의 꼭짓점에 배치하고, "인접한" 꼭짓점끼리만 대결한다.
  * (대각선으로 마주보는 팀과는 경기하지 않음 - 라운드로빈과의 차이점)
  *
- * 이 파일은 admin.js(편집 가능)와 dashboard.js(읽기 전용) 양쪽에서 공통으로 사용한다.
+ * 관리자 대회설정과 예선 화면에서 같은 도형을 사용한다.
  */
 
 /** 꼭짓점 배열을 현재 조 소속 팀 목록에 맞춰 정리한다 (길이 = 팀 수, 빠진 자리는 null) */
@@ -57,21 +57,34 @@ export function getRingPositions(n, size = 260, margin = 38) {
 }
 
 /**
- * 각 변(=경기)의 라벨 표시 위치를 계산한다. 변의 중앙에서 중심 반대 방향으로 살짝 띄워
- * 선/꼭짓점과 겹치지 않게 한다. 반환 순서 = getRingEdges(n)의 순서 = 경기 순서(1경기, 2경기...).
+ * 각 변 중앙에서 바깥쪽으로 gap만큼 떨어진 라벨 기준점을 계산한다.
+ * translateX/Y는 라벨의 선에 가까운 모서리/변을 기준점에 맞추는 백분율이다.
+ * 라벨 너비나 줄 수가 달라져도 카드 테두리와 선 사이의 간격을 유지한다.
+ * 반환 순서는 getRingEdges(n)의 구조적 변 순서이며 실제 경기 진행 순서가 아니다.
  */
-export function getRingEdgeLabelPositions(n, size = 260, margin = 38, offset = 9) {
+export function getRingEdgeLabelPositions(n, size = 260, margin = 38, gap = 6) {
   const cx = size / 2;
   const cy = size / 2;
   const positions = getRingPositions(n, size, margin);
+  const alignment = (value) => Math.abs(value) < 1e-6 ? -50 : value > 0 ? 0 : -100;
   return getRingEdges(n).map(([i, j]) => {
     const mx = (positions[i].x + positions[j].x) / 2;
     const my = (positions[i].y + positions[j].y) / 2;
     const dx = mx - cx;
     const dy = my - cy;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < 1e-6) return { x: mx, y: my };
-    return { x: mx + (dx / dist) * offset, y: my + (dy / dist) * offset };
+    // 2팀일 때 변 중앙은 도형 중심과 같으므로 선의 수직 방향을 사용한다.
+    const normalX = dist < 1e-6 ? positions[j].y - positions[i].y : dx;
+    const normalY = dist < 1e-6 ? positions[i].x - positions[j].x : dy;
+    const length = Math.hypot(normalX, normalY);
+    const nx = length > 1e-6 ? normalX / length : 0;
+    const ny = length > 1e-6 ? normalY / length : 0;
+    return {
+      x: mx + nx * gap,
+      y: my + ny * gap,
+      translateX: alignment(nx),
+      translateY: alignment(ny),
+    };
   });
 }
 
@@ -93,7 +106,7 @@ function safeParseJson(str) {
  *   - onVertexDrop: (data, targetIndex) => void  (data = {type:'pool', teamId} | {type:'vertex', index})
  *   - onVertexClick: (index) => void
  *   - selectedVertexIndex: number|null - 클릭 선택(이동 중)인 꼭짓점 표시용
- *   - edgeLabels: {text:string,title:string}[]|undefined - 변별 표시 라벨(생략하면 구조 순번)
+ *   - edgeLabels: {text:string,title:string}[]|undefined - 코트·라운드 라벨(생략하면 대진 번호)
  */
 export function renderRingDiagram(container, opts) {
   const {
@@ -102,9 +115,11 @@ export function renderRingDiagram(container, opts) {
   } = opts;
 
   const n = ringOrder.length;
-  const minimumCenterGap = 110;
+  // 코트·라운드를 생략하지 않는 라벨과 팀 카드가 겹치지 않도록 간격을 확보한다.
+  const minimumCenterGap = 240;
   const radius = n > 1 ? minimumCenterGap / (2 * Math.sin(Math.PI / n)) : 0;
-  const margin = 64;
+  // 바깥쪽에 놓이는 최대 150px 라벨도 스크롤 영역 안에 남도록 여백을 둔다.
+  const margin = n <= 4 ? 88 : 164;
   const size = Math.max(260, Math.ceil((radius + margin) * 2));
   const positions = getRingPositions(n, size, margin);
   const edges = getRingEdges(n);
@@ -135,7 +150,7 @@ export function renderRingDiagram(container, opts) {
   });
   stage.appendChild(svg);
 
-  // 경기 순서 라벨: 변(=인접한 두 팀의 대진) 중앙에 1경기, 2경기... 순서를 작게 표시
+  // 카드 중심이 아닌 선에 가까운 테두리를 기준으로 간격을 맞춘다.
   const labelPositions = getRingEdgeLabelPositions(n, size, margin);
   edges.forEach((_, idx) => {
     const pos = labelPositions[idx];
@@ -143,10 +158,11 @@ export function renderRingDiagram(container, opts) {
     label.className = "ring-edge-label" + (filled ? " done" : "");
     label.style.left = pos.x + "px";
     label.style.top = pos.y + "px";
+    label.style.transform = `translate(${pos.translateX}%, ${pos.translateY}%)`;
     label.dataset.ringEdgeIndex = String(idx);
     const edgeLabel = Array.isArray(edgeLabels) ? edgeLabels[idx] : null;
-    label.textContent = edgeLabel?.text ?? String(idx + 1);
-    label.title = edgeLabel?.title ?? `${idx + 1}경기`;
+    label.textContent = edgeLabel?.text ?? `대진 ${idx + 1}`;
+    label.title = edgeLabel?.title ?? `대진 ${idx + 1} · 코트 배정 정보 없음`;
     stage.appendChild(label);
   });
 
