@@ -407,11 +407,15 @@ function qualificationHasFinalBracket() {
 
 function qualificationHasFinalPlay() {
   if (finalScoreDrafts.size > 0) return true;
+  const assignments = reviewAssignments.filter((assignment) => (
+    assignment.matchType === "final"
+    && (assignment.divisionId || assignment.division) === activeDivision
+  ));
   const records = [
     ...authoritativeFinalMatches,
     ...finalMatches,
-    ...reviewAssignments,
-    ...reviewWorkflows.values(),
+    ...assignments,
+    ...assignments.map((assignment) => reviewWorkflows.get(assignment.id)),
   ];
   return records.some((record) => (
     Number(record?.officialRevision || 0) > 0
@@ -420,8 +424,10 @@ function qualificationHasFinalPlay() {
     || Number(record?.submissionVersion || 0) > 0
     || ["done", "completed", "in_progress", "under_review"].includes(record?.status)
     || ["completed", "in_progress", "under_review", "replay_required", "rework_required"].includes(record?.publicStatus)
+    || ["editing", "submitted", "rejected"].includes(record?.draftState)
     || (Array.isArray(record?.sets) && record.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0))
     || (Array.isArray(record?.draft?.sets) && record.draft.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0))
+    || (Array.isArray(record?.submittedSnapshot?.sets) && record.submittedSnapshot.sets.some((set) => Number(set?.a) > 0 || Number(set?.b) > 0))
   ));
 }
 
@@ -477,7 +483,16 @@ function syncQualificationProofFromTournamentInfo() {
 function qualificationProofStatus() {
   if (!qualificationHasFinalBracket()) return "none";
   if (qualificationDraftStale) return "stale";
-  if (qualificationProof?.status === "stale" && !qualificationRevalidatedLocally) return "stale";
+  // 공개 전에도 서버 확인을 마친 현재 초안은 유효하다. 영구 검증 기록은 공개할 때 저장한다.
+  if (qualificationRevalidatedLocally
+      && qualificationServerFingerprint
+      && qualificationServerState
+      && qualificationSelectionValidation(
+        qualificationServerState,
+        finalEntrantIds(finalMatches),
+        qualificationTieSelections,
+      ).ok) return "current";
+  if (qualificationProof?.status === "stale") return "stale";
   if (qualificationProof?.status !== "current") return "unverified";
   if (!qualificationProof.fingerprint) return "unverified";
   return "current";
@@ -3422,32 +3437,7 @@ function bindStaticHandlers() {
 
   document.getElementById("generateBracketBtn").addEventListener("click", onGenerateBracket);
   document.getElementById("publishBracketBtn").addEventListener("click", handlePublishBracket);
-  document.getElementById("clearBracketBtn").addEventListener("click", async () => {
-    if (!finalMutationAllowed()) return;
-    if (qualificationHasFinalPlay()) {
-      return showToast("실제 진행된 본선은 대진표 초기화로 우회할 수 없습니다.", 6000);
-    }
-    if (!confirm(`${divisionLabel()}의 아직 시작하지 않은 본선 대진표를 초기화할까요? 기록이 시작된 경기가 있으면 안전을 위해 초기화가 거부됩니다.`)) return;
-    try {
-      if (authoritativeFinalMatches.length) {
-        await adminWorkflowCallable("clearFinalStructure", { division: activeDivision });
-      }
-      resetFinalDraft([]);
-      qualificationProof = null;
-      qualificationServerState = null;
-      qualificationServerFingerprint = "";
-      qualificationTieSelections = {};
-      qualificationDraftStale = false;
-      qualificationRevalidatedLocally = false;
-      qualificationReplacement = null;
-      renderFinalBracket();
-      renderFinalTeamPicker();
-      updateQualificationStructureControls();
-      showToast(`${divisionLabel()} 본선 대진표를 초기화했습니다.`);
-    } catch (err) {
-      reportError("본선 대진표 초기화", err);
-    }
-  });
+  document.getElementById("clearBracketBtn").addEventListener("click", handleClearBracket);
 
   document.getElementById("exportCsvBtn").addEventListener("click", () => {
     const csv = buildFullResultsCsv({
@@ -5104,6 +5094,11 @@ async function handleQualificationRevalidation() {
     qualificationDraftStale = false;
     qualificationRevalidatedLocally = true;
     qualificationPreparationError = "";
+    if (authoritativeFinalMatches.length > 0
+        && (qualificationProof?.status !== "current"
+          || qualificationProof?.fingerprint !== prepared.fingerprint)) {
+      bracketPublishPending = true;
+    }
     renderFinalTeamPicker();
     renderFinalBracket();
     showToast("예선 진출팀을 다시 확인했습니다. 기존 본선 점수와 초안은 보존됩니다.", 5000);
@@ -5354,6 +5349,34 @@ function teamGroupRankLabel(teamId) {
   const standings = computeGroupStandings(groupTeams, groupMatches);
   const s = standings.find((ss) => ss.teamId === teamId);
   return s ? `${g.name} ${s.rank}위` : g.name;
+}
+
+async function handleClearBracket() {
+  if (!finalMutationAllowed()) return;
+  if (qualificationHasFinalPlay()) {
+    return showToast("이 부문의 본선 점수 입력·제출 기록이 있어 초기화할 수 없습니다. 점수 수정 또는 정정 절차를 이용하세요.", 6000);
+  }
+  if (!confirm(`${divisionLabel()}의 아직 시작하지 않은 본선 대진표를 초기화할까요? 예선 결과는 유지됩니다. 기록이 시작된 본선 경기가 있으면 초기화가 거부됩니다.`)) return;
+  try {
+    if (authoritativeFinalMatches.length) {
+      await adminWorkflowCallable("clearFinalStructure", { division: activeDivision });
+    }
+    resetFinalDraft([]);
+    qualificationProof = null;
+    qualificationServerState = null;
+    qualificationServerFingerprint = "";
+    qualificationTieSelections = {};
+    qualificationDraftStale = false;
+    qualificationRevalidatedLocally = false;
+    qualificationReplacement = null;
+    qualificationPreparationError = "";
+    renderFinalBracket();
+    renderFinalTeamPicker();
+    updateQualificationStructureControls();
+    showToast(`${divisionLabel()} 본선 대진표를 초기화했습니다.`);
+  } catch (err) {
+    reportError("본선 대진표 초기화", err);
+  }
 }
 
 /** 대진표 생성도 부전승 배치·자리 조정과 마찬가지로 "아직 다듬는 중"인 단계이므로,

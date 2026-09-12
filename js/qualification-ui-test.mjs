@@ -4,7 +4,9 @@ import vm from "node:vm";
 import {
   buildQualificationSnapshot,
   computeQualificationState,
+  validateQualificationSelection,
 } from "./match-logic.js";
+import { buildCrossGroupSeedOrder, generateBracket } from "./bracket.js";
 
 const adminSource = fs.readFileSync(new URL("./admin.js", import.meta.url), "utf8");
 
@@ -92,6 +94,9 @@ function loadAdminFunctions(names, values = {}) {
     structuredClone,
     buildQualificationSnapshot,
     computeQualificationState,
+    validateQualificationSelection,
+    buildCrossGroupSeedOrder,
+    generateBracket,
     ...values,
   });
   names.forEach((name) => vm.runInContext(extractFunctionSource(name), context));
@@ -322,10 +327,226 @@ function testActualSelectionState() {
   );
 }
 
+function finalUiFixture() {
+  const fixture = qualificationFixture();
+  const state = computeQualificationState(buildQualificationSnapshot({
+    division: "men",
+    qualifyPerGroup: 2,
+    ...fixture,
+  }));
+  const elements = Object.fromEntries([
+    "qualificationProofBanner", "bracketPublishBar", "bracketPublishMsg", "publishBracketBtn",
+  ].map((id) => [id, { style: {}, classList: { toggle() {} } }]));
+  const calls = [];
+  const toasts = [];
+  const errors = [];
+  const confirmations = [];
+  const context = loadAdminFunctions([
+    "cloneFinalMatches", "finalBaselineDescriptor", "resetFinalDraft", "finalMutationAllowed",
+    "qualificationHasFinalBracket", "qualificationHasFinalPlay", "finalEntrantIds",
+    "qualificationProofStatus", "qualificationBlockerCode", "qualificationBlockerMessage",
+    "qualificationStateBlockers", "qualificationStateHasStructuralBlockers",
+    "qualificationStateReadyForSelection", "qualificationGuidanceForBlockers",
+    "qualificationGroupTeamIds", "canonicalQualificationTieSelections",
+    "qualificationSelectionIds", "qualificationSeedOrder", "syncQualificationSelection",
+    "qualificationSelectionValidation", "qualificationValidationMessages",
+    "qualificationPublishContext", "prepareFinalQualificationFromServer",
+    "handleQualificationRevalidation", "updateQualificationProofUi",
+    "onGenerateBracket", "handleClearBracket", "updateBracketPublishBar",
+    "handlePublishBracket", "finalStructureMatch",
+  ], {
+    activeDivision: "men",
+    qualificationState: state,
+    qualificationStateForCurrentData: () => state,
+    qualificationProof: null,
+    qualificationRevalidatedLocally: false,
+    qualificationServerFingerprint: "",
+    qualificationServerState: null,
+    qualificationTieSelections: {},
+    qualificationReplacement: null,
+    qualificationDraftStale: false,
+    qualificationPreparationInFlight: false,
+    qualificationPreparationError: "",
+    seedSelection: ["a", "b"],
+    finalMatches: [],
+    authoritativeFinalMatches: [],
+    finalDraftBaseline: [],
+    finalScoreDrafts: new Map(),
+    bracketPublishPending: false,
+    bracketPublishConflict: false,
+    bracketPublishInFlight: false,
+    reviewAssignments: [
+      { id: "m1", matchType: "prelim", divisionId: "men", publicStatus: "completed", attemptCount: 1 },
+      { id: "final:women:r1m0", matchType: "final", divisionId: "women", publicStatus: "under_review" },
+    ],
+    reviewWorkflows: new Map([
+      ["m1", { draftRevision: 2, submissionVersion: 1, draft: { sets: finishedSets } }],
+      ["final:women:r1m0", { draftState: "submitted", submissionVersion: 1 }],
+    ]),
+    document: { getElementById: (id) => elements[id] },
+    teamName: (id) => fixture.teams.find((team) => team.id === id)?.name || id,
+    divisionLabel: () => "남자부",
+    confirm: (message) => { confirmations.push(message); return true; },
+    showToast: (message) => toasts.push(message),
+    reportError: (action, error) => errors.push({ action, error }),
+    updateQualificationStructureControls: () => {},
+    adminWorkflowCallable: async (name, payload) => {
+      calls.push([name, jsonValue(payload)]);
+      if (name === "prepareFinalQualification") return { data: { fingerprint: "f".repeat(64), state } };
+      assert.equal(name, "clearFinalStructure");
+      return { data: { cleared: true } };
+    },
+    publishFinalBracket: async (...args) => {
+      calls.push(["publishFinalBracket", jsonValue(args)]);
+      return { matches: args[2] };
+    },
+  });
+  context.renderFinalTeamPicker = () => call(context, "updateQualificationProofUi");
+  context.renderFinalBracket = () => call(context, "updateBracketPublishBar");
+  return { context, elements, calls, toasts, errors, confirmations };
+}
+
+async function testGeneratedBracketWarningsAndReset() {
+  const { context, elements, calls, errors, confirmations } = finalUiFixture();
+  await call(context, "onGenerateBracket");
+  assert.ok(context.finalMatches.length > 0, "completed preliminary results generate a bracket");
+  assert.equal(call(context, "qualificationProofStatus"), "current");
+  assert.equal(context.qualificationProof, null, "draft validation does not invent persisted proof");
+  assert.equal(elements.qualificationProofBanner.hidden, true, "new validated drafts show no missing-proof warning");
+  assert.equal(elements.publishBracketBtn.disabled, false);
+  assert.equal(call(context, "qualificationHasFinalPlay"), false, "preliminary and other-division records are excluded");
+
+  await call(context, "onGenerateBracket");
+  assert.equal(calls.filter(([name]) => name === "prepareFinalQualification").length, 2,
+    "regeneration is not blocked by completed preliminary records");
+  await call(context, "handleClearBracket");
+  assert.equal(context.finalMatches.length, 0);
+  assert.equal(context.qualificationServerFingerprint, "");
+  assert.equal(context.qualificationRevalidatedLocally, false);
+  assert.equal(elements.qualificationProofBanner.hidden, true);
+  assert.equal(calls.some(([name]) => name === "clearFinalStructure"), false, "local reset does not mutate the server");
+  assert.match(confirmations.at(-1), /예선 결과는 유지/);
+  assert.equal(context.reviewAssignments[0].attemptCount, 1, "preliminary records remain intact");
+
+  await call(context, "onGenerateBracket");
+  await call(context, "handlePublishBracket");
+  assert.equal(context.qualificationProof.status, "current");
+  assert.equal(context.bracketPublishPending, false);
+  assert.equal(context.authoritativeFinalMatches.length, context.finalMatches.length);
+  await call(context, "handleClearBracket");
+  assert.deepEqual(calls.at(-1), ["clearFinalStructure", { division: "men" }]);
+  assert.equal(context.authoritativeFinalMatches.length, 0);
+  assert.deepEqual(errors, []);
+}
+
+async function testRevalidationCanActuallyPublish() {
+  for (const proof of [null, { status: "stale", fingerprint: "old" }]) {
+    const { context, elements, calls, errors } = finalUiFixture();
+    const matches = generateBracket([{ id: "a", name: "A" }, { id: "b", name: "B" }]).matches;
+    matches[0].sets = finishedSets;
+    matches[0].officialRevision = 1;
+    matches[0].status = "done";
+    call(context, "resetFinalDraft", matches);
+    context.qualificationProof = proof;
+    context.qualificationDraftStale = Boolean(proof);
+    const originalMatches = context.finalMatches;
+    const originalDrafts = context.finalScoreDrafts;
+    await call(context, "handleQualificationRevalidation");
+    assert.equal(context.finalMatches, originalMatches, "revalidation preserves played final scores");
+    assert.equal(context.finalScoreDrafts, originalDrafts, "revalidation preserves drafts");
+    assert.equal(call(context, "qualificationProofStatus"), "current");
+    assert.equal(elements.qualificationProofBanner.hidden, true);
+    assert.equal(context.bracketPublishPending, true, "proof-only changes require publication");
+    assert.equal(elements.publishBracketBtn.disabled, false, "successful revalidation unlocks publication");
+    assert.equal(context.qualificationProof, proof, "stored proof is not overwritten before publishing");
+    await call(context, "handlePublishBracket");
+    assert.equal(calls.at(-1)[0], "publishFinalBracket");
+    assert.equal(calls.at(-1)[1][4].expectedPrelimFingerprint, "f".repeat(64));
+    assert.equal(context.qualificationProof.status, "current");
+    assert.deepEqual(errors, []);
+  }
+}
+
+async function testRealFinalPlayStillBlocksReset() {
+  const { context, calls, toasts, confirmations } = finalUiFixture();
+  await call(context, "onGenerateBracket");
+  const originalMatches = context.finalMatches;
+  const assignment = { id: "final:men:r1m0", matchType: "final", divisionId: "men", publicStatus: "scheduled" };
+  context.reviewAssignments.push(assignment);
+  context.reviewWorkflows.set(assignment.id, { draftState: "idle", draft: { sets: [{ a: 0, b: 0 }] } });
+  assert.equal(call(context, "qualificationHasFinalPlay"), false, "scheduled, untouched finals do not count as played");
+  for (const record of [
+    { draftState: "editing" },
+    { draftState: "submitted" },
+    { draftState: "rejected" },
+    { draftRevision: 1 },
+    { submissionVersion: 1 },
+    { draft: { sets: [{ a: 1, b: 0 }] } },
+    { submittedSnapshot: { sets: [{ a: 0, b: 1 }] } },
+  ]) {
+    context.reviewWorkflows.set(assignment.id, record);
+    const beforeCalls = calls.length;
+    const beforeConfirmations = confirmations.length;
+    await call(context, "handleClearBracket");
+    assert.equal(context.finalMatches, originalMatches);
+    assert.equal(calls.length, beforeCalls, "no deletion request is sent for real final records");
+    assert.equal(confirmations.length, beforeConfirmations);
+    assert.match(toasts.at(-1), /본선 점수 입력·제출 기록/);
+  }
+  context.reviewWorkflows.delete(assignment.id);
+  assignment.attemptCount = 1;
+  assert.equal(call(context, "qualificationHasFinalPlay"), true);
+  assignment.attemptCount = 0;
+  context.finalMatches[0].officialRevision = 1;
+  assert.equal(call(context, "qualificationHasFinalPlay"), true);
+  context.finalMatches[0].officialRevision = 0;
+  context.finalScoreDrafts.set(context.finalMatches[0].id, { sets: finishedSets });
+  assert.equal(call(context, "qualificationHasFinalPlay"), true, "local final score drafts are still protected");
+}
+
+async function testInvalidQualificationAndFailedResetStayBlocked() {
+  const { context, elements, calls, errors } = finalUiFixture();
+  await call(context, "onGenerateBracket");
+  context.qualificationDraftStale = true;
+  call(context, "updateQualificationProofUi");
+  call(context, "updateBracketPublishBar");
+  assert.equal(elements.qualificationProofBanner.hidden, false);
+  assert.equal(elements.publishBracketBtn.disabled, true);
+  const beforeCalls = calls.length;
+  await call(context, "handlePublishBracket");
+  assert.equal(calls.length, beforeCalls, "source changes still block publication");
+
+  context.qualificationDraftStale = false;
+  const originalMatches = structuredClone(context.finalMatches);
+  context.finalMatches[0].teamB = { id: "c", name: "C" };
+  await call(context, "handleQualificationRevalidation");
+  call(context, "updateBracketPublishBar");
+  assert.equal(elements.qualificationProofBanner.hidden, false, "invalid entrants still warn after revalidation");
+  assert.equal(elements.publishBracketBtn.disabled, true);
+  assert.equal(call(context, "qualificationProofStatus"), "unverified");
+
+  call(context, "resetFinalDraft", originalMatches);
+  context.qualificationProof = { status: "current", fingerprint: "f".repeat(64) };
+  const retainedMatches = context.finalMatches;
+  context.confirm = () => false;
+  await call(context, "handleClearBracket");
+  assert.equal(context.finalMatches, retainedMatches, "cancelled reset preserves the bracket");
+  context.confirm = () => true;
+  context.adminWorkflowCallable = async () => { throw new Error("Server rejected concurrent final input"); };
+  await call(context, "handleClearBracket");
+  assert.equal(context.finalMatches, retainedMatches, "server rejection never clears local records");
+  assert.equal(context.qualificationProof.status, "current");
+  assert.equal(errors.length, 1);
+}
+
 async function runQualificationUiSuite() {
   testActualSourceInvalidationAndForeignRecords();
   testActualSelectionState();
   await testActualPreparationPublishContextAndCount();
+  await testGeneratedBracketWarningsAndReset();
+  await testRevalidationCanActuallyPublish();
+  await testRealFinalPlayStillBlocksReset();
+  await testInvalidQualificationAndFailedResetStayBlocked();
   console.log("qualification UI fixtures passed");
 }
 
