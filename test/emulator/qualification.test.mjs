@@ -9,6 +9,35 @@ import {
   computeQualificationState,
   validateQualificationSelection,
 } from '../../js/match-logic.js';
+import { buildCrossGroupSeedOrder, generateBracket } from '../../js/bracket.js';
+
+// 관리자 화면이 서버에 보내는 것과 같은 구조 전용 레코드로 바꾼다(admin.js finalStructureMatch와 동일한 필드).
+function structureOnly(prefix, matches) {
+  const rename = (id) => (id ? `${prefix}-${id}` : null);
+  return matches.map((match) => {
+    const structure = {};
+    for (const field of ['id', 'round', 'roundLabel', 'index', 'teamA', 'teamB', 'teamASource', 'teamBSource',
+      'status', 'byeCandidate', 'nextMatchId', 'nextSlot']) {
+      if (match[field] !== undefined) structure[field] = match[field];
+    }
+    structure.id = rename(match.id);
+    structure.nextMatchId = rename(match.nextMatchId);
+    if (!structure.nextMatchId) structure.nextSlot = null;
+    return structure;
+  });
+}
+
+// 3개 조 · 조별 2팀 진출(6팀) · 8강 대진. winners에 든 조 1위가 부전승 자리를 받는다.
+function byeLotteryBracket(prefix, standingsByGroup, winners) {
+  const tiers = [0, 1].map((rankIndex) => standingsByGroup.map(({ groupId, ids }) => ({
+    teamId: ids[rankIndex],
+    groupId,
+    groupSize: ids.length,
+    ...(rankIndex === 0 && winners ? { byePriority: winners.includes(ids[0]) } : {}),
+  })));
+  const order = buildCrossGroupSeedOrder(tiers);
+  return structureOnly(prefix, generateBracket(order.map((id) => ({ id, name: id }))).matches);
+}
 
 const host = process.env.FUNCTIONS_EMULATOR_HOST || '127.0.0.1:5001';
 const [functionsHost, functionsPort] = host.split(':');
@@ -861,6 +890,113 @@ export async function runQualificationSuite() {
     ));
     assert.equal(preservedPlayedFinal.data().officialRevision, 1, 'rejected-played-replacement-preserves-score-history');
     await cleanupScenario(byeStale);
+
+    // 부전승 추첨: 3개 조 1위 3팀이 부전승 2자리를 두고 추첨한 결과를 서버가 검증·저장한다.
+    const byeLottery = await seedQualificationScenario({
+      prefix: 'bye-lottery',
+      groupSpecs: [
+        { name: 'g1', teams: ['a', 'b', 'c'] },
+        { name: 'g2', teams: ['d', 'e', 'f'] },
+        { name: 'g3', teams: ['g', 'h', 'i'] },
+      ],
+    });
+    const standingsByGroup = [
+      { groupId: 'bye-lottery-g1', ids: ['bye-lottery-a', 'bye-lottery-b'] },
+      { groupId: 'bye-lottery-g2', ids: ['bye-lottery-d', 'bye-lottery-e'] },
+      { groupId: 'bye-lottery-g3', ids: ['bye-lottery-g', 'bye-lottery-h'] },
+    ];
+    const lotteryWinners = ['bye-lottery-d', 'bye-lottery-g'];
+    const lotteryRecord = {
+      candidateIds: ['bye-lottery-a', 'bye-lottery-d', 'bye-lottery-g'],
+      selectedIds: lotteryWinners,
+      reason: '감독자 회의 제비뽑기',
+    };
+    const lotteryStructure = byeLotteryBracket('bye-lottery-final', standingsByGroup, lotteryWinners);
+    const defaultStructure = byeLotteryBracket('bye-lottery-final', standingsByGroup, null);
+    byeLottery.finalIds.push(...lotteryStructure.map((match) => match.id));
+    const lotteryPrepared = await call('prepareFinalQualification', { tournamentId: 'main', division: 'men' });
+    assert.equal(lotteryPrepared.state.requiredCount, 6, 'bye-lottery-six-finalists');
+    const lotteryPayload = (matches, byeSelection) => ({
+      tournamentId: 'main',
+      division: 'men',
+      expectedMatches: [],
+      matches,
+      scoreDrafts: [],
+      expectedPrelimFingerprint: lotteryPrepared.fingerprint,
+      tieSelections: {},
+      ...(byeSelection === undefined ? {} : { byeSelection }),
+    });
+    await assert.rejects(
+      call('publishFinalStructure', lotteryPayload(defaultStructure, lotteryRecord)),
+      /bye_placement_mismatch/,
+      'bye-lottery-rejects-placement-that-contradicts-the-record',
+    );
+    await assert.rejects(
+      call('publishFinalStructure', lotteryPayload(lotteryStructure, {
+        ...lotteryRecord, candidateIds: ['bye-lottery-d', 'bye-lottery-g'],
+      })),
+      /bye_candidates_mismatch/,
+      'bye-lottery-rejects-forged-candidates',
+    );
+    await assert.rejects(
+      call('publishFinalStructure', lotteryPayload(lotteryStructure, {
+        ...lotteryRecord, selectedIds: ['bye-lottery-d', 'bye-lottery-b'],
+      })),
+      /bye_/,
+      'bye-lottery-rejects-non-candidate-winner',
+    );
+    await assert.rejects(
+      call('publishFinalStructure', lotteryPayload(lotteryStructure, { ...lotteryRecord, reason: ' ' })),
+      /bye_reason_required/,
+      'bye-lottery-requires-a-note',
+    );
+    await assert.rejects(
+      call('publishFinalStructure', { ...lotteryPayload(lotteryStructure, lotteryRecord), extra: true }),
+      /Exact final publication payload/,
+      'bye-lottery-payload-stays-exact',
+    );
+    const noFinalsYet = await f.seed((db) => getDoc(
+      doc(db, 'tournaments/main/divisions/men/finalMatches', lotteryStructure[0].id),
+    ));
+    assert.equal(noFinalsYet.exists(), false, 'bye-lottery-rejections-write-nothing');
+    const lotteryPublished = await call('publishFinalStructure', lotteryPayload(lotteryStructure, lotteryRecord));
+    assert.equal(lotteryPublished.matches.length, 7, 'bye-lottery-publishes-eight-slot-bracket');
+    const lotteryRoots = lotteryPublished.matches.filter((match) => match.round === 1);
+    assert.deepEqual(
+      lotteryRoots.filter((match) => match.byeCandidate).map((match) => match.byeCandidate.team.id).sort(),
+      lotteryWinners,
+      'bye-lottery-winners-hold-the-bye-slots',
+    );
+    assert.ok(
+      lotteryRoots.some((match) => match.status === 'pending'
+        && [match.teamA?.id, match.teamB?.id].includes('bye-lottery-a')),
+      'bye-lottery-remaining-winner-plays-round-one',
+    );
+    const lotteryRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.equal(lotteryRoot.data().finalQualification.men.status, 'current', 'bye-lottery-proof-is-current');
+    assert.deepEqual(lotteryRoot.data().finalQualification.men.byeSelection, {
+      candidateIds: ['bye-lottery-a', 'bye-lottery-d', 'bye-lottery-g'],
+      selectedIds: lotteryWinners,
+      reason: '감독자 회의 제비뽑기',
+    }, 'bye-lottery-record-is-persisted-with-the-proof');
+    const lotteryAudit = await f.seed((db) => getDoc(doc(db, path('auditEvents', lotteryPublished.transitionId))));
+    assert.deepEqual(lotteryAudit.data().before.byeSelection.selectedIds, lotteryWinners, 'bye-lottery-record-is-audited');
+    const republished = await call('publishFinalStructure', {
+      ...lotteryPayload(
+        lotteryPublished.matches.map(({ id, round, roundLabel, index, teamA, teamB, teamASource, teamBSource,
+          status, byeCandidate, nextMatchId, nextSlot }) => ({
+          id, round, roundLabel, index, teamA, teamB, teamASource, teamBSource, status,
+          ...(byeCandidate ? { byeCandidate } : {}), nextMatchId, nextSlot,
+        })),
+        undefined,
+      ),
+      expectedMatches: finalStructureBaseline(lotteryPublished.matches),
+    });
+    assert.equal(republished.matches.length, 7, 'bye-lottery-republication-without-record-stays-allowed');
+    const republishedRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.deepEqual(republishedRoot.data().finalQualification.men.byeSelection?.selectedIds, lotteryWinners,
+      'bye-lottery-record-is-kept-when-a-matching-bracket-is-republished');
+    await cleanupScenario(byeLottery);
   } finally {
     await deleteApp(app);
     await f.cleanup();

@@ -10,6 +10,9 @@ import {
   buildQualificationSnapshot,
   computeQualificationState,
   validateQualificationSelection,
+  computeByeLotteryState,
+  validateByeSelection,
+  byeEntrantIdsFromRoots,
   normalizePlayedSets,
   validateSetScore,
 } from './match-logic.js';
@@ -44,6 +47,7 @@ import {
   reconcileRecorderAssignment,
   reconcileRecorderSubmit,
   writeStoredRecorderDraft,
+  recorderWaitingMessage,
 } from './recorder-state.js';
 
 let pass = 0, fail = 0;
@@ -4134,6 +4138,101 @@ check(
   adminGrantUi.grant.activeCards().length === 0
     && !adminGrantUi.grant.status().includes("stale@example.com"),
 );
+
+// ---------- 부전승 추첨 (3개 조 · 6팀 · 8강 → 조 1위 3팀 중 2팀 부전승) ----------
+{
+  const groupsAbc = ['A', 'B', 'C'];
+  const byeState = {
+    groups: groupsAbc.map((g) => ({
+      groupId: g,
+      standings: [1, 2, 3].map((rank) => ({ teamId: `${g}${rank}`, rank })),
+    })),
+  };
+  const finalists = groupsAbc.flatMap((g) => [`${g}1`, `${g}2`]);
+  const lottery = computeByeLotteryState(byeState, finalists);
+  check('bye lottery: 6 finalists leave 2 BYE slots', lottery.ok && lottery.byeSlots === 2);
+  check('bye lottery: three group winners tie for the two BYE slots',
+    lottery.required && lottery.slots === 2 && lottery.candidateIds.join() === 'A1,B1,C1' && lottery.fixedIds.length === 0);
+
+  const fourGroups = { groups: ['A', 'B', 'C', 'D'].map((g) => ({ groupId: g, standings: [1, 2].map((rank) => ({ teamId: `${g}${rank}`, rank })) })) };
+  check('bye lottery: 8 finalists need no lottery',
+    computeByeLotteryState(fourGroups, ['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'D1', 'D2']).required === false);
+  const fiveOfFour = computeByeLotteryState(fourGroups, ['A1', 'B1', 'C1', 'D1', 'A2']);
+  check('bye lottery: 4 winners + 1 runner-up fill 3 BYE slots by lottery among winners',
+    fiveOfFour.required && fiveOfFour.slots === 3 && fiveOfFour.candidateIds.join() === 'A1,B1,C1,D1');
+  const sevenOfFour = computeByeLotteryState(fourGroups, ['A1', 'B1', 'C1', 'D1', 'A2', 'B2', 'C2']);
+  check('bye lottery: 7 finalists give the single BYE to a lottery among 4 winners',
+    sevenOfFour.required && sevenOfFour.slots === 1 && sevenOfFour.candidateIds.length === 4);
+  const threeGroupsSix = computeByeLotteryState(byeState, ['A1', 'B1', 'C1', 'A2', 'B2']);
+  check('bye lottery: 3 winners + 2 runners-up with 3 BYE slots fix all winners without lottery',
+    threeGroupsSix.required === false && threeGroupsSix.fixedIds.join() === 'A1,B1,C1');
+  check('bye lottery: a finalist without a preliminary rank is rejected',
+    computeByeLotteryState(byeState, ['A1', 'X9']).ok === false);
+
+  const record = { candidateIds: ['A1', 'B1', 'C1'], selectedIds: ['A1', 'C1'], reason: '감독자 회의 제비뽑기' };
+  check('bye selection: valid lottery record passes', validateByeSelection(byeState, finalists, record).ok);
+  const codes = (result) => result.errors.map((e) => e.split(':')[0]);
+  check('bye selection: wrong winner count rejected',
+    codes(validateByeSelection(byeState, finalists, { ...record, selectedIds: ['A1'] })).includes('bye_slots_mismatch'));
+  check('bye selection: non-candidate winner rejected',
+    codes(validateByeSelection(byeState, finalists, { ...record, selectedIds: ['A1', 'A2'] })).includes('bye_non_candidate'));
+  check('bye selection: forged candidates rejected',
+    codes(validateByeSelection(byeState, finalists, { ...record, candidateIds: ['A1', 'C1'] })).includes('bye_candidates_mismatch'));
+  check('bye selection: empty note rejected',
+    codes(validateByeSelection(byeState, finalists, { ...record, reason: '  ' })).includes('bye_reason_required'));
+  check('bye selection: unknown keys rejected',
+    codes(validateByeSelection(byeState, finalists, { ...record, extra: 1 })).includes('bye_selection_invalid'));
+  check('bye selection: record is refused when no lottery is needed',
+    codes(validateByeSelection(fourGroups, ['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'D1', 'D2'], { candidateIds: [], selectedIds: [], reason: 'x' }))
+      .includes('bye_lottery_not_required'));
+
+  for (const winners of [['A1', 'B1'], ['A1', 'C1'], ['B1', 'C1']]) {
+    const tiers = [1, 2].map((rank) => groupsAbc.map((g) => ({
+      teamId: `${g}${rank}`, groupId: g, groupSize: 3,
+      ...(rank === 1 ? { byePriority: winners.includes(`${g}1`) } : {}),
+    })));
+    const order = buildCrossGroupSeedOrder(tiers);
+    const { matches } = generateBracket(order.map((id) => ({ id, name: id })));
+    const roots = matches.filter((m) => m.round === 1);
+    const byes = byeEntrantIdsFromRoots(roots);
+    const loser = ['A1', 'B1', 'C1'].find((id) => !winners.includes(id));
+    const loserMatch = roots.find((m) => m.teamA?.id === loser || m.teamB?.id === loser);
+    check(`bye seeding ${winners.join('+')}: lottery winners get the BYE slots`, byes.join() === [...winners].sort().join());
+    check(`bye seeding ${winners.join('+')}: remaining winner plays round one`, Boolean(loserMatch?.teamA && loserMatch?.teamB));
+    check(`bye seeding ${winners.join('+')}: no same-group round-one pair`,
+      roots.filter((m) => m.teamA && m.teamB).every((m) => m.teamA.id[0] !== m.teamB.id[0]));
+    check(`bye seeding ${winners.join('+')}: generated roots match the recorded lottery`,
+      validateByeSelection(byeState, finalists, { candidateIds: ['A1', 'B1', 'C1'], selectedIds: winners, reason: 'x' }, matches).ok);
+  }
+  const defaultOrder = buildCrossGroupSeedOrder([1, 2].map((rank) => groupsAbc.map((g) => ({ teamId: `${g}${rank}`, groupId: g, groupSize: 3 }))));
+  const defaultRoots = generateBracket(defaultOrder.map((id) => ({ id, name: id }))).matches;
+  check('bye seeding: placement that contradicts the lottery is rejected',
+    !validateByeSelection(byeState, finalists, { candidateIds: ['A1', 'B1', 'C1'], selectedIds: ['B1', 'C1'], reason: 'x' }, defaultRoots).ok);
+  check('bye seeding: without byePriority the existing default order is unchanged',
+    defaultOrder.join() === buildCrossGroupSeedOrder([1, 2].map((rank) => groupsAbc.map((g) => ({ teamId: `${g}${rank}`, groupId: g, groupSize: 3 })))).join()
+      && byeEntrantIdsFromRoots(defaultRoots).join() === 'A1,B1');
+}
+
+// ---------- 기록관 대기 안내 문구 ----------
+{
+  check('recorder waiting: empty court explains that finals need publication',
+    /관객·기록관 화면에 공개/.test(recorderWaitingMessage('empty_schedule')));
+  check('recorder waiting: unresolved final explains publication of previous results',
+    /이전 경기 결과를 검수하고 ‘관객·기록관 화면에 공개’/.test(recorderWaitingMessage('unresolved', { assignment: { matchType: 'final' } })));
+  check('recorder waiting: unresolved prelim keeps the generic message',
+    /대진이 확정되기를 기다리고/.test(recorderWaitingMessage('unresolved', { assignment: { matchType: 'prelim' } })));
+  check('recorder waiting: blocked final in schedule says the next final team is undecided',
+    /다음 본선 경기의 팀이 아직 정해지지/.test(recorderWaitingMessage('no_current', {
+      schedule: [{ status: 'waiting', baseStatus: 'waiting', assignment: { matchType: 'final', dependencyReady: false } }],
+    })));
+  check('recorder waiting: all completed points to publication',
+    /공개/.test(recorderWaitingMessage('no_current', { schedule: [{ status: 'completed', baseStatus: 'completed', assignment: {} }] })));
+  check('recorder waiting: remaining ready matches give the queue message',
+    /관리자가 다음 경기를 진행/.test(recorderWaitingMessage('no_current', {
+      schedule: [{ status: 'waiting', baseStatus: 'waiting', assignment: { matchType: 'prelim' } }],
+    })));
+}
+
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

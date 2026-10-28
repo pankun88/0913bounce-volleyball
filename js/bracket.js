@@ -143,6 +143,11 @@ export function buildCrossGroupSeedOrder(tiers) {
   const size = nextPowerOfTwo(totalSeeds);
   const partnerOf = (s) => size + 1 - s; // 시드 s가 1라운드에서 만날 수 있는 상대 시드 번호
   const sizeOf = (entry) => (Number.isFinite(entry.groupSize) ? entry.groupSize : 0);
+  // byePriority: 같은 티어의 부전승 후보가 자리보다 많아 현장 추첨을 한 경우 true(뽑힘)/false(탈락).
+  // 뽑힌 팀은 조 인원수보다 우선해 티어 앞쪽(부전승) 시드를 받고, 추첨 대상 팀은 아래 같은 조
+  // 충돌 해소 단계에서도 부전승 자리와 실제 경기 자리 사이를 옮기지 않는다.
+  const priorityOf = (entry) => (entry.byePriority === true ? 1 : 0);
+  const lotteryLocked = (entry) => typeof entry?.byePriority === 'boolean';
   const isRealMatchSeed = (s) => { const p = partnerOf(s); return p >= 1 && p <= totalSeeds; };
 
   // 1) 표준 배정: 순위가 좋은 팀부터(1위 전원 -> 2위 전원 -> ...) 차례로 시드 번호를 받는다.
@@ -152,7 +157,7 @@ export function buildCrossGroupSeedOrder(tiers) {
   const tierRanges = []; // 각 티어가 차지하는 시드 번호 [시작, 끝] (같은 티어 내 스왑용)
   let cursor = 1;
   nonEmptyTiers.forEach((tier) => {
-    const sortedTier = tier.slice().sort((a, b) => sizeOf(b) - sizeOf(a));
+    const sortedTier = tier.slice().sort((a, b) => priorityOf(b) - priorityOf(a) || sizeOf(b) - sizeOf(a));
     const start = cursor;
     sortedTier.forEach((entry) => { seeds[cursor] = entry; cursor++; });
     tierRanges.push([start, cursor - 1]);
@@ -178,6 +183,9 @@ export function buildCrossGroupSeedOrder(tiers) {
     candidates.sort((a, b) => (isRealMatchSeed(b.cand) ? 1 : 0) - (isRealMatchSeed(a.cand) ? 1 : 0));
 
     for (const { side, cand } of candidates) {
+      // 추첨으로 정한 부전승/실제 경기 구분은 자리바꿈으로 뒤집지 않는다.
+      const moving = side === 'p' ? seeds[p] : seeds[s];
+      if (!isRealMatchSeed(cand) && (lotteryLocked(seeds[cand]) || lotteryLocked(moving))) continue;
       const candPartner = partnerOf(cand);
       const candPartnerEntry = isRealMatchSeed(cand) ? seeds[candPartner] : null;
       if (side === 'p') {

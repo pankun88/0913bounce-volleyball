@@ -18,6 +18,7 @@ import {
   recorderDataState, reconcileRecorderAssignment, reconcileRecorderOwnership, resolveRecorderConflict,
   writeStoredRecorderDraft, buildRecorderFixtureIdentity, cloneRecorderFixtureIdentity,
   recorderFixtureIdentityEqual, reconcileRecorderDraftIdentity, preserveStoredRecorderDraft,
+  recorderWaitingMessage,
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
@@ -218,6 +219,15 @@ function scheduleStatusLabel(statusValue) {
     replay: "재경기",
   }[statusValue] || "대기";
 }
+function currentCourtSchedule() {
+  return buildRecorderCourtSchedule({
+    assignments: courtAssignments,
+    queue,
+    officialMatches: scheduleOfficial,
+    teamsById: teams,
+    groupsById: groups,
+  });
+}
 function renderCourtSchedule() {
   renderOperationsHeader();
   if (!ui.courtScheduleList) return;
@@ -237,16 +247,10 @@ function renderCourtSchedule() {
     }
     return;
   }
-  const schedule = buildRecorderCourtSchedule({
-    assignments: courtAssignments,
-    queue,
-    officialMatches: scheduleOfficial,
-    teamsById: teams,
-    groupsById: groups,
-  });
+  const schedule = currentCourtSchedule();
   if (ui.courtScheduleStatus) {
     ui.courtScheduleStatus.hidden = Boolean(schedule.length);
-    ui.courtScheduleStatus.textContent = schedule.length ? "" : "이 코트에 배정된 경기가 없습니다.";
+    ui.courtScheduleStatus.textContent = schedule.length ? "" : recorderWaitingMessage("empty_schedule");
   }
   ui.courtScheduleList.replaceChildren(...schedule.map((item) => {
     const card = document.createElement("li");
@@ -477,7 +481,7 @@ function clearCurrentMatch() {
   assignment = workflow = official = null;
   renderedFormKey = "";
   clearConfirmation();
-  if (ui.matchSummary) ui.matchSummary.textContent = "현재 대기 중인 경기가 없습니다.";
+  if (ui.matchSummary) ui.matchSummary.textContent = recorderWaitingMessage("no_current", { schedule: currentCourtSchedule() });
   if (ui.lockNotice) ui.lockNotice.hidden = true;
   if (ui.claimButton) ui.claimButton.hidden = true;
   if (ui.scoreForm) ui.scoreForm.hidden = true;
@@ -935,6 +939,9 @@ function render() {
   renderDataState();
   renderSaveRecovery();
   if (viewState !== "operations" || !matchKey) {
+    if (viewState === "operations" && !matchKey && ui.matchSummary) {
+      ui.matchSummary.textContent = recorderWaitingMessage("no_current", { schedule: currentCourtSchedule() });
+    }
     if (ui.claimButton) ui.claimButton.hidden = true;
     if (ui.scoreForm) ui.scoreForm.hidden = true;
     applyActionGate();
@@ -949,7 +956,7 @@ function render() {
   const waiting = !resolved();
   if (ui.lockNotice) {
     ui.lockNotice.hidden = !(waiting || (workflow?.lock && !edit.token));
-    ui.lockNotice.textContent = waiting ? "대진이 확정되기를 기다리고 있습니다. 팀과 이전 경기 결과가 확정되면 입력할 수 있습니다." : "다른 탭 또는 기록관이 입력 중입니다.";
+    ui.lockNotice.textContent = waiting ? recorderWaitingMessage("unresolved", { assignment }) : "다른 탭 또는 기록관이 입력 중입니다.";
   }
   const selectorReady = Boolean(courtId && recorder && (ui.courtSelect?.value || pendingCourtId) === courtId);
   if (isStaleTerminalCurrent()) {

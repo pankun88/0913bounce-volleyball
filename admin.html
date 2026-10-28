@@ -183,6 +183,10 @@
   </section>
 
   <section class="tab-panel" id="tab-workflow">
+    <div id="workflowFinalPublishHint" class="final-publish-hint" role="status" aria-live="polite" hidden>
+      <span data-role="text"></span>
+      <button type="button" class="btn primary small" id="gotoFinalPublishBtn">본선 탭에서 공개하기</button>
+    </div>
     <div class="card">
       <h2>기록관 접근 코드 <button type="button" class="help-trigger" aria-label="기록관 접근 코드 설명" data-help="코드는 생성·재발급할 때만 표시됩니다. 안전한 방법으로 기록관에게 전달하세요.">설명</button></h2>
       <p class="empty-hint recorder-code-guidance">접근 코드는 생성·재발급 때만 표시됩니다. 코드로 받은 권한은 계정 단위이며 12시간 후 만료됩니다. 재발급·전체 폐기는 모든 기록관의 기존 권한을 무효화하지만, 입력 중인 초안과 잠금은 유지됩니다.</p>
@@ -359,9 +363,12 @@
       <div class="bracket-header">
         <div class="bracket-banner"><span id="bracketTitle">본선 대진표</span></div>
       </div>
-      <div class="bracket-publish-bar" id="bracketPublishBar" style="display:none;">
-        <span id="bracketPublishMsg">모든 변경사항이 관객 화면에 공개되어 있습니다.</span>
-        <button type="button" class="btn primary small" id="publishBracketBtn">관객 화면에 공개</button>
+      <div class="bracket-publish-bar" id="bracketPublishBar" role="status" aria-live="polite" style="display:none;">
+        <span class="bracket-publish-text">
+          <b id="bracketPublishTitle">공개됨 — 기록관 입력 가능</b>
+          <span id="bracketPublishMsg">모든 변경사항이 관객·기록관 화면에 공개되어 있습니다.</span>
+        </span>
+        <button type="button" class="btn primary" id="publishBracketBtn">관객·기록관 화면에 공개</button>
       </div>
       <div class="bracket-wrap" id="finalBracketContainer"></div>
     </div>

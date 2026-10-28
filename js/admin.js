@@ -21,6 +21,8 @@ import {
   buildQualificationSnapshot,
   computeQualificationState,
   validateQualificationSelection,
+  computeByeLotteryState,
+  validateByeSelection,
   normalizePlayedSets,
 } from "./match-logic.js";
 import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
@@ -75,9 +77,15 @@ let qualificationServerState = null;
 let qualificationServerFingerprint = "";
 let qualificationTieSelections = {};
 let qualificationProof = null;
+// 부전승 후보(같은 예선 순위 티어)가 부전승 자리보다 많을 때 관리자가 기록한 현장 추첨 결과.
+// { candidateIds, selectedIds, reason } — 공개 시 서버가 검증해 finalQualification에 저장한다.
+let finalByeSelection = null;
 let qualificationRevalidatedLocally = false;
 let qualificationSourceKey = "";
 let qualificationSourceInitialized = false;
+// 대회 문서(qualifyPerGroup)도 예선 원본 스냅샷의 일부다. 이 문서가 조·팀·예선보다 늦게 도착하면
+// 빈 값으로 잡은 기준선과 달라져 멀쩡한 본선이 '예선 원본이 바뀜'으로 오판되므로 함께 기다린다.
+let qualificationInfoLoaded = false;
 let qualificationGroupsLoaded = false;
 let qualificationTeamsLoaded = false;
 let qualificationMatchesLoaded = false;
@@ -92,7 +100,7 @@ let isAddingGroup = false; // 저장 응답 전 중복 클릭/Enter로 같은 �
 let isAddingTeam = false; // 저장 응답 전 중복 클릭/Enter로 같은 팀이 두 번 생성되는 것을 막는다
 // 대진표 자리 드래그/부전승 배치는 누를 때마다 바로 관객 화면(대시보드)에 공개되면
 // 관객이 "아직 정해지지 않은" 자리 이동을 결과로 오해할 수 있다. 그래서 이 조정들은
-// 일단 화면(로컬)에서만 반영해두고, 관리자가 "관객 화면에 공개" 버튼을 눌러야만
+// 일단 화면(로컬)에서만 반영해두고, 관리자가 "관객·기록관 화면에 공개" 버튼을 눌러야만
 // Firestore에 저장돼 대시보드에 실제로 공유된다.
 let bracketPublishPending = false;
 let bracketPublishConflict = false;
@@ -304,6 +312,13 @@ function qualificationBlockerMessage(blocker) {
     qualification_not_ready: "참가팀이 있는 모든 조의 예선 결과를 먼저 완료하세요.",
     participant_count: "본선 진출팀은 2~32팀이어야 합니다.",
     qualification_validation_failed: "진출팀 선택 검증에 실패했습니다.",
+    bye_selection_invalid: "부전승 추첨 기록을 확인하세요.",
+    bye_lottery_not_required: "이 대진은 부전승 추첨이 필요하지 않습니다. 추첨 기록을 지우고 다시 시도하세요.",
+    bye_reason_required: "부전승 추첨 메모(추첨 방법·입회자 등)를 입력하세요.",
+    bye_candidates_mismatch: "부전승 추첨 후보가 현재 예선 순위와 다릅니다. 진출팀을 다시 확인하세요.",
+    bye_slots_mismatch: "부전승 자리 수만큼 추첨 당첨 팀을 선택하세요.",
+    bye_non_candidate: "부전승 추첨 후보만 당첨 팀으로 선택할 수 있습니다.",
+    bye_placement_mismatch: "대진표의 부전승 자리가 추첨 결과와 다릅니다. 추첨 당첨 팀은 부전승 자리에, 나머지 후보는 1라운드 경기 자리에 두거나 대진표를 다시 생성하세요.",
   }[code];
   return guidance || "예선 진출 조건을 확인하고 최신 상태에서 다시 시도하세요.";
 }
@@ -355,8 +370,10 @@ function qualificationSelectionIds(state, tieSelections = qualificationTieSelect
   ]);
 }
 
-function qualificationSeedOrder(state, tieSelections = qualificationTieSelections) {
+function qualificationSeedOrder(state, tieSelections = qualificationTieSelections, byeSelection = finalByeSelection) {
   const canonicalTies = canonicalQualificationTieSelections(state, tieSelections);
+  const byeCandidates = new Set(byeSelection?.candidateIds || []);
+  const byeWinners = new Set(byeSelection?.selectedIds || []);
   const tiers = [];
   const maxRank = Math.max(
     0,
@@ -377,6 +394,7 @@ function qualificationSeedOrder(state, tieSelections = qualificationTieSelection
           teamId: standing.teamId,
           groupId: group.groupId,
           groupSize: qualificationGroupTeamIds(group).length,
+          ...(byeCandidates.has(standing.teamId) ? { byePriority: byeWinners.has(standing.teamId) } : {}),
         }));
     });
     if (tier.length) tiers.push(tier);
@@ -388,8 +406,9 @@ function syncQualificationSelection(state) {
   const nextTies = canonicalQualificationTieSelections(state);
   qualificationTieSelections = nextTies;
   const ids = new Set(qualificationSelectionIds(state, nextTies));
+  syncFinalByeSelection(finalByeLotteryState(state, [...ids]));
   const previousOrder = seedSelection.filter((id) => ids.has(id));
-  const recommended = qualificationSeedOrder(state, nextTies);
+  const recommended = qualificationSeedOrder(state, nextTies, finalByeSelection);
   seedSelection = previousOrder.length === ids.size
     ? previousOrder
     : recommended.filter((id) => ids.has(id));
@@ -447,7 +466,7 @@ function finalEntrantIds(matches = finalMatches) {
 function qualificationSourceChanged() {
   const snapshot = qualificationSnapshotForCurrentData();
   const nextKey = JSON.stringify(snapshot);
-  if (!qualificationGroupsLoaded || !qualificationTeamsLoaded || !qualificationMatchesLoaded) {
+  if (!qualificationInfoLoaded || !qualificationGroupsLoaded || !qualificationTeamsLoaded || !qualificationMatchesLoaded) {
     qualificationSourceKey = nextKey;
     return false;
   }
@@ -479,6 +498,49 @@ function syncQualificationProofFromTournamentInfo() {
         .map(([groupId, values]) => [groupId, [...values]]),
     );
   }
+  if (!previous && !finalByeSelection && next?.byeSelection
+      && Array.isArray(next.byeSelection.candidateIds)
+      && Array.isArray(next.byeSelection.selectedIds)) {
+    finalByeSelection = {
+      candidateIds: [...next.byeSelection.candidateIds],
+      selectedIds: [...next.byeSelection.selectedIds],
+      reason: typeof next.byeSelection.reason === "string" ? next.byeSelection.reason : "",
+    };
+  }
+}
+
+/** 현재 진출팀 선택에서 부전승 추첨이 필요한지(같은 예선 순위 후보 > 남은 부전승 자리) 계산한다. */
+function finalByeLotteryState(state, participantIds = seedSelection) {
+  if (!state?.groups?.length || !Array.isArray(participantIds) || participantIds.length < 2) return null;
+  const lottery = computeByeLotteryState(state, participantIds);
+  return lottery.ok ? lottery : null;
+}
+
+/** 기록된 추첨이 현재 후보와 맞지 않으면(예선·진출팀 변경) 당첨자만 후보 안으로 줄여 다시 맞춘다. */
+function syncFinalByeSelection(lottery) {
+  if (!lottery?.required) {
+    finalByeSelection = null;
+    return;
+  }
+  const candidates = [...lottery.candidateIds].sort();
+  const previous = finalByeSelection;
+  const sameCandidates = previous
+    && previous.candidateIds.length === candidates.length
+    && [...previous.candidateIds].sort().every((id, index) => id === candidates[index]);
+  if (sameCandidates) return;
+  finalByeSelection = {
+    candidateIds: candidates,
+    selectedIds: (previous?.selectedIds || []).filter((id) => candidates.includes(id)).slice(0, lottery.slots),
+    reason: previous?.reason || "",
+  };
+}
+
+function finalByeSelectionComplete(lottery, selection = finalByeSelection) {
+  if (!lottery?.required) return true;
+  return Boolean(selection)
+    && selection.selectedIds.length === lottery.slots
+    && typeof selection.reason === "string"
+    && selection.reason.trim().length > 0;
 }
 
 function qualificationProofStatus() {
@@ -674,6 +736,7 @@ subscribeTournamentInfo((info) => {
   hideErrorBanner();
   setConnStatus(true);
   tournamentInfo = info || {};
+  qualificationInfoLoaded = true;
   syncQualificationProofFromTournamentInfo();
   const nameInput = document.getElementById("tournamentNameInput");
   if (nameInput && !nameInput.value) nameInput.value = tournamentInfo.name || "";
@@ -3281,7 +3344,7 @@ function stageSubmittedFinalReview(assignment, workflow) {
     return;
   }
   stageFinalScoreDraft(match.id, sets, reason, workflow.submissionVersion);
-  showToast("제출 점수를 로컬 본선 초안에 반영했습니다. 관객 화면에 공개해야 확정됩니다.");
+  showToast("제출 점수를 로컬 본선 초안에 반영했습니다. ‘관객·기록관 화면에 공개’해야 공식 결과가 되고 다음 라운드 기록관 입력이 열립니다.");
 }
 
 // ---------------- 대회설정: 대회명 ----------------
@@ -3318,42 +3381,50 @@ async function saveQualificationCount() {
   }
 }
 
+/** 부문을 바꾸면 이전 부문의 로컬 진출 검증 상태를 버리고, 새 부문의 서버 저장 검증 기록
+ * (tournaments/main.finalQualification[부문])을 곧바로 다시 불러온다. 대회 문서 구독은 문서가
+ * 바뀔 때만 다시 호출되므로, 여기서 다시 동기화하지 않으면 공개·검증이 끝난 본선도
+ * '검증된 진출 근거가 없습니다'로 잘못 표시된다. */
+function switchActiveDivision(nextDivision) {
+  if (!nextDivision || nextDivision === activeDivision) return false;
+  if (!finalMutationAllowed()) return false;
+  if (bracketPublishPending && !confirm(`${divisionLabel()}의 공개하지 않은 본선 대진 변경사항을 버리고 ${DIVISION_LABELS[nextDivision]}로 전환할까요?`)) return false;
+  activeDivision = nextDivision;
+  document.body.dataset.division = activeDivision;
+  syncDivisionThemeScopes();
+  bracketPublishPending = false;
+  seedSelection = [];
+  seedAutoMode = true;
+  qualificationState = null;
+  qualificationServerState = null;
+  qualificationServerFingerprint = "";
+  qualificationTieSelections = {};
+  qualificationProof = null;
+  qualificationRevalidatedLocally = false;
+  qualificationSourceInitialized = false;
+  qualificationSourceKey = "";
+  qualificationDraftStale = false;
+  qualificationReplacement = null;
+  qualificationPreparationError = "";
+  qualificationCountInputOverride = null;
+  finalByeSelection = null;
+  ringSelection = null;
+  syncQualificationProofFromTournamentInfo();
+  // 대회설정·예선·본선에 각각 같은 부문 스위치가 있으므로 모두 같은 상태로 맞춘다.
+  document.querySelectorAll("[data-division]").forEach((item) => {
+    item.classList.toggle("active", item.dataset.division === activeDivision);
+  });
+  refreshActiveDivisionData();
+  rebindFinalMatches();
+  document.getElementById("qualifyPerGroupInput").value = tournamentInfo.qualifyPerGroup?.[activeDivision] || 2;
+  document.getElementById("bracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${divisionLabel()} 본선 대진표`;
+  showToast(`${divisionLabel()}로 전환했습니다`);
+  return true;
+}
+
 function bindStaticHandlers() {
   document.querySelectorAll("[data-division]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const nextDivision = button.dataset.division;
-      if (nextDivision === activeDivision) return;
-      if (!finalMutationAllowed()) return;
-      if (bracketPublishPending && !confirm(`${divisionLabel()}의 공개하지 않은 본선 대진 변경사항을 버리고 ${DIVISION_LABELS[nextDivision]}로 전환할까요?`)) return;
-      activeDivision = nextDivision;
-      document.body.dataset.division = activeDivision;
-      syncDivisionThemeScopes();
-      bracketPublishPending = false;
-      seedSelection = [];
-      seedAutoMode = true;
-      qualificationState = null;
-      qualificationServerState = null;
-      qualificationServerFingerprint = "";
-      qualificationTieSelections = {};
-      qualificationProof = null;
-      qualificationRevalidatedLocally = false;
-      qualificationSourceInitialized = false;
-      qualificationSourceKey = "";
-      qualificationDraftStale = false;
-      qualificationReplacement = null;
-      qualificationPreparationError = "";
-      qualificationCountInputOverride = null;
-      ringSelection = null;
-      // 대회설정·예선·본선에 각각 같은 부문 스위치가 있으므로 모두 같은 상태로 맞춘다.
-      document.querySelectorAll("[data-division]").forEach((item) => {
-        item.classList.toggle("active", item.dataset.division === activeDivision);
-      });
-      refreshActiveDivisionData();
-      rebindFinalMatches();
-      document.getElementById("qualifyPerGroupInput").value = tournamentInfo.qualifyPerGroup?.[activeDivision] || 2;
-      document.getElementById("bracketTitle").textContent = `${tournamentInfo.name || "바운스발리볼"} ${divisionLabel()} 본선 대진표`;
-      showToast(`${divisionLabel()}로 전환했습니다`);
-    });
+    button.addEventListener("click", () => switchActiveDivision(button.dataset.division));
   });
 
   document.getElementById("saveTournamentNameBtn").addEventListener("click", async () => {
@@ -3424,6 +3495,10 @@ function bindStaticHandlers() {
 
   document.getElementById("generateBracketBtn").addEventListener("click", onGenerateBracket);
   document.getElementById("publishBracketBtn").addEventListener("click", handlePublishBracket);
+  document.getElementById("gotoFinalPublishBtn")?.addEventListener("click", () => {
+    document.querySelector('.tab-btn[data-tab="final"]')?.click();
+    document.getElementById("bracketPublishBar")?.scrollIntoView?.({ block: "center" });
+  });
   document.getElementById("clearBracketBtn").addEventListener("click", handleClearBracket);
 
   document.getElementById("exportCsvBtn").addEventListener("click", () => {
@@ -5000,7 +5075,36 @@ function qualificationPublishContext(state, participantIds = finalEntrantIds(fin
     context.replacementMode = "replace_unplayed";
     context.replacementReason = qualificationReplacement.reason;
   }
+  if (finalByeSelectionComplete(finalByeLotteryState(state, participantIds)) && finalByeSelection) {
+    context.byeSelection = {
+      candidateIds: [...finalByeSelection.candidateIds].sort(),
+      selectedIds: [...finalByeSelection.selectedIds].sort(),
+      reason: finalByeSelection.reason.trim(),
+    };
+  }
   return context;
+}
+
+/** 부전승 추첨이 필요한 대진에서 추첨 기록이 빠졌거나(requireRecord) 기록한 당첨 팀과 대진표의
+ * 부전승 자리가 다르면 안내 문구를 돌려준다. 기록 없이 이미 만든(이전 버전·수동 배치) 대진의
+ * 공개는 막지 않는다 — 기록은 새 대진표 생성 때 필수다. */
+function finalByeSelectionProblem(state, participantIds = finalEntrantIds(finalMatches), matches = finalMatches, options = null) {
+  const requireRecord = options?.requireRecord === true;
+  const lottery = finalByeLotteryState(state, participantIds);
+  if (!lottery?.required) return "";
+  if (!finalByeSelectionComplete(lottery)) {
+    const started = (finalByeSelection?.selectedIds?.length || 0) > 0 || Boolean(finalByeSelection?.reason?.trim());
+    return requireRecord || started
+      ? `부전승 후보 ${lottery.candidateIds.length}팀 중 ${lottery.slots}팀을 추첨해야 합니다. ‘부전승 추첨 결과’에서 당첨 팀과 추첨 메모를 기록하세요.`
+      : "";
+  }
+  if (!matches?.length) return "";
+  const result = validateByeSelection(state, participantIds, {
+    candidateIds: finalByeSelection.candidateIds,
+    selectedIds: finalByeSelection.selectedIds,
+    reason: finalByeSelection.reason.trim(),
+  }, matches.map(finalStructureMatch));
+  return result.ok ? "" : qualificationValidationMessages(result).join(" ");
 }
 
 function updateQualificationProofUi() {
@@ -5145,7 +5249,7 @@ async function handleQualificationReplacement() {
   bracketPublishPending = true;
   renderFinalBracket();
   renderFinalTeamPicker();
-  showToast("미진행 본선 초안을 교체했습니다. 사유와 함께 관객 화면에 공개해야 서버에 확정됩니다.", 6000);
+  showToast("미진행 본선 초안을 교체했습니다. 사유와 함께 ‘관객·기록관 화면에 공개’해야 서버에 확정됩니다.", 6000);
 }
 
 function renderFinalTeamPicker() {
@@ -5267,6 +5371,9 @@ function renderFinalTeamPicker() {
       });
     groupsWrap.appendChild(sub);
   });
+  const byeLottery = qualificationStateReadyForSelection(state)
+    ? finalByeLotteryState(state, seedSelection) : null;
+  if (byeLottery?.required) left.appendChild(renderFinalByeLotteryBox(byeLottery));
   el.appendChild(left);
 
   const resetBtn = left.querySelector("#resetSeedAutoBtn");
@@ -5337,6 +5444,81 @@ function renderFinalTeamPicker() {
   el.appendChild(left);
 }
 
+/** 같은 예선 순위의 부전승 후보가 부전승 자리보다 많을 때, 현장 추첨 결과(당첨 팀·메모)를 기록하는 상자.
+ * 당첨 팀은 부전승 자리로, 나머지 후보는 1라운드 경기 자리로 대진표가 생성된다. */
+function renderFinalByeLotteryBox(lottery) {
+  const box = document.createElement("div");
+  box.className = "bye-lottery-box";
+  box.id = "byeLotteryBox";
+  const selected = new Set(finalByeSelection?.selectedIds || []);
+  const locked = qualificationHasFinalPlay();
+  box.innerHTML = `<h4>부전승 추첨 결과</h4>
+    <p class="lottery-flag">부전승 자리는 ${lottery.byeSlots}개입니다. 같은 예선 순위 후보 ${lottery.candidateIds.length}팀 중 ${lottery.slots}팀을 현장 추첨으로 정해 기록하세요 (현재 ${selected.size}/${lottery.slots}). 뽑히지 않은 후보는 1라운드 경기를 치릅니다.</p>`;
+  if (lottery.fixedIds.length) {
+    const fixed = document.createElement("p");
+    fixed.className = "empty-hint";
+    fixed.style.padding = "0 0 6px";
+    fixed.textContent = `순위로 확정된 부전승: ${lottery.fixedIds.map((id) => `${teamName(id)}(${teamGroupRankLabel(id)})`).join(", ")}`;
+    box.appendChild(fixed);
+  }
+  lottery.candidateIds.forEach((id) => {
+    const row = document.createElement("label");
+    row.className = "row bye-lottery-candidate";
+    row.innerHTML = `<input type="checkbox" ${selected.has(id) ? "checked" : ""} ${locked ? "disabled" : ""} />
+      <span>${escapeHtml(teamName(id))} <span class="badge">${escapeHtml(teamGroupRankLabel(id))}</span></span>`;
+    const input = row.querySelector("input");
+    input.dataset.teamId = id;
+    input.addEventListener("change", (event) => {
+      const next = new Set(finalByeSelection?.selectedIds || []);
+      if (event.target.checked) {
+        if (next.size >= lottery.slots) {
+          showToast(`부전승은 ${lottery.slots}팀만 선택할 수 있습니다.`);
+          renderFinalTeamPicker();
+          return;
+        }
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      finalByeSelection = {
+        candidateIds: [...lottery.candidateIds],
+        selectedIds: [...next].sort(),
+        reason: finalByeSelection?.reason || "",
+      };
+      seedSelection = [];
+      seedAutoMode = true;
+      renderFinalTeamPicker();
+      renderFinalBracket();
+    });
+    box.appendChild(row);
+  });
+  const reason = document.createElement("textarea");
+  reason.id = "byeLotteryReason";
+  reason.rows = 2;
+  reason.maxLength = 500;
+  reason.disabled = locked;
+  reason.setAttribute("aria-label", "부전승 추첨 메모");
+  reason.placeholder = "추첨 메모 (필수) — 예: 9/13 감독자 회의 제비뽑기, 입회: 운영본부";
+  reason.value = finalByeSelection?.reason || "";
+  reason.addEventListener("input", () => {
+    finalByeSelection = {
+      candidateIds: [...lottery.candidateIds],
+      selectedIds: [...(finalByeSelection?.selectedIds || [])],
+      reason: reason.value,
+    };
+    updateBracketPublishBar();
+  });
+  box.appendChild(reason);
+  if (finalMatches.length) {
+    const hint = document.createElement("p");
+    hint.className = "empty-hint";
+    hint.style.padding = "4px 0 0";
+    hint.textContent = "추첨 당첨 팀을 바꾸면 ‘대진표 생성’을 다시 눌러 부전승 자리를 맞추세요.";
+    box.appendChild(hint);
+  }
+  return box;
+}
+
 /** teamId가 속한 조에서의 예선 순위를 "A조 1위" 형태 문구로 만든다 */
 function teamGroupRankLabel(teamId) {
   const t = teams.find((tt) => tt.id === teamId);
@@ -5380,7 +5562,7 @@ async function handleClearBracket() {
 
 /** 대진표 생성도 부전승 배치·자리 조정과 마찬가지로 "아직 다듬는 중"인 단계이므로,
  * 이 시점에 곧바로 Firestore에 쓰지 않는다. generateBracket()으로 로컬에서만 새 대진표를
- * 만들어 화면에 보여주고, 부전승 배치·자리 조정까지 모두 마친 뒤 "관객 화면에 공개"를
+ * 만들어 화면에 보여주고, 부전승 배치·자리 조정까지 모두 마친 뒤 "관객·기록관 화면에 공개"를
  * 눌러야 비로소 관객 화면(대시보드)에 한 번에 반영된다. */
 async function onGenerateBracket() {
   if (!finalMutationAllowed()) return;
@@ -5401,6 +5583,11 @@ async function onGenerateBracket() {
   }
   if (qualificationDraftStale && qualificationHasFinalBracket()) {
     return showToast("예선 원본이 바뀌었습니다. 먼저 ‘진출팀 다시 확인’ 또는 미진행 초안 교체를 진행하세요.", 6000);
+  }
+  const localByeProblem = finalByeSelectionProblem(localState, seedSelection, [], { requireRecord: true });
+  if (localByeProblem) {
+    document.getElementById("byeLotteryBox")?.scrollIntoView?.({ block: "center" });
+    return showToast(localByeProblem, 7000);
   }
   if (qualificationHasFinalPlay() && qualificationHasFinalBracket()) {
     return showToast("실제 진행된 본선은 새 대진표 생성으로 우회할 수 없습니다.", 6000);
@@ -5431,10 +5618,22 @@ async function onGenerateBracket() {
     prepared.state,
     serverSelection.tieSelections || qualificationTieSelections,
   );
+  const byeLottery = finalByeLotteryState(prepared.state, seedSelection);
+  syncFinalByeSelection(byeLottery);
+  if (!finalByeSelectionComplete(byeLottery)) {
+    renderFinalTeamPicker();
+    return showToast(finalByeSelectionProblem(prepared.state, seedSelection, [], { requireRecord: true }), 7000);
+  }
   qualificationServerState = prepared.state;
   qualificationDraftStale = false;
   qualificationRevalidatedLocally = true;
   qualificationReplacement = null;
+  // 부전승 추첨 결과를 반영한 서버 기준 시드 순서로 대진표를 만든다(당첨 팀 = 부전승 자리).
+  const selectedIds = new Set(seedSelection);
+  const seededIds = qualificationSeedOrder(prepared.state, qualificationTieSelections, finalByeSelection)
+    .filter((id) => selectedIds.has(id));
+  seedSelection.forEach((id) => { if (!seededIds.includes(id)) seededIds.push(id); });
+  seedSelection = seededIds;
   const teamsInSeedOrder = seedSelection.map((id) => ({ id, name: teamName(id) }));
   const { matches } = generateBracket(teamsInSeedOrder);
   finalMatches = matches;
@@ -5442,7 +5641,7 @@ async function onGenerateBracket() {
   bracketPublishPending = true;
   renderFinalBracket();
   renderFinalTeamPicker();
-  showToast(`${divisionLabel()} 본선 대진표를 생성했습니다 (아직 공개 안 됨). 부전승 배치·자리 조정까지 마친 뒤 '관객 화면에 공개'를 눌러주세요.`);
+  showToast(`${divisionLabel()} 본선 대진표를 생성했습니다 (아직 공개 안 됨). 부전승 배치·자리 조정까지 마친 뒤 '관객·기록관 화면에 공개'를 눌러야 기록관이 입력할 수 있습니다.`);
 }
 
 function renderFinalBracket() {
@@ -5512,22 +5711,106 @@ function updateBracketPublishBar() {
       && qualificationProofStatus() !== "current");
   const structureChanged = hasRecordedFinalStructureChanges();
 
-  if (msg) {
-    msg.textContent = bracketPublishConflict
-      ? "공개 기준이 변경되었습니다. 로컬 초안을 버린 뒤 최신 대진표를 확인하세요."
-      : structureChanged
-      ? "기록이 있는 경기의 팀 자리가 바뀌었습니다. 저장된 대진으로 복구한 뒤 같은 팀 순서로 점수를 입력하세요."
-      : qualificationNeedsReview
-      ? "예선 진출 근거를 다시 확인해야 공개할 수 있습니다. 현재 초안과 점수는 보존됩니다."
-      : bracketPublishPending
-      ? "공개하지 않은 변경/기록이 있습니다. 버튼을 눌러야 관객 화면에 반영됩니다."
-      : "모든 변경사항이 관객 화면에 공개되어 있습니다.";
-  }
+  const byeProblem = bracketPublishPending
+    ? finalByeSelectionProblem(qualificationStateForPublish, finalEntrantIds(finalMatches))
+    : "";
+  const publication = finalPublicationStatus({
+    hasBracket,
+    published: authoritativeFinalMatches.length > 0,
+    pending: bracketPublishPending,
+    conflict: bracketPublishConflict,
+    structureChanged,
+    needsReview: qualificationNeedsReview,
+    byeProblem,
+    stagedScores: finalScoreDrafts.size,
+  });
+  bar.dataset.publicationState = publication.state;
+  bar.classList.toggle("is-blocked", publication.state === "blocked");
+  const title = document.getElementById("bracketPublishTitle");
+  if (title) title.textContent = publication.title;
+  if (msg) msg.textContent = publication.message;
   if (btn) {
     btn.disabled = (!bracketPublishPending && !bracketPublishConflict && !structureChanged)
       || bracketPublishInFlight
-      || (qualificationNeedsReview && !bracketPublishConflict && !structureChanged);
-    btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : structureChanged ? "저장된 대진으로 복구" : bracketPublishPending ? "관객 화면에 공개" : "공개 완료";
+      || (qualificationNeedsReview && !bracketPublishConflict && !structureChanged)
+      || (Boolean(byeProblem) && !bracketPublishConflict && !structureChanged);
+    btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : structureChanged ? "저장된 대진으로 복구" : bracketPublishPending ? "관객·기록관 화면에 공개" : "공개 완료";
+    btn.classList.toggle("is-attention", bracketPublishPending && !btn.disabled);
+  }
+  updateFinalPublicationIndicators(publication);
+}
+
+/** 본선 공개 상태 문구. 본선 대진·부전승·점수는 ‘공개’를 눌러야 서버에 확정되고, 그때서야
+ * 기록관 코트 배정 대상이 되며 다음 라운드 팀이 채워진다. 그 사실을 항상 드러내도록 상태별 제목·설명을 만든다. */
+function finalPublicationStatus(input) {
+  const {
+    hasBracket, published, pending, conflict, structureChanged, needsReview, byeProblem, stagedScores,
+  } = input;
+  if (!hasBracket) {
+    return { state: "none", title: "", message: "" };
+  }
+  if (conflict) {
+    return {
+      state: "blocked",
+      title: "공개 충돌 — 최신 공개본 확인 필요",
+      message: "다른 화면에서 본선이 먼저 공개되었습니다. 로컬 초안을 버린 뒤 최신 대진표를 확인하세요.",
+    };
+  }
+  if (structureChanged) {
+    return {
+      state: "blocked",
+      title: "공개 불가 — 기록된 경기의 자리가 바뀜",
+      message: "기록이 있는 경기의 팀 자리가 바뀌었습니다. 저장된 대진으로 복구한 뒤 같은 팀 순서로 점수를 입력하세요.",
+    };
+  }
+  const recorderNote = published
+    ? "기록관 화면과 관객 화면에는 마지막으로 공개한 대진·점수만 보입니다."
+    : "아직 한 번도 공개하지 않아 기록관에게 본선 경기가 없고, ‘기록·검수’ 코트 배정에도 나타나지 않습니다.";
+  if (needsReview || byeProblem) {
+    return {
+      state: "blocked",
+      title: pending ? "공개 전 — 기록관이 점수를 입력할 수 없음" : "진출 근거 확인 필요",
+      message: [
+        needsReview ? "예선 진출 근거를 다시 확인해야 공개할 수 있습니다. 현재 초안과 점수는 보존됩니다." : "",
+        byeProblem,
+        pending ? recorderNote : "",
+      ].filter(Boolean).join(" "),
+    };
+  }
+  if (pending) {
+    const scoreNote = stagedScores > 0
+      ? `반영한 본선 점수 ${stagedScores}건은 공개해야 공식 결과가 되고, 승리 팀이 다음 라운드로 올라가 기록관이 다음 경기를 입력할 수 있습니다.`
+      : "대진 생성·자리 조정·부전승 배치는 이 화면에만 있습니다. 공개해야 기록관 코트 배정과 관객 화면에 반영됩니다.";
+    return {
+      state: "pending",
+      title: "공개 전 — 기록관이 점수를 입력할 수 없음",
+      message: `${scoreNote} ${recorderNote}`,
+    };
+  }
+  return {
+    state: "published",
+    title: "공개됨 — 기록관 입력 가능",
+    message: "모든 변경사항이 관객·기록관 화면에 공개되어 있습니다. 두 팀이 확정된 본선 경기는 ‘기록·검수’에서 코트에 배정하면 기록관이 입력합니다.",
+  };
+}
+
+/** 본선 탭 버튼과 ‘기록·검수’ 탭에도 공개 대기 상태를 표시해, 다른 탭에서 점수를 반영한 뒤에도
+ * 공개를 잊지 않게 한다. */
+function updateFinalPublicationIndicators(publication) {
+  const waiting = publication.state === "pending" || (publication.state === "blocked" && bracketPublishPending);
+  const tab = document.querySelector('.tab-btn[data-tab="final"]');
+  if (tab) {
+    tab.classList.toggle("has-unpublished", waiting);
+    tab.title = waiting ? "공개하지 않은 본선 변경이 있습니다" : "";
+  }
+  const hint = document.getElementById("workflowFinalPublishHint");
+  if (!hint) return;
+  hint.hidden = !waiting;
+  const text = hint.querySelector("[data-role='text']");
+  if (text) {
+    text.textContent = waiting
+      ? `${divisionLabel()} 본선에 공개하지 않은 변경이 있습니다${finalScoreDrafts.size ? ` (반영한 점수 ${finalScoreDrafts.size}건)` : ""}. 공개 전에는 기록관 화면·코트 배정·다음 라운드에 반영되지 않습니다.`
+      : "";
   }
 }
 
@@ -5542,10 +5825,13 @@ function finalPublicationErrorMessage(error) {
   if (reason === "recorded_final_structure_changed") {
     return "기록이 있는 경기의 팀 자리나 대진 연결이 바뀌었습니다. 저장된 대진으로 복구하고 점수만 정정하세요. 기존 기록은 유지됩니다.";
   }
+  if (/^bye_[a-z_]+:/.test(String(error?.message || ""))) {
+    return qualificationBlockerMessage(error.message);
+  }
   return error?.message || String(error);
 }
 
-/** "관객 화면에 공개" — 그동안 로컬에서만 조정/입력해 둔 대진·경기 기록을 한 번에 Firestore에
+/** "관객·기록관 화면에 공개" — 그동안 로컬에서만 조정/입력해 둔 대진·경기 기록을 한 번에 Firestore에
  * 반영해서 대시보드(관객 화면)에 실제로 공유한다. 6강·준결승·결승 등 매 라운드 결과를 입력한 뒤
  * 이 버튼을 눌러 그때그때 공개할 수 있다. */
 async function handlePublishBracket() {
@@ -5600,6 +5886,11 @@ async function handlePublishBracket() {
     showToast(message || "본선 진출팀을 다시 확인하세요.", 6000);
     return;
   }
+  const byeProblem = finalByeSelectionProblem(qualificationStateForPublish, finalParticipants);
+  if (byeProblem) {
+    showToast(byeProblem, 7000);
+    return;
+  }
   bracketPublishInFlight = true;
   updateBracketPublishBar();
   try {
@@ -5630,7 +5921,7 @@ async function handlePublishBracket() {
     qualificationPreparationError = "";
     updateQualificationProofUi();
     updateBracketPublishBar();
-    showToast(`${divisionLabel()} 대진표를 관객 화면에 공개했습니다`);
+    showToast(`${divisionLabel()} 대진표를 공개했습니다. 두 팀이 정해진 경기는 이제 기록관이 입력할 수 있습니다.`);
   } catch (err) {
     qualificationPreparationError = finalPublicationErrorMessage(err);
     updateQualificationProofUi();
@@ -5702,7 +5993,7 @@ function renderByeUnassignedPanel() {
 
 /** 미배정 부전승 후보를 실제로 대진표 자리에 배치한다(아직 다음 라운드 진출 확정은 아님).
  * 자리 배치는 결과가 아니라 위치 조정이므로, 곧바로 Firestore에 저장해 관객 화면에 공유하지
- * 않고 일단 로컬에만 반영해 둔다 — "관객 화면에 공개"를 눌러야 실제로 공유된다. */
+ * 않고 일단 로컬에만 반영해 둔다 — "관객·기록관 화면에 공개"를 눌러야 실제로 공유된다. */
 async function handlePlaceByeTeam(match) {
   if (!finalMutationAllowed()) return;
   const result = placeByeTeam(finalMatches, match.id);
@@ -5716,7 +6007,7 @@ async function handlePlaceByeTeam(match) {
   }
   bracketPublishPending = true;
   renderFinalBracket();
-  showToast("대진표에 부전승 대상으로 배치했습니다 (아직 공개 안 됨). '부전승 확정' 후 '관객 화면에 공개'를 눌러주세요.");
+  showToast("대진표에 부전승 대상으로 배치했습니다 (아직 공개 안 됨). '부전승 확정' 후 '관객·기록관 화면에 공개'를 눌러야 기록관이 입력할 수 있습니다.");
 }
 
 /** 확정 대기 중인 부전승을 관리자가 직접 확정해, 남은 팀을 다음 라운드로 올린다.
@@ -5734,12 +6025,12 @@ async function handleConfirmBye(match) {
   }
   bracketPublishPending = true;
   renderFinalBracket();
-  showToast("부전승을 확정했습니다 (아직 공개 안 됨). '관객 화면에 공개'를 눌러야 관객 화면에 반영됩니다.");
+  showToast("부전승을 확정했습니다 (아직 공개 안 됨). '관객·기록관 화면에 공개'를 눌러야 관객 화면과 기록관에게 반영됩니다.");
 }
 
 /** 대진표 카드에서 팀명을 드래그해 1라운드 두 자리를 서로 바꾼다 (경기 시작 전까지만 가능).
  * 드래그하는 동안마다 관객 화면에 바로 반영되면 "아직 정해지지 않은" 자리 이동을 결과로
- * 오해할 수 있으므로, 일단 로컬 화면에만 반영해 두고 "관객 화면에 공개"를 눌러야만
+ * 오해할 수 있으므로, 일단 로컬 화면에만 반영해 두고 "관객·기록관 화면에 공개"를 눌러야만
  * Firestore에 저장돼 대시보드에 공유된다. */
 async function handleBracketSlotSwap(fromSlot, toSlot) {
   if (!finalMutationAllowed()) return;
@@ -5804,7 +6095,7 @@ function openFinalScoreModal(match) {
       if (approved && scoreChanged && !correctionReason) throw new Error("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
 
       stageFinalScoreDraft(modalContext.matchId, sets, correctionReason || "", modalContext.submissionVersion);
-      showToast("본선 점수를 로컬 초안에 저장했습니다. 아직 관객 화면에 공개되지 않았습니다.");
+      showToast("본선 점수를 로컬 초안에 저장했습니다. 아직 공개되지 않아 관객·기록관 화면과 다음 라운드에 반영되지 않았습니다.");
     },
   });
 }

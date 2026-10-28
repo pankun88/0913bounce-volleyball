@@ -45,6 +45,84 @@
   border-color: var(--orange);
   color: var(--red-dark);
 }
+/* 진출 근거·부전승 추첨 등으로 공개할 수 없을 때: 빨강 */
+.bracket-publish-bar.is-blocked {
+  background: #fdecea;
+  border-color: #d9534f;
+  color: #8a2d1f;
+}
+/* 대진표를 아래로 스크롤해도 공개 상태와 버튼이 항상 보이도록 고정한다. */
+.bracket-publish-bar {
+  position: sticky;
+  top: 8px;
+  z-index: 20;
+}
+.bracket-publish-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.bracket-publish-text b { font-size: 15px; }
+.bracket-publish-text span { font-weight: 600; line-height: 1.5; }
+#publishBracketBtn { flex: 0 0 auto; white-space: nowrap; }
+#publishBracketBtn.is-attention {
+  box-shadow: 0 0 0 3px rgba(255, 152, 0, 0.35);
+  animation: publish-attention 1.6s ease-in-out infinite;
+}
+@keyframes publish-attention {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(255, 152, 0, 0.35); }
+  50% { box-shadow: 0 0 0 7px rgba(255, 152, 0, 0.12); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #publishBracketBtn.is-attention { animation: none; }
+}
+/* 본선 탭 버튼의 미공개 표시 점 */
+.tab-btn.has-unpublished { position: relative; }
+.tab-btn.has-unpublished::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--orange, #ff9800);
+  box-shadow: 0 0 0 2px #fff;
+}
+/* 기록·검수 탭의 본선 미공개 안내 */
+.final-publish-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 10px 16px;
+  border-radius: 14px;
+  border: 2px solid var(--orange, #ff9800);
+  background: #fff4e0;
+  color: var(--red-dark, #8a2d1f);
+  font-size: 13px;
+  font-weight: 700;
+}
+.final-publish-hint[hidden] { display: none; }
+/* 부전승 추첨 결과 기록 상자 */
+.bye-lottery-box {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 2px dashed var(--orange, #ff9800);
+  border-radius: 10px;
+  background: #fffaf2;
+}
+.bye-lottery-box h4 { margin: 0 0 6px; font-size: 14px; }
+.bye-lottery-box .lottery-flag { margin: 0 0 8px; }
+.bye-lottery-candidate {
+  justify-content: flex-start;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.bye-lottery-box textarea { width: 100%; margin-top: 6px; }
 
 .bracket-fullscreen-btn {
   position: absolute;

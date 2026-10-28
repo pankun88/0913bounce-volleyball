@@ -11,6 +11,7 @@ import {
   buildQualificationSnapshot,
   computeQualificationState,
   serializeQualificationSnapshot,
+  validateByeSelection,
   validateQualificationSelection,
 } from './match-logic.generated.js';
 
@@ -1511,18 +1512,18 @@ export async function publishFinalStructure(request) {
   const {
     tournamentId, division, expectedMatches, matches, scoreDrafts,
     expectedPrelimFingerprint, tieSelections,
-    replacementMode, replacementReason,
+    replacementMode, replacementReason, byeSelection,
   } = request.data || {};
   const baseRequired = ['tournamentId', 'division', 'expectedMatches', 'matches', 'scoreDrafts',
     'expectedPrelimFingerprint', 'tieSelections'];
   const replacementKeys = ['replacementMode', 'replacementReason'];
+  const optionalKeys = [...replacementKeys, 'byeSelection'];
   if (!request.data || typeof request.data !== 'object' || Array.isArray(request.data)
-      || ![baseRequired.length, baseRequired.length + replacementKeys.length].includes(Object.keys(request.data).length)
       || baseRequired.some((key) => !Object.hasOwn(request.data, key))
-      || (Object.keys(request.data).length === baseRequired.length + replacementKeys.length
-        && replacementKeys.some((key) => !Object.hasOwn(request.data, key)))
-      || (Object.keys(request.data).length === baseRequired.length
-        && replacementKeys.some((key) => Object.hasOwn(request.data, key)))
+      || Object.keys(request.data).some((key) => !baseRequired.includes(key) && !optionalKeys.includes(key))
+      || replacementKeys.filter((key) => Object.hasOwn(request.data, key)).length === 1
+      || (Object.hasOwn(request.data, 'byeSelection')
+        && (!byeSelection || typeof byeSelection !== 'object' || Array.isArray(byeSelection)))
       || tournamentId !== TOURNAMENT_ID || !['men', 'women'].includes(division)
       || typeof expectedPrelimFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(expectedPrelimFingerprint)
       || !tieSelections || typeof tieSelections !== 'object' || Array.isArray(tieSelections)
@@ -1669,6 +1670,34 @@ export async function publishFinalStructure(request) {
     );
     const canonicalParticipantIds = qualificationSelection.ok
       ? [...new Set(proposedParticipantIds)].sort() : [];
+    // 부전승 추첨 기록은 선택 사항이지만, 보냈다면 서버가 예선 순위에서 후보·자리 수를 다시
+    // 계산하고 실제 대진표의 부전승 자리가 기록과 일치하는지 확인한 뒤에만 저장한다.
+    let canonicalByeSelection = null;
+    if (Object.hasOwn(request.data, 'byeSelection')) {
+      const byeValidation = validateByeSelection(
+        qualificationContext.state,
+        canonicalParticipantIds,
+        byeSelection,
+        ordered,
+      );
+      if (!byeValidation.ok) bad(byeValidation.errors[0] || 'BYE lottery record is invalid.');
+      canonicalByeSelection = {
+        candidateIds: [...byeSelection.candidateIds].sort(),
+        selectedIds: [...byeSelection.selectedIds].sort(),
+        reason: boundedReason(byeSelection.reason),
+      };
+    } else {
+      // 점수만 반영하는 재공개 등에서 기록을 다시 보내지 않아도, 기존 추첨 기록이 여전히 예선 순위와
+      // 대진표에 맞으면 유지한다. 맞지 않으면(진출팀·배치 변경) 낡은 기록을 남기지 않는다.
+      const prior = qualificationContext.finalQualification?.byeSelection;
+      if (prior && validateByeSelection(qualificationContext.state, canonicalParticipantIds, prior, ordered).ok) {
+        canonicalByeSelection = {
+          candidateIds: [...prior.candidateIds].sort(),
+          selectedIds: [...prior.selectedIds].sort(),
+          reason: prior.reason,
+        };
+      }
+    }
     const priorParticipantIds = Array.isArray(qualificationContext.finalQualification?.participantIds)
       ? [...new Set(qualificationContext.finalQualification.participantIds)].sort() : null;
     if (existingSnap.size > 0 && !qualificationContext.finalQualification && !replacement) {
@@ -2065,6 +2094,7 @@ export async function publishFinalStructure(request) {
       fingerprint: qualificationContext.fingerprint,
       participantIds: canonicalParticipantIds,
       tieSelections: canonicalTieSelections(qualificationContext.state, tieSelections),
+      ...(canonicalByeSelection ? { byeSelection: canonicalByeSelection } : {}),
       reason: replacement ? 'replace_unplayed' : 'published',
     };
     const rootUpdate = { [`finalQualification.${division}`]: finalQualification };
@@ -2074,6 +2104,7 @@ export async function publishFinalStructure(request) {
       expectedMatches: expected,
       expectedPrelimFingerprint,
       tieSelections: finalQualification.tieSelections,
+      byeSelection: canonicalByeSelection,
       cutoff: qualificationContext.state.groups.map((group) => ({
         groupId: group.groupId,
         cutoffCandidateIds: group.cutoffCandidateIds,

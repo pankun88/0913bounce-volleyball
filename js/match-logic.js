@@ -801,6 +801,134 @@ export function validateQualificationSelection(state, participantIds, tieSelecti
   return { ok: true, errors: [] };
 }
 
+// ---------- 본선 부전승 추첨 (공통 브라우저/서버 로직) ----------
+
+function bracketSizeFor(count) {
+  let size = 1;
+  while (size < count) size *= 2;
+  return size;
+}
+
+/**
+ * 부전승 자리(대진표 크기 - 진출팀 수)는 표준 시딩대로 예선 순위 티어(조별 1위 전원 →
+ * 2위 전원 …) 순서로 채워진다. 마지막으로 걸치는 순위 티어의 팀 수가 남은 자리보다 많으면
+ * 경기 기준으로는 고를 근거가 없으므로 그 티어가 부전승 추첨 대상이다. 추첨 기록이 없으면
+ * 대진표 생성은 기존 기본 배정(조 인원이 많은 조 → 조 순서, bracket.js)을 쓴다.
+ * 예: 3개 조에서 6팀 진출 → 8강 대진, 부전승 2자리, 조 1위 3팀 중 2팀 추첨.
+ * @returns {{ok:boolean, byeSlots:number, fixedIds:string[], candidateIds:string[], slots:number, required:boolean, errors:string[]}}
+ */
+export function computeByeLotteryState(state, participantIds) {
+  const ids = Array.isArray(participantIds) ? [...new Set(participantIds)] : [];
+  const empty = { byeSlots: 0, fixedIds: [], candidateIds: [], slots: 0, required: false };
+  if (ids.length < 2 || ids.length > 32) {
+    return { ok: false, ...empty, errors: [qualificationBlocker('participant_count', 'Final qualification requires between 2 and 32 participants.')] };
+  }
+  const rankOf = new Map();
+  (state?.groups || []).forEach((group) => {
+    (Array.isArray(group.standings) ? group.standings : []).forEach((standing) => {
+      if (typeof standing?.teamId === 'string') rankOf.set(standing.teamId, Number(standing.rank));
+    });
+  });
+  if (ids.some((id) => !Number.isInteger(rankOf.get(id)) || rankOf.get(id) < 1)) {
+    return { ok: false, ...empty, errors: [qualificationBlocker('foreign_participant', 'Every finalist needs a preliminary group rank.')] };
+  }
+  const byeSlots = bracketSizeFor(ids.length) - ids.length;
+  const tiers = new Map();
+  ids.forEach((id) => {
+    const rank = rankOf.get(id);
+    if (!tiers.has(rank)) tiers.set(rank, []);
+    tiers.get(rank).push(id);
+  });
+  const fixedIds = [];
+  let candidateIds = [];
+  let slots = 0;
+  for (const rank of [...tiers.keys()].sort((a, b) => a - b)) {
+    const tier = tiers.get(rank).sort();
+    if (fixedIds.length + tier.length <= byeSlots) {
+      fixedIds.push(...tier);
+      continue;
+    }
+    slots = byeSlots - fixedIds.length;
+    if (slots > 0) candidateIds = tier;
+    else slots = 0;
+    break;
+  }
+  return {
+    ok: true,
+    byeSlots,
+    fixedIds: fixedIds.sort(),
+    candidateIds,
+    slots,
+    required: candidateIds.length > 0 && slots > 0,
+    errors: [],
+  };
+}
+
+/**
+ * 1라운드 경기 기록에서 부전승 자리를 받은 팀(상대 없는 자리, 미배정 부전승 후보 포함)을 모은다.
+ */
+export function byeEntrantIdsFromRoots(matches) {
+  const ids = [];
+  (Array.isArray(matches) ? matches : [])
+    .filter((match) => (match?.round || 1) === 1)
+    .forEach((match) => {
+      const present = [match.teamA, match.teamB].filter((team) => team?.id);
+      if (present.length === 1) ids.push(present[0].id);
+      if (present.length === 0 && match.byeCandidate?.team?.id) ids.push(match.byeCandidate.team.id);
+    });
+  return [...new Set(ids)].sort();
+}
+
+/**
+ * 관리자가 기록한 부전승 추첨 결과를 검증한다. 추첨 대상·남은 자리 수는 예선 순위에서 다시
+ * 계산하며, roots가 주어지면 실제 대진표에서 추첨에 뽑힌 팀은 부전승 자리를, 뽑히지 않은
+ * 후보는 1라운드 실제 경기 자리를 차지하는지 확인한다. 추첨 대상이 아닌 팀의 자리는 기존처럼
+ * 관리자가 대진표에서 조정할 수 있다.
+ */
+export function validateByeSelection(state, participantIds, byeSelection, roots = null) {
+  const errors = [];
+  const lottery = computeByeLotteryState(state, participantIds);
+  if (!lottery.ok) return { ok: false, lottery, errors: lottery.errors };
+  if (!byeSelection || typeof byeSelection !== 'object' || Array.isArray(byeSelection)
+      || Object.keys(byeSelection).some((key) => !['candidateIds', 'selectedIds', 'reason'].includes(key))) {
+    return { ok: false, lottery, errors: [qualificationBlocker('bye_selection_invalid', 'BYE lottery record must contain candidateIds, selectedIds and reason.')] };
+  }
+  const { candidateIds, selectedIds, reason } = byeSelection;
+  if (!lottery.required) {
+    errors.push(qualificationBlocker('bye_lottery_not_required', 'This bracket has no tied BYE candidates.'));
+  }
+  if (!Array.isArray(candidateIds) || !Array.isArray(selectedIds)
+      || [...candidateIds, ...selectedIds].some((id) => typeof id !== 'string' || !id)
+      || new Set(candidateIds).size !== candidateIds.length
+      || new Set(selectedIds).size !== selectedIds.length) {
+    errors.push(qualificationBlocker('bye_selection_invalid', 'BYE lottery team lists must be unique team IDs.'));
+    return { ok: false, lottery, errors };
+  }
+  if (typeof reason !== 'string' || !reason.trim() || reason.length > 500) {
+    errors.push(qualificationBlocker('bye_reason_required', 'A BYE lottery note of 1-500 characters is required.'));
+  }
+  const expected = [...lottery.candidateIds].sort();
+  const supplied = [...candidateIds].sort();
+  if (supplied.length !== expected.length || supplied.some((id, index) => id !== expected[index])) {
+    errors.push(qualificationBlocker('bye_candidates_mismatch', 'BYE lottery candidates must equal the tied preliminary tier.'));
+  }
+  if (selectedIds.length !== lottery.slots) {
+    errors.push(qualificationBlocker('bye_slots_mismatch', `Exactly ${lottery.slots} BYE lottery winners are required.`));
+  }
+  if (selectedIds.some((id) => !expected.includes(id))) {
+    errors.push(qualificationBlocker('bye_non_candidate', 'Only tied BYE candidates can win the BYE lottery.'));
+  }
+  if (roots && !errors.length) {
+    const byeIds = new Set(byeEntrantIdsFromRoots(roots));
+    if (selectedIds.some((id) => !byeIds.has(id))
+        || expected.some((id) => !selectedIds.includes(id) && byeIds.has(id))) {
+      errors.push(qualificationBlocker('bye_placement_mismatch', 'Bracket BYE positions must match the recorded BYE lottery.'));
+    }
+  }
+  if (errors.length) return { ok: false, lottery, errors };
+  return { ok: true, lottery, errors: [] };
+}
+
 /**
  * Return deterministic JSON bytes for the snapshot. The function accepts
  * only the canonical object produced by buildQualificationSnapshot, but
