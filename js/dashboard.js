@@ -5,6 +5,7 @@ import {
 import { evaluatePrelimMatch, computeGroupStandings } from "./match-logic.js";
 import { publicMatchView } from "./bracket.js";
 import { renderBracket, displayTeamName } from "./bracket-render.js";
+import { bracketRankLabel, tieSelectionNote } from "./qualification-labels.js";
 import { formatCourtName, projectPrelimCourtSchedule } from "./court-display.js";
 
 const DIVISIONS = ["men", "women"];
@@ -959,6 +960,18 @@ function renderPrelim() {
       scroll.className = "table-scroll";
       scroll.appendChild(table);
       card.appendChild(scroll);
+      const tieNote = tieSelectionNote(group.id, {
+        teams: groupTeams,
+        tieSelections: divisionTieSelections(),
+        nameOf: (team) => displayTeamName(team.name),
+      });
+      if (tieNote) {
+        const note = document.createElement("p");
+        note.className = "prelim-tie-note";
+        note.dataset.tieSelectionNote = group.id;
+        note.textContent = tieNote;
+        card.appendChild(note);
+      }
       if (tournamentInfo.finalQualification?.[activeDivision]?.postFinalCorrection?.groupIds?.includes(group.id)) {
         const note = document.createElement("p");
         note.className = "prelim-corrected-note";
@@ -1011,16 +1024,17 @@ function teamName(id, state = divisionData()) {
   return team ? displayTeamName(team.name) : "?";
 }
 
+function divisionTieSelections() {
+  return tournamentInfo.finalQualification?.[activeDivision]?.tieSelections || {};
+}
+
 function teamGroupRankLabel(teamId, state = divisionData()) {
-  const team = state.teams.find((item) => item.id === teamId);
-  if (!team) return "";
-  const group = state.groups.find((item) => item.id === team.groupId);
-  if (!group) return "";
-  const groupTeams = state.teams.filter((item) => item.groupId === group.id);
-  const groupMatches = state.prelimMatches.filter((match) => match.groupId === group.id);
-  const standings = computeGroupStandings(groupTeams, groupMatches);
-  const standing = standings.find((item) => item.teamId === teamId);
-  return standing ? `${group.name} ${standing.rank}위` : group.name;
+  return bracketRankLabel(teamId, {
+    teams: state.teams,
+    groups: state.groups,
+    prelimMatches: state.prelimMatches,
+    tieSelections: divisionTieSelections(),
+  });
 }
 
 function escapeHtml(str) {

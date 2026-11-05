@@ -70,6 +70,24 @@
   box-shadow: 0 0 0 3px rgba(255, 152, 0, 0.35);
   animation: publish-attention 1.6s ease-in-out infinite;
 }
+#publishBracketBtn.is-urgent {
+  background: #e65100;
+  border-color: #e65100;
+  color: #fff;
+  font-size: 16px;
+  padding: 10px 20px;
+}
+.review-staged-done {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #fff3e0;
+  border: 2px solid var(--orange, #ff9800);
+  color: #8c4a00;
+  font-weight: 800;
+}
+.review-next-step { margin-top: 10px; width: 100%; white-space: normal; background: #e65100; border-color: #e65100; color: #fff; }
 @keyframes publish-attention {
   0%, 100% { box-shadow: 0 0 0 3px rgba(255, 152, 0, 0.35); }
   50% { box-shadow: 0 0 0 7px rgba(255, 152, 0, 0.12); }

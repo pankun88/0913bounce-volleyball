@@ -27,6 +27,7 @@ import {
 } from "./match-logic.js";
 import { buildCrossGroupSeedOrder, swapFinalSeedSlots, confirmBye, placeByeTeam, generateBracket, recordMatchResult, invalidateDescendantResults } from "./bracket.js";
 import { renderBracket } from "./bracket-render.js";
+import { bracketRankLabel } from "./qualification-labels.js";
 import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
 import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
 import { orderExistingRoundRobinMatchIds } from "./schedule.js";
@@ -104,6 +105,9 @@ let isAddingTeam = false; // 저장 응답 전 중복 클릭/Enter로 같은 팀
 // 일단 화면(로컬)에서만 반영해두고, 관리자가 "관객·기록관 화면에 공개" 버튼을 눌러야만
 // Firestore에 저장돼 대시보드에 실제로 공유된다.
 let bracketPublishPending = false;
+let lastStagedReviewSignature = "";
+// 부문 전환 직후 새 부문의 본선 경기를 처음 받을 때까지 기다리는 대기자들.
+let finalMatchesWaiters = [];
 let bracketPublishConflict = false;
 let bracketPublishInFlight = false;
 let unsubscribeFinalMatches = null;
@@ -588,7 +592,7 @@ function qualificationStructureLocked() {
 function blockQualificationStructureEdit() {
   if (!qualificationStructureLocked()) return false;
   showToast(
-    "본선이 공개된 뒤 조·팀의 추가/삭제·조 이동·예선 재생성은 Rules로 차단됩니다. 표시 이름과 순서만 조정하고, 본선 대진표가 지금 예선 순위와 맞는지 ‘현재 순위로 확인’으로 확인하세요.",
+    "본선 공개 후에는 조·팀·예선 구조를 바꿀 수 없습니다(팀 추가/삭제·조 이동·예선 다시 만들기 불가). 표시 이름과 순서만 조정하고, 본선 대진표가 지금 예선 순위와 맞는지 ‘현재 순위로 확인’으로 확인하세요.",
     7000,
   );
   return true;
@@ -728,6 +732,9 @@ function rebindFinalMatches() {
     renderFinalTeamPicker();
     renderWorkflowCourtPlanner();
     updateQualificationStructureControls();
+    const waiters = finalMatchesWaiters;
+    finalMatchesWaiters = [];
+    waiters.forEach((fn) => fn());
   });
 }
 
@@ -2600,6 +2607,13 @@ function buildReviewScoreboard(display, scoreSource, scoreState = "draft") {
   return board;
 }
 
+const FINAL_PUBLISH_NEXT_STEP = "본선 탭에서 ‘관객·기록관 화면에 공개’를 눌러야 다음 경기가 열립니다";
+
+function gotoFinalPublish() {
+  document.querySelector('.tab-btn[data-tab="final"]')?.click();
+  document.getElementById("bracketPublishBar")?.scrollIntoView?.({ block: "center" });
+}
+
 function renderScoreReviews() {
   const root = document.getElementById("scoreReviewList");
   if (!root) return;
@@ -2665,10 +2679,15 @@ function renderScoreReviews() {
     row.append(meta, actions);
     const approve = document.createElement("button");
     approve.className = "btn primary small";
-    approve.textContent = assignment.matchType === "final" ? "공개 초안에 반영" : "승인";
+    const isFinalReview = assignment.matchType === "final";
+    const finalDivision = assignment.divisionId || assignment.division;
+    const stagedFinal = isFinalReview && finalDivision === activeDivision && finalScoreDrafts.has(assignment.matchId);
+    approve.textContent = !isFinalReview ? "승인"
+      : finalDivision !== activeDivision ? `${DIVISION_LABELS[finalDivision] || finalDivision}로 전환하고 반영`
+      : "공개 초안에 반영";
     approve.addEventListener("click", async () => {
       if (assignment.matchType === "final") {
-        stageSubmittedFinalReview(assignment, workflow);
+        await stageSubmittedFinalReview(assignment, workflow);
         return;
       }
       const ok = await runWorkflowButton(approve, "점수 승인", () => adminWorkflowCallable("approveScoreReview", {
@@ -2697,7 +2716,21 @@ function renderScoreReviews() {
         },
       });
     });
-    if (isSubmitted) {
+    if (isSubmitted && stagedFinal) {
+      // 반영은 끝났지만 아직 공개 전: 같은 버튼 대신 완료 표시와 다음 단계 안내를 보여 준다.
+      const done = document.createElement("span");
+      done.className = "review-staged-done";
+      done.dataset.finalStaged = assignment.id;
+      done.textContent = "반영됨 · 아직 공개 전";
+      actions.append(done);
+      const next = document.createElement("button");
+      next.type = "button";
+      next.className = "btn primary review-next-step";
+      next.dataset.gotoFinalPublish = assignment.id;
+      next.textContent = FINAL_PUBLISH_NEXT_STEP;
+      next.addEventListener("click", gotoFinalPublish);
+      row.insertBefore(next, actions.nextSibling);
+    } else if (isSubmitted) {
       // 반려는 비상용: 평소에는 승인만 보이고, 「비상용 기능 보기」를 연 동안에만 카드에 나타난다.
       actions.append(approve);
       if (emergencyFeaturesOpen) actions.append(reject);
@@ -3391,11 +3424,30 @@ function invalidateCorrectionPreview(
   updateCorrectionControls();
 }
 
-function stageSubmittedFinalReview(assignment, workflow) {
+/** 부문을 바꾼 직후에는 새 부문의 본선 경기를 구독으로 다시 받아야 하므로, 첫 수신까지 기다린다. */
+function waitForFinalMatches(timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      finalMatchesWaiters = finalMatchesWaiters.filter((fn) => fn !== done);
+      resolve(false);
+    }, timeoutMs);
+    const done = () => { clearTimeout(timer); resolve(true); };
+    finalMatchesWaiters.push(done);
+  });
+}
+
+async function stageSubmittedFinalReview(assignment, workflow) {
   const division = assignment.divisionId || assignment.division;
   if (division !== activeDivision) {
-    showToast(`${DIVISION_LABELS[division] || division} 본선으로 전환한 뒤 공개 초안에 반영하세요.`, 4000);
-    return;
+    // 보고 있는 부문이 다르면 해당 부문 본선으로 자동 전환한 뒤 반영한다.
+    // 공개하지 않은 다른 부문 변경이 있으면 전환 확인창이 먼저 뜨고, 취소하면 아무것도 바꾸지 않는다.
+    const waiter = waitForFinalMatches();
+    if (!switchActiveDivision(division)) return;
+    if (!(await waiter)) {
+      showToast(`${DIVISION_LABELS[division] || division} 본선을 불러오지 못했습니다. 잠시 뒤 다시 눌러 주세요.`, 5000);
+      return;
+    }
+    if (activeDivision !== division) return;
   }
   if (!finalMutationAllowed()) return;
   const match = finalMatches.find((item) => item.id === assignment.matchId);
@@ -3412,7 +3464,7 @@ function stageSubmittedFinalReview(assignment, workflow) {
     !== JSON.stringify(normalizePlayedSets(sets, true));
   const stage = (reason) => {
     stageFinalScoreDraft(match.id, sets, reason, workflow.submissionVersion);
-    showToast("제출 점수를 로컬 본선 초안에 반영했습니다. ‘관객·기록관 화면에 공개’해야 공식 결과가 되고 다음 라운드 기록관 입력이 열립니다.");
+    showToast("반영됨 · 아직 공개 전입니다. 본선 탭에서 ‘관객·기록관 화면에 공개’를 눌러야 다음 경기가 열립니다.", 6000);
   };
   if (!((official?.officialRevision || 0) > 0 && changed)) {
     stage("");
@@ -3589,10 +3641,7 @@ function bindStaticHandlers() {
 
   document.getElementById("generateBracketBtn").addEventListener("click", onGenerateBracket);
   document.getElementById("publishBracketBtn").addEventListener("click", handlePublishBracket);
-  document.getElementById("gotoFinalPublishBtn")?.addEventListener("click", () => {
-    document.querySelector('.tab-btn[data-tab="final"]')?.click();
-    document.getElementById("bracketPublishBar")?.scrollIntoView?.({ block: "center" });
-  });
+  document.getElementById("gotoFinalPublishBtn")?.addEventListener("click", gotoFinalPublish);
   document.getElementById("clearBracketBtn").addEventListener("click", handleClearBracket);
 
   document.getElementById("exportCsvBtn").addEventListener("click", () => {
@@ -3966,7 +4015,7 @@ function updateTeamNameInputContext() {
   nameInput.disabled = locked || !sel.value;
   if (addBtn) {
     addBtn.disabled = locked || !sel.value;
-    if (locked) addBtn.title = "본선 공개 후 팀 추가는 Rules로 차단됩니다.";
+    if (locked) addBtn.title = "본선 공개 후에는 팀을 추가할 수 없습니다.";
   }
 }
 
@@ -3976,7 +4025,7 @@ function updateQualificationStructureControls() {
   const groupInput = document.getElementById("groupNameInput");
   if (addGroup) {
     addGroup.disabled = locked || isAddingGroup;
-    if (locked) addGroup.title = "본선 공개 후 조 추가는 Rules로 차단됩니다.";
+    if (locked) addGroup.title = "본선 공개 후에는 조를 추가할 수 없습니다.";
   }
   if (groupInput) groupInput.disabled = locked;
   updateTeamNameInputContext();
@@ -4037,7 +4086,7 @@ function renderGroupList() {
     deleteButton.title = !ready
       ? prelimHistoryReadinessGuidance()
       : qualificationStructureLocked()
-      ? "본선 공개 후 조 삭제는 Rules로 차단됩니다. 표시 이름·순서만 조정하세요."
+      ? "본선 공개 후에는 조를 삭제할 수 없습니다. 표시 이름·순서만 조정하세요."
       : groupHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : "삭제";
     deleteButton.addEventListener("click", async () => {
       if (blockQualificationStructureEdit()) return;
@@ -4160,7 +4209,7 @@ function createTeamPill(t, groupId) {
   const structureLocked = qualificationStructureLocked();
   deleteButton.disabled = structureLocked || !ready;
   deleteButton.setAttribute("aria-disabled", String(structureLocked || !ready));
-  if (structureLocked) deleteButton.title = "본선 공개 후 팀 삭제는 Rules로 차단됩니다. 표시 이름·순서만 조정하세요.";
+  if (structureLocked) deleteButton.title = "본선 공개 후에는 팀을 삭제할 수 없습니다. 표시 이름·순서만 조정하세요.";
   else if (!ready) deleteButton.title = prelimHistoryReadinessGuidance();
   deleteButton.addEventListener("click", async () => {
     if (blockQualificationStructureEdit()) return;
@@ -4460,7 +4509,7 @@ function buildRoundRobinControls(g, groupTeams) {
   btn.title = !ready
     ? prelimHistoryReadinessGuidance()
     : qualificationStructureLocked()
-    ? "본선 공개 후 예선 대진 재생성은 Rules로 차단됩니다."
+    ? "본선 공개 후에는 예선 대진을 다시 만들 수 없습니다."
     : groupHistory.length ? PRELIM_HISTORY_DISABLED_TITLE : "공식 이력이 없는 경우 라운드로빈 대진을 생성합니다.";
   btn.addEventListener("click", async () => {
     if (blockQualificationStructureEdit()) return;
@@ -4503,7 +4552,7 @@ function buildRingControls(g, groupTeams) {
   hint.style.padding = "0";
   hint.textContent = blocked
     ? qualificationStructureLocked()
-      ? "본선 공개 후 링크제 배치 변경은 Rules로 차단됩니다."
+      ? "본선 공개 후에는 링크제 배치를 바꿀 수 없습니다."
       : !ready ? prelimHistoryReadinessGuidance() : prelimMutationGuidance(groupHistory)
     : filled
     ? "대진이 확정되었습니다. 공식 이력이 없는 경우 다시 배치하면 기존 대진이 초기화됩니다."
@@ -4515,7 +4564,7 @@ function buildRingControls(g, groupTeams) {
   shuffleBtn.setAttribute("aria-disabled", String(blocked));
   if (blocked) {
     shuffleBtn.title = qualificationStructureLocked()
-      ? "본선 공개 후 링크제 배치 변경은 Rules로 차단됩니다."
+      ? "본선 공개 후에는 링크제 배치를 바꿀 수 없습니다."
       : PRELIM_HISTORY_DISABLED_TITLE;
   }
   shuffleBtn.addEventListener("click", () => {
@@ -4724,7 +4773,7 @@ function renderPrelimSetupGroups() {
     modeToggle.querySelectorAll(".mode-btn").forEach((btn) => {
       btn.disabled = qualificationStructureLocked();
       if (qualificationStructureLocked()) {
-        btn.title = "본선 공개 후 예선 방식 변경은 Rules로 차단됩니다.";
+        btn.title = "본선 공개 후에는 예선 방식을 바꿀 수 없습니다.";
       }
       btn.addEventListener("click", () => handleSetMatchMode(g, btn.dataset.mode));
     });
@@ -4736,7 +4785,7 @@ function renderPrelimSetupGroups() {
     resetGroupBtn.title = !ready
       ? prelimHistoryReadinessGuidance()
       : qualificationStructureLocked()
-        ? "본선 공개 후 예선 초기화는 Rules로 차단됩니다."
+        ? "본선 공개 후에는 예선을 초기화할 수 없습니다."
       : groupHistory.length
         ? PRELIM_HISTORY_DISABLED_TITLE
         : `${g.name}의 공식 이력이 없는 예선 대진과 도형(링크제) 배치를 삭제합니다`;
@@ -4755,7 +4804,7 @@ function renderPrelimSetupGroups() {
       guardHint.textContent = !ready
         ? prelimHistoryReadinessGuidance()
         : qualificationStructureLocked()
-        ? "본선 공개 후 조·팀·예선 구조 변경은 Rules로 차단됩니다. 표시 이름과 순서만 조정하세요."
+        ? "본선 공개 후에는 조·팀·예선 구조를 바꿀 수 없습니다. 표시 이름과 순서만 조정하세요."
         : prelimMutationGuidance(groupHistory);
       box.appendChild(guardHint);
     }
@@ -5710,15 +5759,10 @@ function renderFinalByeLotteryBox(lottery) {
 
 /** teamId가 속한 조에서의 예선 순위를 "A조 1위" 형태 문구로 만든다 */
 function teamGroupRankLabel(teamId) {
-  const t = teams.find((tt) => tt.id === teamId);
-  if (!t) return "";
-  const g = groups.find((gg) => gg.id === t.groupId);
-  if (!g) return "";
-  const groupTeams = teams.filter((tt) => tt.groupId === g.id);
-  const groupMatches = prelimMatches.filter((m) => m.groupId === g.id);
-  const standings = computeGroupStandings(groupTeams, groupMatches);
-  const s = standings.find((ss) => ss.teamId === teamId);
-  return s ? `${g.name} ${s.rank}위` : g.name;
+  // 새로고침 직후에는 로컬 선택이 비어 있으므로, 공개된 본선의 저장된 추첨 결과를 대신 쓴다.
+  const hasLocal = Object.values(qualificationTieSelections || {}).some((ids) => Array.isArray(ids) && ids.length);
+  const tieSelections = hasLocal ? qualificationTieSelections : (qualificationProof?.tieSelections || {});
+  return bracketRankLabel(teamId, { teams, groups, prelimMatches, tieSelections });
 }
 
 async function handleClearBracket() {
@@ -5836,6 +5880,12 @@ async function onGenerateBracket() {
 function renderFinalBracket() {
   renderByeUnassignedPanel();
   updateBracketPublishBar();
+  // 점수 반영 상태가 바뀌면 기록·검수 카드의 ‘반영됨’ 표시도 함께 바꾼다.
+  const stagedSignature = `${activeDivision}:${[...finalScoreDrafts.keys()].sort().join(",")}`;
+  if (stagedSignature !== lastStagedReviewSignature) {
+    lastStagedReviewSignature = stagedSignature;
+    renderScoreReviews();
+  }
   const container = document.getElementById("finalBracketContainer");
   renderBracket(container, finalMatches, {
     editable: true,
@@ -5925,6 +5975,8 @@ function updateBracketPublishBar() {
       || (Boolean(byeProblem) && !bracketPublishConflict && !structureChanged);
     btn.textContent = bracketPublishConflict ? "로컬 초안 버리기" : bracketPublishInFlight ? "공개 중…" : structureChanged ? "저장된 대진으로 복구" : bracketPublishPending ? "관객·기록관 화면에 공개" : "공개 완료";
     btn.classList.toggle("is-attention", bracketPublishPending && !btn.disabled);
+    btn.classList.toggle("is-urgent", finalScoreDrafts.size > 0 && bracketPublishPending && !btn.disabled);
+    btn.title = finalScoreDrafts.size > 0 && bracketPublishPending ? FINAL_PUBLISH_NEXT_STEP : "";
   }
   updateFinalPublicationIndicators(publication);
 }
@@ -5968,7 +6020,7 @@ function finalPublicationStatus(input) {
   }
   if (pending) {
     const scoreNote = stagedScores > 0
-      ? `반영한 본선 점수 ${stagedScores}건은 공개해야 공식 결과가 되고, 승리 팀이 다음 라운드로 올라가 기록관이 다음 경기를 입력할 수 있습니다.`
+      ? `${FINAL_PUBLISH_NEXT_STEP}. 반영한 본선 점수 ${stagedScores}건은 공개해야 공식 결과가 되고, 승리 팀이 다음 라운드로 올라갑니다.`
       : "대진 생성·자리 조정·부전승 배치는 이 화면에만 있습니다. 공개해야 기록관 코트 배정과 관객 화면에 반영됩니다.";
     return {
       state: "pending",
@@ -5998,7 +6050,7 @@ function updateFinalPublicationIndicators(publication) {
   const text = hint.querySelector("[data-role='text']");
   if (text) {
     text.textContent = waiting
-      ? `${divisionLabel()} 본선에 공개하지 않은 변경이 있습니다${finalScoreDrafts.size ? ` (반영한 점수 ${finalScoreDrafts.size}건)` : ""}. 공개 전에는 기록관 화면·코트 배정·다음 라운드에 반영되지 않습니다.`
+      ? `${divisionLabel()} 본선에 공개하지 않은 변경이 있습니다${finalScoreDrafts.size ? ` (반영한 점수 ${finalScoreDrafts.size}건)` : ""}. ${FINAL_PUBLISH_NEXT_STEP}.`
       : "";
   }
 }

@@ -2999,4 +2999,5 @@ body.dashboard-page .footer-note {
 .prelim-gate-lines { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.6; }
 .prelim-gate-confirm { margin: 0; font-size: 13px; line-height: 1.55; color: var(--ink); }
 .prelim-gate .modal-actions { margin-top: 4px; }
+.prelim-tie-note { margin: 6px 0 0; font-size: 12px; font-weight: 700; color: #8c5a12; }
 .prelim-corrected-note { margin: 6px 0 0; font-size: 12px; font-weight: 700; color: #8c5a12; }

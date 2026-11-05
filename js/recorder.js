@@ -488,8 +488,13 @@ function renderDataState() {
     ui.retryDataButton.hidden = true;
     ui.dataStatus.hidden = authState?.kind !== "signedOut";
     ui.dataStatus.textContent = authState?.kind === "signedOut" ? RECORDER_NOTICES.signedOutCourts : "";
+    // 로그아웃 안내는 오류가 아니므로 빨간 오류 상자가 아니라 중립 안내 모양으로 보여 준다.
+    ui.dataStatus.classList.toggle("rejection", authState?.kind !== "signedOut");
+    ui.dataStatus.setAttribute("role", authState?.kind === "signedOut" ? "status" : "alert");
     return;
   }
+  ui.dataStatus.classList.add("rejection");
+  ui.dataStatus.setAttribute("role", "alert");
   const problems = gatedDataKeys()
     .map((key) => ({ key, ...dataHealth[key] }))
     .filter(({ status }) => status !== "ready");
@@ -1647,6 +1652,10 @@ watchRecorderAuthState((state) => {
     stopAll();
     Object.keys(dataHealth).forEach((key) => setDataState(key, "idle"));
     if (!state.user) {
+      // 로그아웃하면 직전 제출의 「제출 완료」 표시와 상태 줄도 함께 지운다.
+      if (ui.successPanel) ui.successPanel.hidden = true;
+      successMatchKey = "";
+      action("");
       clearStored();
       resetMatchEditor();
       edit.pendingEnd = null;

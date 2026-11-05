@@ -1,4 +1,4 @@
-import { groupByRound, publicMatchView, finalSlotsLocked } from "./bracket.js";
+import { groupByRound, publicMatchView, finalSlotsLockReason } from "./bracket.js";
 import { evaluateFinalMatch } from "./match-logic.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -35,7 +35,8 @@ export function renderBracket(container, matches, options = {}) {
   const { rounds } = groupByRound(publicMatches);
 
   // 승인 취소로 점수가 비워져도 기존 기록과 입력권의 팀 기준은 바뀌지 않는다.
-  const locked = options.slotsLocked || finalSlotsLocked(matches);
+  const lockReason = options.slotsLocked ? "history" : finalSlotsLockReason(matches);
+  const locked = lockReason !== null;
   const canSwapSlots = Boolean(options.editable && options.onSwapSlot && !locked);
 
   if (canSwapSlots) {
@@ -46,7 +47,9 @@ export function renderBracket(container, matches, options = {}) {
   } else if (options.editable && options.onSwapSlot && locked) {
     const hint = document.createElement("div");
     hint.className = "empty-hint bracket-history-hint";
-    hint.textContent = "경기 입력·승인 이력이 있어 팀 자리는 고정됩니다. 점수가 틀렸다면 해당 경기의 ‘점수 수정’으로 같은 팀 순서에서 고치세요.";
+    hint.textContent = lockReason === "history"
+      ? "경기 입력·승인 이력이 있어 팀 자리는 고정됩니다. 점수가 틀렸다면 해당 경기의 ‘점수 수정’으로 같은 팀 순서에서 고치세요."
+      : "부전승이 확정되어 팀 자리는 고정됩니다.";
     container.appendChild(hint);
   }
 

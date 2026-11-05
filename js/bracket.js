@@ -463,14 +463,24 @@ export function invalidateDescendantResults(matches, matchId) {
 
 /** 승인 취소로 현재 점수가 비워져도 과거 경기의 팀 기준은 고정한다. */
 export function finalSlotsLocked(matches) {
-  return matches.some((match) => (
+  return finalSlotsLockReason(matches) !== null;
+}
+
+/**
+ * 팀 자리가 고정된 이유. 'history'=경기 입력·승인 기록이 있음, 'bye'=기록은 없고 부전승만 확정됨,
+ * null=고정되지 않음. 안내 문구가 실제 이유와 맞도록 구분한다.
+ */
+export function finalSlotsLockReason(matches) {
+  const list = matches || [];
+  if (list.some((match) => (
     Number(match.officialRevision || 0) > 0
     || Number(match.attemptCount || 0) > 0
     || Number(match.draftRevision || 0) > 0
     || Number(match.submissionVersion || 0) > 0
     || (match.sets && match.sets.length > 0)
-    || ['done', 'in_progress', 'bye'].includes(match.status)
-  ));
+    || ['done', 'in_progress'].includes(match.status)
+  ))) return 'history';
+  return list.some((match) => match.status === 'bye') ? 'bye' : null;
 }
 
 /**

@@ -17,6 +17,8 @@ import {
   normalizePlayedSets,
   validateSetScore,
 } from './match-logic.js';
+import { bracketRankLabel, tieSelectionNote } from './qualification-labels.js';
+import { finalSlotsLockReason } from './bracket.js';
 import { generateBracket, recordMatchResult, invalidateDescendantResults, groupByRound, seedOrder, nextPowerOfTwo, buildCrossGroupSeedOrder, swapFinalSeedSlots, resetAndPropagateByes, confirmBye, placeByeTeam, publicMatchView, roundLabel } from './bracket.js';
 import { generateRoundRobin, orderExistingRoundRobinMatchIds } from './schedule.js';
 import { normalizeRingOrder, getRingEdges, getRingMatchPairs, getRingPositions, getRingEdgeLabelPositions } from './ring-bracket.js';
@@ -2121,6 +2123,8 @@ function createDashboardHarness(search = '?display=venue', options = {}) {
       bracketRenders.push(args);
     },
     displayTeamName: (name) => name,
+    bracketRankLabel,
+    tieSelectionNote,
     getRingEdges,
     normalizeRingOrder: options.realData ? normalizeRingOrder : () => [],
     renderRingDiagram: (...args) => { ringRenders.push(args); },
@@ -4275,13 +4279,13 @@ check(
   check('recorder waiting: empty court explains that finals need publication',
     /관객·기록관 화면에 공개/.test(recorderWaitingMessage('empty_schedule')));
   check('recorder waiting: unresolved final explains publication of previous results',
-    /이전 경기 결과를 검수하고 ‘관객·기록관 화면에 공개’/.test(recorderWaitingMessage('unresolved', { assignment: { matchType: 'final' } })));
+    /운영본부가 결과를 공개하면 열립니다\. 잠시 기다려 주세요\./.test(recorderWaitingMessage('unresolved', { assignment: { matchType: 'final' } })));
   check('recorder waiting: unresolved prelim keeps the generic message',
     /대진이 확정되기를 기다리고/.test(recorderWaitingMessage('unresolved', { assignment: { matchType: 'prelim' } })));
-  check('recorder waiting: blocked final in schedule says the next final team is undecided',
-    /다음 본선 경기의 팀이 아직 정해지지/.test(recorderWaitingMessage('no_current', {
+  check('recorder waiting: blocked final in schedule says the next final opens after HQ publishes',
+    recorderWaitingMessage('no_current', {
       schedule: [{ status: 'waiting', baseStatus: 'waiting', assignment: { matchType: 'final', dependencyReady: false } }],
-    })));
+    }) === '다음 본선 경기는 운영본부가 결과를 공개하면 열립니다. 잠시 기다려 주세요.');
   check('recorder waiting: all completed points to publication',
     /공개/.test(recorderWaitingMessage('no_current', { schedule: [{ status: 'completed', baseStatus: 'completed', assignment: {} }] })));
   check('recorder waiting: remaining ready matches give the queue message',
@@ -4290,6 +4294,47 @@ check(
     })));
 }
 
+
+// ---------- polish2: 동률 추첨 표기 · 자리 고정 안내 · 한국어 문구 ----------
+{
+  const mk = (id, name, groupId) => ({ id, name, groupId, division: 'men' });
+  const teamsT = [mk('a', '가팀', 'gA'), mk('b', '나팀', 'gA'), mk('c', '다팀', 'gA'), mk('d', '라팀', 'gB'), mk('e', '마팀', 'gB')];
+  const groupsT = [{ id: 'gA', name: 'A조', division: 'men' }, { id: 'gB', name: 'B조', division: 'men' }];
+  const done = (id, groupId, teamA, teamB, a1, b1, a2, b2) => ({ id, groupId, division: 'men', teamA, teamB, status: 'done', sets: [{ a: a1, b: b1 }, { a: a2, b: b2 }] });
+  // A조: 세 팀이 1승 1패로 완전 동률
+  const matchesT = [
+    done('m1', 'gA', 'a', 'b', 10, 5, 10, 5),
+    done('m2', 'gA', 'b', 'c', 10, 5, 10, 5),
+    done('m3', 'gA', 'c', 'a', 10, 5, 10, 5),
+    done('m4', 'gB', 'd', 'e', 10, 5, 10, 5),
+  ];
+  const ctx = { teams: teamsT, groups: groupsT, prelimMatches: matchesT };
+  check('tie label: without selection the bracket keeps 순위 labels', bracketRankLabel('a', ctx) === 'A조 1위' && bracketRankLabel('d', ctx) === 'B조 1위');
+  const withTie = { ...ctx, tieSelections: { gA: ['a', 'b'] } };
+  check('tie label: tie-selected teams are marked 추첨 and not 1위/2위',
+    bracketRankLabel('a', withTie) === 'A조 1위(추첨)' && bracketRankLabel('b', withTie) === 'A조 1위(추첨)');
+  check('tie label: non-tie group is unaffected by another group\'s selection', bracketRankLabel('d', withTie) === 'B조 1위');
+  check('tie label: unknown team gives empty label', bracketRankLabel('zz', withTie) === '');
+  check('tie note: lists the selected teams', tieSelectionNote('gA', { teams: teamsT, tieSelections: { gA: ['a', 'b'] } }) === '동률 — 추첨으로 가팀·나팀 진출');
+  check('tie note: empty without selection or for other group', tieSelectionNote('gA', { teams: teamsT, tieSelections: {} }) === ''
+    && tieSelectionNote('gB', { teams: teamsT, tieSelections: { gA: ['a', 'b'] } }) === '');
+  check('tie note: ignores ids that are not in the group', tieSelectionNote('gA', { teams: teamsT, tieSelections: { gA: ['d'] } }) === '');
+
+  check('slot lock reason: untouched bracket is not locked', finalSlotsLockReason([{ status: 'pending' }]) === null);
+  check('slot lock reason: recorded history says history', finalSlotsLockReason([{ status: 'done', sets: [{ a: 10, b: 5 }] }]) === 'history');
+  check('slot lock reason: only a confirmed bye says bye (no 입력·승인 이력 claim)', finalSlotsLockReason([{ status: 'bye' }, { status: 'pending' }]) === 'bye');
+  check('slot lock reason: bye plus history says history', finalSlotsLockReason([{ status: 'bye' }, { status: 'done' }]) === 'history');
+  const roundSrc = fs.readFileSync(new URL('./bracket-render.js', import.meta.url), 'utf8');
+  check('history hint is only chosen for lockReason history', /lockReason === "history"\s*\?\s*"경기 입력·승인 이력이 있어/.test(roundSrc));
+
+  const adminSrc = fs.readFileSync(new URL('./admin.js', import.meta.url), 'utf8');
+  check('admin text has no English "Rules" label', !/Rules/.test(adminSrc));
+  check('admin states the structure lock in plain Korean', adminSrc.includes('본선 공개 후에는 조·팀·예선 구조를 바꿀 수 없습니다'));
+  check('final review card auto-switches division instead of refusing', !/본선으로 전환한 뒤 공개 초안에 반영하세요/.test(adminSrc)
+    && /switchActiveDivision\(division\)/.test(adminSrc));
+  check('final review card shows done state and next-step jump', adminSrc.includes('반영됨 · 아직 공개 전')
+    && adminSrc.includes('본선 탭에서 ‘관객·기록관 화면에 공개’를 눌러야 다음 경기가 열립니다'));
+}
 
 // ---- A안: 승인 취소·재입력은 평소 숨기고, 점수 수정/반려는 모달 안의 사유 입력으로 통일한다 ----
 {

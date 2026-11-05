@@ -109,6 +109,7 @@ function loadAdminFunctions(names, values = {}) {
     finalSlotsLocked,
     buildCrossGroupSeedOrder,
     generateBracket,
+    FINAL_PUBLISH_NEXT_STEP: "본선 탭에서 ‘관객·기록관 화면에 공개’를 눌러야 다음 경기가 열립니다",
     ...values,
   });
   names.forEach((name) => vm.runInContext(extractFunctionSource(name), context));
@@ -935,6 +936,7 @@ function testFinalPublicationStatusCopy() {
   const staged = status({ pending: true, published: true, stagedScores: 2 });
   assert.match(staged.message, /본선 점수 2건은 공개해야 공식 결과/);
   assert.match(staged.message, /다음 라운드/);
+  assert.match(staged.message, /본선 탭에서 ‘관객·기록관 화면에 공개’를 눌러야 다음 경기가 열립니다/);
   const live = status({ published: true });
   assert.equal(live.state, "published");
   assert.equal(live.title, "공개됨 — 기록관 입력 가능");

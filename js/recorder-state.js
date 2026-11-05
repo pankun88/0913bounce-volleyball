@@ -914,6 +914,7 @@ export function buildRecorderCourtSchedule({
     });
 }
 
+const FINAL_WAITING_MESSAGE = "다음 본선 경기는 운영본부가 결과를 공개하면 열립니다. 잠시 기다려 주세요.";
 const FINAL_PUBLISH_HINT = "본선 경기는 관리자가 본선 대진을 ‘관객·기록관 화면에 공개’하고 이 코트에 배정해야 나타납니다.";
 
 function isFinalAssignment(assignment) {
@@ -931,13 +932,13 @@ export function recorderWaitingMessage(kind, { schedule = [], assignment = null 
   }
   if (kind === "unresolved") {
     return isFinalAssignment(assignment)
-      ? "본선 대진이 아직 확정되지 않았습니다. 관리자가 이전 경기 결과를 검수하고 ‘관객·기록관 화면에 공개’를 눌러야 팀이 채워지고 입력할 수 있습니다."
+      ? FINAL_WAITING_MESSAGE
       : "대진이 확정되기를 기다리고 있습니다. 팀과 이전 경기 결과가 확정되면 입력할 수 있습니다.";
   }
   const list = Array.isArray(schedule) ? schedule : [];
   const remaining = list.filter((item) => item?.baseStatus === "waiting" || item?.status === "waiting");
   if (remaining.some((item) => isFinalAssignment(item?.assignment) && item?.assignment?.dependencyReady === false)) {
-    return "현재 입력할 경기가 없습니다. 다음 본선 경기의 팀이 아직 정해지지 않았습니다. 관리자가 이전 경기 결과를 검수·공개하면 자동으로 나타납니다.";
+    return FINAL_WAITING_MESSAGE;
   }
   if (!list.length || list.every((item) => item?.baseStatus === "completed")) {
     return `현재 입력할 경기가 없습니다. ${FINAL_PUBLISH_HINT}`;
