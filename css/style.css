@@ -575,6 +575,21 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   font-size: 12px;
 }
 .review-info-chip.score strong { color: var(--red-dark); }
+.review-lock-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  padding: 12px 14px;
+  border: 2px solid #c0392b;
+  border-radius: 12px;
+  background: #fff4f1;
+}
+.review-lock-text { display: grid; gap: 3px; min-width: 0; flex: 1 1 220px; }
+.review-lock-text strong { color: #8f2a1f; font-size: 14px; }
+.review-lock-text small { color: #5c4a46; font-size: 12px; line-height: 1.4; }
+.review-lock-release { padding: 10px 16px; font-size: 14px; font-weight: 800; }
 .review-actions {
   justify-content: flex-end;
   padding-top: 2px;

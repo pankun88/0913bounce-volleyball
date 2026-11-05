@@ -18,6 +18,7 @@ import {
   recorderSubmissionConfirmed,
   classifyWorkflowReadError,
   describeRecorderLock,
+  mapHeldDraftToFixture,
   RECORDER_NOTICES,
   removeStoredRecorderDraft,
   writeStoredRecorderDraft,
@@ -354,7 +355,7 @@ function submitRaceHarness() {
   };
   vm.createContext(context);
   const names = ["currentFixtureIdentity", "operationContextIsCurrent", "syncScreenVisibility",
-    "resetMatchEditor", "clearStoredKey", "clearDeviceDraft", "storeDraft", "fenceAmbiguousOperation", "followCourtQueue", "subscribeCourtStreams",
+    "hideHeldScoreOffer", "resetMatchEditor", "clearStoredKey", "clearDeviceDraft", "storeDraft", "fenceAmbiguousOperation", "followCourtQueue", "subscribeCourtStreams",
     "showSubmissionWarning", "clearSubmissionWarning", "submissionAlreadyOnServer"];
   const start = recorderSource.indexOf("ui.submitButton.onclick=async()=>{");
   const end = recorderSource.indexOf("\nui.endButton.onclick", start);
@@ -554,7 +555,7 @@ function tabSafetyHarness({ matchKey = "M1" } = {}) {
     recorderWaitingMessage: () => "", currentCourtSchedule: () => [], assignment: null, workflow: null, official: null,
   };
   vm.createContext(context);
-  const names = ["currentFixtureIdentity", "storeDraft", "clearDeviceDraft", "resetMatchEditor", "releaseHeldScores", "loseLease"];
+  const names = ["currentFixtureIdentity", "storeDraft", "clearDeviceDraft", "hideHeldScoreOffer", "resetMatchEditor", "releaseHeldScores", "loseLease"];
   vm.runInContext(names.map(recorderFunction).join("\n"), context);
   const type = (key, draft) => {
     edit.localDraft = draft; edit.draftMatchKey = key; edit.dirty = true; edit.touched = new Set(["0-a"]);
@@ -656,6 +657,26 @@ function tabSafetyHarness({ matchKey = "M1" } = {}) {
   for (const [key, value] of Object.entries(RECORDER_NOTICES)) {
     if (typeof value === "string") assert.doesNotMatch(value, jargon, `notice ${key} stays in plain language`);
   }
+}
+
+// Held score restore: mapped by team id, never by position, never across matches.
+{
+  const id = (matchKey, teamAId, teamBId, extra = {}) => ({ matchKey, matchType: "prelim", divisionId: "men", teamAId, teamBId, officialRevision: 0, ...extra });
+  const held = { sets: [{ a: 10, b: 4 }, { a: 7, b: 10 }] };
+  const same = mapHeldDraftToFixture({ storedIdentity: id("M1", "t1", "t2"), currentIdentity: id("M1", "t1", "t2", { officialRevision: 2 }), draft: held, touched: ["0-a", "1-b"] });
+  assert.equal(same.swapped, false);
+  assert.deepEqual(same.draft, held);
+  const swapped = mapHeldDraftToFixture({ storedIdentity: id("M1", "t1", "t2"), currentIdentity: id("M1", "t2", "t1"), draft: held, touched: ["0-a", "1-b"] });
+  assert.equal(swapped.swapped, true);
+  assert.deepEqual(swapped.draft, { sets: [{ a: 4, b: 10 }, { a: 10, b: 7 }] });
+  assert.deepEqual(swapped.touched, ["0-b", "1-a"]);
+  assert.deepEqual(held, { sets: [{ a: 10, b: 4 }, { a: 7, b: 10 }] }, "input is not mutated");
+  const blank = mapHeldDraftToFixture({ storedIdentity: id("M1", "t1", "t2"), currentIdentity: id("M1", "t2", "t1"), draft: { sets: [{ a: "", b: 3 }] }, touched: [] });
+  assert.deepEqual(blank.draft, { sets: [{ a: 3, b: "" }] });
+  assert.equal(mapHeldDraftToFixture({ storedIdentity: id("M1", "t1", "t2"), currentIdentity: id("M2", "t1", "t2"), draft: held }), null, "other match is never mapped");
+  assert.equal(mapHeldDraftToFixture({ storedIdentity: id("M1", "t1", "t2"), currentIdentity: id("M1", "t1", "t3"), draft: held }), null, "replaced team is never mapped");
+  assert.equal(mapHeldDraftToFixture({ storedIdentity: null, currentIdentity: id("M1", "t1", "t2"), draft: held }), null);
+  assert.equal(mapHeldDraftToFixture({ storedIdentity: id("M1", "t1", "t2"), currentIdentity: id("M1", "t1", "t2"), draft: null }), null);
 }
 
 console.log("recorder draft identity and submit ordering fixtures passed");

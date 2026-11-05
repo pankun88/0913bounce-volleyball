@@ -231,6 +231,32 @@ export function normalizeRecorderDraft(value) {
   return sets.some((set) => set === null) ? null : { sets };
 }
 
+/**
+ * Map a held (stored) score onto the current official team order by team id, never by position.
+ * Only a same-match, same-two-teams record can be mapped; anything else (another match, a replaced team,
+ * a missing identity) returns null so a held score can never be applied to a different match.
+ * Returns the draft re-ordered to the current A/B sides plus whether the sides were swapped.
+ */
+export function mapHeldDraftToFixture({ storedIdentity = null, currentIdentity = null, draft = null, touched = [] } = {}) {
+  const stored = normalizeRecorderFixtureIdentity(storedIdentity);
+  const current = normalizeRecorderFixtureIdentity(currentIdentity);
+  const held = cloneRecorderDraft(draft);
+  if (!stored || !current || !held) return null;
+  if (stored.matchKey !== current.matchKey || stored.matchType !== current.matchType
+      || stored.divisionId !== current.divisionId) return null;
+  const same = stored.teamAId === current.teamAId && stored.teamBId === current.teamBId;
+  const swapped = stored.teamAId === current.teamBId && stored.teamBId === current.teamAId;
+  if (!same && !swapped) return null;
+  const flip = (side) => (side === "a" ? "b" : "a");
+  return {
+    swapped,
+    draft: swapped ? { sets: held.sets.map(({ a, b }) => ({ a: b, b: a })) } : held,
+    touched: swapped
+      ? touched.map((item) => { const [index, side] = String(item).split("-"); return side === "a" || side === "b" ? `${index}-${flip(side)}` : item; })
+      : [...touched],
+  };
+}
+
 export function cloneRecorderDraft(value) {
   const normalized = normalizeRecorderDraft(value);
   return normalized ? { sets: normalized.sets.map(({ a, b }) => ({ a, b })) } : null;
@@ -970,6 +996,7 @@ export const RECORDER_NOTICES = Object.freeze({
   reconnecting: "인터넷 연결을 기다리는 중입니다. 입력한 점수는 화면에 그대로 있습니다. 연결되면 자동으로 이어집니다.",
   blockedTryAgain: "아직 앞 기록관의 입력 시간이 끝나지 않았습니다. 잠시 뒤 자동으로 다시 확인합니다.",
   loadingData: "정보를 불러오는 중입니다. 잠시만 기다려 주세요.",
+  signedOutCourts: "Google 로그인 후 대회 코드를 입력하면 코트 목록이 나타납니다.",
   matchStateUnknown: "경기 정보를 확인하지 못했습니다. 잠시 뒤 자동으로 다시 확인합니다. 계속되면 ‘대회 데이터 다시 불러오기’를 누르세요.",
   logoutConfirm: "로그아웃하면 이 경기 입력을 마치고 입력 잠금도 풀립니다. ‘임시 저장’을 누르지 않은 점수는 사라집니다. 계속할까요?",
   logoutReleaseFailed: "입력 잠금을 풀지 못했습니다. 최대 3분 뒤 자동으로 풀립니다. 급하면 운영본부에 알려 주세요.",

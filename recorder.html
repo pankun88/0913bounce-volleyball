@@ -55,6 +55,7 @@
       </section>
       <section id="workflowPanel" class="panel" hidden aria-labelledby="workflowTitle">
         <h2 id="workflowTitle" tabindex="-1">점수 입력</h2><div id="matchSummary" class="match-summary"></div><aside id="rejectionNotice" class="notice rejection" hidden></aside><aside id="lockNotice" class="notice" hidden><p id="lockNoticeText"></p><div class="actions"><button id="lockActionButton" class="primary-button" type="button" hidden>입력 다시 시작</button></div></aside><aside id="entryNotice" class="notice success-notice" role="status" aria-live="polite" hidden></aside>
+        <aside id="heldScoreNotice" class="notice" role="status" hidden><p id="heldScoreText"></p><div class="actions"><button id="loadHeldScoreButton" class="secondary-button" type="button">보관 점수 불러오기</button></div></aside>
         <aside id="saveRecoveryNotice" class="notice rejection" hidden><h3 id="saveRecoveryTitle" tabindex="-1">저장 상태를 확인하세요</h3><p id="saveRecoveryMessage"></p><div class="actions"><button id="retrySaveButton" class="secondary-button" type="button" hidden>다시 저장</button><button id="keepLocalButton" class="secondary-button" type="button" hidden>내 점수 유지</button><button id="useServerButton" class="danger-button" type="button" hidden>서버 점수 사용</button></div></aside>
         <button id="claimButton" class="primary-button" type="button" hidden>경기 입력 시작</button>
         <form id="scoreForm" hidden novalidate>

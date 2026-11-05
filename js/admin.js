@@ -31,6 +31,7 @@ import { buildFullResultsCsv, downloadCsv } from "./csv-export.js";
 import { normalizeRingOrder, renderRingDiagram } from "./ring-bracket.js";
 import { orderExistingRoundRobinMatchIds } from "./schedule.js";
 import { adminWorkflowCallable } from "./workflow-service.js";
+import { describeError } from "./error-messages.js";
 import {
   getPlannerVisibleAdjacent,
   groupPlannerAssignments,
@@ -819,8 +820,8 @@ function initConnectionWatch() {
       renderPrelimSetupGroups();
     }
     setConnStatus(false);
-    const code = err && err.code ? ` (${err.code})` : "";
-    showErrorBanner(`${label} 실패${code}: ${err && err.message ? err.message : err}\nFirestore 보안 규칙이 게시되어 있는지 Firebase 콘솔에서 확인해주세요.`);
+    console.error(`[${label} 실패]`, err);
+    showErrorBanner(`${label} 실패: ${describeError(err).text}\n연결이 계속 실패하면 운영본부에 알려 주세요.`);
   });
   window.addEventListener("firestore-timeout", (e) => {
     if (e.detail.label === "예선경기") {
@@ -2496,6 +2497,14 @@ function requiredReason(label) {
   return reason?.trim() || null;
 }
 
+function reviewLockElapsedText(lock) {
+  const toMillis = (value) => value?.toMillis?.() ?? (Number.isFinite(value?.seconds) ? value.seconds * 1000 : null);
+  const since = toMillis(lock?.renewedAt) ?? toMillis(lock?.acquiredAt);
+  if (since === null) return "";
+  const minutes = Math.max(0, Math.floor((Date.now() - since) / 60000));
+  return minutes < 1 ? " · 방금 응답" : ` · 마지막 응답 ${minutes}분 전`;
+}
+
 function formatSets(score) {
   return (score?.sets || []).map((set) => `${set.a}:${set.b}`).join(" / ") || "점수 없음";
 }
@@ -2694,8 +2703,19 @@ function renderScoreReviews() {
       if (emergencyFeaturesOpen) actions.append(reject);
     }
     if (workflow.lock) {
+      // 기록관 화면이 멈췄을 때 찾기 쉽도록 카드 안에 눈에 띄는 잠금 안내 줄과 큰 버튼으로 둔다.
+      const lockBox = document.createElement("div");
+      lockBox.className = "review-lock-box";
+      lockBox.dataset.reviewLock = assignment.id;
+      const lockText = document.createElement("div");
+      lockText.className = "review-lock-text";
+      const holder = document.createElement("strong");
+      holder.textContent = `${workflow.lock.recorderName || "기록관"} 기록관이 입력 중입니다${reviewLockElapsedText(workflow.lock)}`;
+      const caption = document.createElement("small");
+      caption.textContent = "기록관 화면이 멈췄을 때만 누르세요. 입력 중이던 점수 잠금이 풀립니다.";
+      lockText.append(holder, caption);
       const release = document.createElement("button");
-      release.className = "btn danger small";
+      release.className = "btn danger review-lock-release";
       release.textContent = "잠금 강제 해제";
       release.addEventListener("click", async () => {
         const reason = requiredReason("강제 해제");
@@ -2708,7 +2728,8 @@ function renderScoreReviews() {
         }));
         if (ok) showToast("잠금을 강제 해제했습니다.");
       });
-      actions.append(release);
+      lockBox.append(lockText, release);
+      row.insertBefore(lockBox, actions);
     }
     root.appendChild(row);
   });
@@ -5327,7 +5348,7 @@ async function prepareFinalQualificationFromServer() {
     updateQualificationProofUi();
     return data;
   } catch (error) {
-    qualificationPreparationError = error?.message || String(error);
+    qualificationPreparationError = describeError(error).text;
     updateQualificationProofUi();
     throw error;
   } finally {
@@ -5996,7 +6017,7 @@ function finalPublicationErrorMessage(error) {
   if (/^bye_[a-z_]+:/.test(String(error?.message || ""))) {
     return qualificationBlockerMessage(error.message);
   }
-  return error?.message || String(error);
+  return describeError(error).text;
 }
 
 /** "관객·기록관 화면에 공개" — 그동안 로컬에서만 조정/입력해 둔 대진·경기 기록을 한 번에 Firestore에
@@ -6630,8 +6651,8 @@ function reportError(action, err) {
     showToast(finalPublicationErrorMessage(err), 7000);
     return;
   }
-  const code = err && err.code ? ` (${err.code})` : "";
-  showToast(`${action} 실패${code}: ${err && err.message ? err.message : err}`, 5000);
+  const described = describeError(err);
+  showToast(`${action} 실패: ${described.text}`, described.known ? 6000 : 7000);
 }
 
 function escapeHtml(str) {

@@ -14,7 +14,7 @@ import { courtMatchSummary, courtTeamNames, formatCourtName, renderMatchMeta } f
 import {
   buildRecorderConfirmationModel, buildRecorderSubmitContext, reconcileRecorderSelections,
   buildRecorderCourtSchedule, reconcileRecorderSubmit, recorderRouteState, sortRecorderCourts,
-  cloneRecorderDraft, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
+  cloneRecorderDraft, mapHeldDraftToFixture, readStoredRecorderDraft, reconcileRecorderSnapshot, removeStoredRecorderDraft,
   recorderDataState, reconcileRecorderAssignment, reconcileRecorderOwnership, resolveRecorderConflict,
   writeStoredRecorderDraft, buildRecorderFixtureIdentity, cloneRecorderFixtureIdentity,
   recorderFixtureIdentityEqual, reconcileRecorderDraftIdentity, preserveStoredRecorderDraft,
@@ -22,7 +22,7 @@ import {
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
-const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","lockNoticeText","lockActionButton","entryNotice","submitNotice","courtChangeNotice","successNote","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
+const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","lockNoticeText","lockActionButton","entryNotice","submitNotice","courtChangeNotice","successNote","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","heldScoreNotice","heldScoreText","loadHeldScoreButton","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
 let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", pendingCourtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "", viewState = "selection";
 let fixtureIdentity = null;
 let courtAssignments = [], scheduleOfficial = new Map(), scheduleState = "idle";
@@ -187,6 +187,44 @@ function clearDeviceDraft(key = storageKeyForEdit(), identity = null) {
   if (!result.preserved) channel?.postMessage({ type: "draft_cleared", storageKey: key, instance: tabInstanceId });
   return true;
 }
+// A held score from the previous team order, offered (never applied automatically) for the same match only.
+let heldScoreOffer = null;
+function hideHeldScoreOffer() {
+  heldScoreOffer = null;
+  if (ui.heldScoreNotice) ui.heldScoreNotice.hidden = true;
+}
+function offerHeldScore(saved, currentIdentity, storedPair, currentPair, warning) {
+  const mapped = mapHeldDraftToFixture({
+    storedIdentity: saved.value.identity, currentIdentity, draft: saved.value.draft, touched: saved.value.touched,
+  });
+  if (!mapped || !ui.heldScoreNotice || !ui.heldScoreText) return false;
+  heldScoreOffer = { matchKey, ...mapped };
+  ui.heldScoreText.textContent = `${warning} 보관 점수: ${draftScoreSummary(saved.value.draft)}. `
+    + `현재 순서(${currentPair})에 맞춰 ${mapped.swapped ? "A팀·B팀 점수를 바꿔 " : ""}`
+    + "채우려면 ‘보관 점수 불러오기’를 누르세요. 채운 뒤에도 점수를 확인하고 직접 제출해야 합니다.";
+  ui.heldScoreNotice.hidden = false;
+  return true;
+}
+function loadHeldScore() {
+  const offer = heldScoreOffer;
+  // Same-match guard: the offer is only valid for the match it was kept for, and only while this screen holds the input.
+  if (!offer || offer.matchKey !== matchKey || !edit.token || inertTab || !resolved()) { hideHeldScoreOffer(); return; }
+  const hasTyped = edit.dirty && (edit.localDraft?.sets || []).some((set) => set.a !== "" || set.b !== "");
+  if (hasTyped && !window.confirm("지금 화면에 입력한 점수를 보관 점수로 바꿉니다. 계속할까요?")) return;
+  edit.localDraft = draftCopy(offer.draft);
+  edit.draftMatchKey = matchKey;
+  edit.touched = new Set(offer.touched);
+  edit.dirty = true;
+  edit.reviewedPayload = null;
+  edit.inputVersion += 1;
+  clearConfirmation();
+  hideHeldScoreOffer();
+  renderedFormKey = "";
+  const stored = storeDraft();
+  status(stored ? "보관 점수를 불러왔습니다. 점수를 확인한 뒤 ‘점수 확인/제출’을 누르세요." : "보관 점수를 불러왔습니다. 이 기기에 보관하지 못했으니 화면을 닫지 마세요.");
+  action("미저장");
+  render();
+}
 function draftTeamPair(identity) {
   return `${identity?.teamAName || "A팀"} vs ${identity?.teamBName || "B팀"}`;
 }
@@ -239,7 +277,8 @@ function restoreStoredAfterClaim(saved, currentIdentity, serverRevision) {
     : `이전 기기 초안(${storedPair})과 현재 경기(${currentPair})가 달라 자동으로 불러오지 않았습니다. 현재 서버 초안을 사용합니다.`;
   const comparison = `보관 점수: ${draftScoreSummary(saved.value.draft)}`;
   status(preserved ? warning : `${warning} 이전 초안 보존에 실패했습니다.`);
-  action(preserved ? `${warning} ${comparison}` : `${warning} ${comparison}`);
+  action(`${warning} ${comparison}`);
+  if (assessment.status === "mismatch") offerHeldScore(saved, currentIdentity, storedPair, currentPair, warning);
 }
 function renderCourtSelectors({ resetRecorder = false } = {}) {
   if (!ui.courtSelect || !ui.recorderSelect) return;
@@ -436,10 +475,21 @@ function setSnapshotState(key, metadata) {
 function clearHealedDataFailure() {
   if (dataFailureText && authoritativeDataReady() && workflowDenial() === "none") clearFailureNotice();
 }
+function hasFinalConsonant(text) {
+  const code = String(text || "").trim().at(-1)?.charCodeAt(0) ?? 0;
+  return code >= 0xac00 && code <= 0xd7a3 && (code - 0xac00) % 28 !== 0;
+}
 function renderDataState() {
   if (!ui.dataStatus || !ui.retryDataButton) return;
   clearHealedDataFailure();
   if (workflowDenial() === "generic" && !dataFailureText) reportDataFailure(RECORDER_NOTICES.matchStateUnknown);
+  // 로그인·코드 확인 전에는 불러올 데이터가 없습니다. ‘불러오는 중’ 대신 다음에 할 일을 안내합니다.
+  if (authState?.kind !== "ready" || !readyUid) {
+    ui.retryDataButton.hidden = true;
+    ui.dataStatus.hidden = authState?.kind !== "signedOut";
+    ui.dataStatus.textContent = authState?.kind === "signedOut" ? RECORDER_NOTICES.signedOutCourts : "";
+    return;
+  }
   const problems = gatedDataKeys()
     .map((key) => ({ key, ...dataHealth[key] }))
     .filter(({ status }) => status !== "ready");
@@ -450,11 +500,13 @@ function renderDataState() {
     return;
   }
   const errors = problems.filter(({ status }) => status === "error");
-  const names = [...new Set(problems.map(({ key }) => dataLabels[key]))].join(", ");
+  const names = [...new Set(problems.map(({ key }) => dataLabels[key]))];
+  const list = names.join(", ");
+  const objectParticle = hasFinalConsonant(names.at(-1)) ? "을" : "를";
   ui.dataStatus.hidden = false;
   ui.dataStatus.textContent = errors.length
-    ? `${names}를 불러오지 못했습니다. 잠시 뒤 자동으로 다시 시도합니다. 급하면 아래 ‘대회 데이터 다시 불러오기’를 누르세요.`
-    : `${names}를 불러오는 중입니다. 잠시만 기다려 주세요.`;
+    ? `${list}${objectParticle} 불러오지 못했습니다. 잠시 뒤 자동으로 다시 시도합니다. 급하면 아래 ‘대회 데이터 다시 불러오기’를 누르세요.`
+    : `${list}${objectParticle} 불러오는 중입니다. 잠시만 기다려 주세요.`;
   ui.retryDataButton.hidden = false;
   ui.retryDataButton.disabled = busy || !authActionsReady();
 }
@@ -546,6 +598,7 @@ function resetMatchEditor({ preservePendingSubmit = false } = {}) {
   edit.saveConflict = null;
   if (!preservePendingSubmit) edit.pendingSubmit = null;
   stopHeartbeat();
+  hideHeldScoreOffer();
   renderedFormKey = "";
   if (!reviewedPayload) clearConfirmation();
   if (ui.scoreFields && ui.scoreLegend) ui.scoreFields.replaceChildren(ui.scoreLegend);
@@ -806,6 +859,7 @@ function fenceFixtureIdentity(nextIdentity) {
   const hadDirtyDraft = Boolean(edit.dirty && edit.localDraft);
   const oldStorageKey = edit.pendingSave?.context?.storageKey || storageKeyForEdit();
   bumpContext();
+  hideHeldScoreOffer();
   fixtureIdentity = cloneRecorderFixtureIdentity(nextIdentity);
   stopHeartbeat();
   edit.token = null;
@@ -1074,6 +1128,7 @@ function syncScreenVisibility() {
 }
 function render() {
   syncScreenVisibility();
+  if (heldScoreOffer && (heldScoreOffer.matchKey !== matchKey || !edit.token || inertTab)) hideHeldScoreOffer();
   renderOperationsHeader();
   renderCourtSchedule();
   renderDataState();
@@ -1616,6 +1671,7 @@ watchRecorderAuthState((state) => {
   render();
   if (authKindChanged && !edit.token) focus(state.kind === "ready" ? ui.courtPanel.querySelector("h2") : ui.authTitle);
 });
+ui.loadHeldScoreButton?.addEventListener("click", loadHeldScore);
 window.addEventListener("online", () => { status("온라인"); heartbeat?.start(); heartbeat?.reconcile(); applyActionGate(); render(); housekeeping(); });
 window.addEventListener("offline", () => {
   status(RECORDER_NOTICES.offlineBanner);

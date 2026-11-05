@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { describeError } from './error-messages.js';
 import {
   getSetWinner,
   evaluatePrelimMatch,
@@ -65,7 +66,7 @@ function check(label, cond) {
   const source = fs.readFileSync(new URL('./workflow-service.js', import.meta.url), 'utf8')
     .replace(/^import[\s\S]*?;\s*/gm, '')
     .replace(/^export /gm, '');
-  const context = { TOURNAMENT_ID: 'test' };
+  const context = { TOURNAMENT_ID: 'test', describeError, console };
   vm.runInNewContext(`${source}
     globalThis.structuredReason = recorderReason({details:{reason:"qualification_unverified"}});
     globalThis.messageReason = recorderReason({message:"qualification_unverified"});
@@ -3281,6 +3282,7 @@ function createAdminProjectionHarness() {
     normalizeRingOrder,
     renderRingDiagram: renderRingDiagramForTest,
     orderExistingRoundRobinMatchIds: () => [],
+    describeError,
     adminWorkflowCallable: (...args) => adminWorkflowCallableImpl(...args),
     __setAdminWorkflowCallable: (fn) => {
       adminWorkflowCallableImpl = fn;
