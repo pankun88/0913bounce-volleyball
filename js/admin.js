@@ -133,6 +133,8 @@ let workflowDragMatchKey = null;
 let workflowDragTarget = null;
 let workflowDropHighlightTimer = null;
 const WORKFLOW_DRAG_HINT = "완료 경기가 분리되거나 일부 경기가 숨겨져 드래그 정렬은 제한됩니다. 코트 선택과 가능한 화살표를 사용하세요.";
+const PRELIM_BLOCKED_AFTER_FINALS_MESSAGE = "본선 경기가 이미 진행되어, 순위가 바뀌는 예선 점수 수정은 할 수 없습니다. 대회 본부가 정정하기로 결정한 경우에만 아래 ‘비상용 기능 보기’에서 처리하세요.";
+const PRELIM_OVERRIDE_CONFIRM_TEXT = "점수 기록만 바로잡고, 본선 대진과 본선 결과는 그대로 둡니다. 본선 진출팀도 바뀌지 않습니다. 정정 사유는 감사 기록에 남습니다.";
 const PRELIM_ORDER_GUIDANCE = "경기 진행 순서는 통합 경기 배정·순서에서 변경합니다. 도형의 팀 배치는 대진 상대를 변경합니다.";
 const PRELIM_UNSAVED_PLAN_HINT = "저장되지 않은 코트 배정·진행 순서가 표시 중입니다. 통합 경기 배정·순서에서 저장하세요.";
 let tournamentResetInProgress = false;
@@ -243,18 +245,18 @@ function cloneFinalMatches(matches) {
   return structuredClone(matches || []);
 }
 
-function qualificationSnapshotForCurrentData() {
-  const selectedGroups = allGroups.filter((group) => group.division === activeDivision);
+function qualificationSnapshotForCurrentData(division = activeDivision, replacedMatch = null) {
+  const selectedGroups = allGroups.filter((group) => group.division === division);
   const selectedGroupIds = new Set(selectedGroups.map((group) => group.id));
   const selectedTeams = allTeams.filter((team) => (
-    team.division === activeDivision || selectedGroupIds.has(team.groupId)
+    team.division === division || selectedGroupIds.has(team.groupId)
   ));
   const selectedMatches = allPrelimMatches.filter((match) => (
-    match.division === activeDivision || selectedGroupIds.has(match.groupId)
-  ));
+    match.division === division || selectedGroupIds.has(match.groupId)
+  )).map((match) => (replacedMatch && match.id === replacedMatch.id ? replacedMatch : match));
   return buildQualificationSnapshot({
-    division: activeDivision,
-    qualifyPerGroup: tournamentInfo.qualifyPerGroup?.[activeDivision],
+    division,
+    qualifyPerGroup: tournamentInfo.qualifyPerGroup?.[division],
     groups: selectedGroups,
     teams: selectedTeams,
     matches: selectedMatches,
@@ -425,15 +427,16 @@ function qualificationHasFinalBracket() {
     || bracketPublishPending;
 }
 
-function qualificationHasFinalPlay() {
-  if (finalScoreDrafts.size > 0) return true;
+function qualificationHasFinalPlay(division = activeDivision) {
+  const isActive = division === activeDivision;
+  if (isActive && finalScoreDrafts.size > 0) return true;
   const assignments = reviewAssignments.filter((assignment) => (
     assignment.matchType === "final"
-    && (assignment.divisionId || assignment.division) === activeDivision
+    && (assignment.divisionId || assignment.division) === division
   ));
   const records = [
-    ...authoritativeFinalMatches,
-    ...finalMatches,
+    ...(isActive ? authoritativeFinalMatches : []),
+    ...(isActive ? finalMatches : []),
     ...assignments,
     ...assignments.map((assignment) => reviewWorkflows.get(assignment.id)),
   ];
@@ -477,7 +480,7 @@ function qualificationSourceChanged() {
   }
   if (qualificationSourceKey === nextKey) return false;
   qualificationSourceKey = nextKey;
-  if (qualificationHasFinalBracket()) {
+  if (qualificationHasFinalBracket() && !(qualificationPostFinalCorrected() && qualificationHasFinalPlay())) {
     qualificationDraftStale = true;
     qualificationRevalidatedLocally = false;
   }
@@ -488,6 +491,8 @@ function syncQualificationProofFromTournamentInfo() {
   const next = tournamentInfo.finalQualification?.[activeDivision] || null;
   const previous = qualificationProof;
   qualificationProof = next;
+  // 본선 시작 후 정정은 진출팀·대진을 그대로 두므로 '다시 확인 필요' 상태로 만들지 않는다.
+  if (qualificationPostFinalCorrected() && qualificationHasFinalPlay()) qualificationDraftStale = false;
   if (!qualificationServerFingerprint && typeof next?.fingerprint === "string") {
     qualificationServerFingerprint = next.fingerprint;
   }
@@ -549,8 +554,15 @@ function qualificationReplacementAvailable() {
   return qualificationProofStatus() === "stale" && !qualificationHasFinalPlay();
 }
 
+/** 본선 시작 후 대회 본부 결정으로 예선 점수만 정정한 부문이다. 서버가 진출팀을 그대로 두고 current 로 기록한다. */
+function qualificationPostFinalCorrected() {
+  const proof = qualificationProof;
+  return proof?.status === "current" && proof?.reason === "prelim_corrected_after_finals" && Boolean(proof?.postFinalCorrection);
+}
+
 function qualificationProofStatus() {
   if (!qualificationHasFinalBracket()) return "none";
+  if (qualificationPostFinalCorrected() && qualificationHasFinalPlay()) return "current";
   if (qualificationDraftStale) return "stale";
   // 공개 전에도 서버 확인을 마친 현재 초안은 유효하다. 영구 검증 기록은 공개할 때 저장한다.
   if (qualificationRevalidatedLocally
@@ -4837,6 +4849,12 @@ function renderPrelimGroups() {
       });
       table.appendChild(tbody);
       card.appendChild(table);
+      if (tournamentInfo.finalQualification?.[activeDivision]?.postFinalCorrection?.groupIds?.includes(g.id)) {
+        const note = document.createElement("p");
+        note.className = "prelim-corrected-note";
+        note.textContent = "본선 시작 후 정정됨";
+        card.appendChild(note);
+      }
     } else {
       const noTeamHint = document.createElement("div");
       noTeamHint.className = "empty-hint";
@@ -5013,6 +5031,82 @@ function prelimDirectScoreContextIsCurrent(snapshot) {
     && current.requiresQueueCas === snapshot.requiresQueueCas;
 }
 
+/** 예선 점수 수정이 진출팀·순위에 주는 영향을 같은 계산식(computeQualificationState)으로 미리 비교한다. */
+function prelimCorrectionImpact(match, sets) {
+  const division = match.division || activeDivision;
+  const proof = tournamentInfo.finalQualification?.[division] || null;
+  const finalExists = Boolean(proof) || (division === activeDivision && qualificationHasFinalBracket());
+  if (!finalExists) return { finalExists: false, changed: false, lines: [] };
+  const evaluated = evaluatePrelimMatch(sets);
+  const proposedMatch = {
+    ...match,
+    sets,
+    status: evaluated.status,
+    result: evaluated.result,
+    setsWonA: evaluated.setsWonA,
+    setsWonB: evaluated.setsWonB,
+    pointsForA: evaluated.pointsForA,
+    pointsForB: evaluated.pointsForB,
+    officialCurrent: true,
+    officialRevision: (Number(match.officialRevision) || 0) + 1,
+  };
+  const before = computeQualificationState(qualificationSnapshotForCurrentData(division));
+  const after = computeQualificationState(qualificationSnapshotForCurrentData(division, proposedMatch));
+  const nameOf = (id) => allTeams.find((team) => team.id === id)?.name || "?";
+  const lines = [];
+  after.groups.forEach((group) => {
+    const prior = before.groups.find((item) => item.groupId === group.groupId);
+    if (!prior) return;
+    const groupName = allGroups.find((item) => item.id === group.groupId)?.name || group.groupId;
+    for (let index = 0; index < group.requiredCount; index += 1) {
+      const was = prior.standings[index];
+      const now = group.standings[index];
+      if (!was || !now) continue;
+      if (was.teamId !== now.teamId || was.rank !== now.rank) {
+        lines.push(`${groupName} ${index + 1}위 ${nameOf(was.teamId)} → ${nameOf(now.teamId)}`);
+      }
+    }
+    if (JSON.stringify(prior.cutoffCandidateIds) !== JSON.stringify(group.cutoffCandidateIds)) {
+      lines.push(`${groupName} 진출선 동률 → 추첨이 필요할 수 있습니다`);
+    }
+  });
+  const played = qualificationHasFinalPlay(division);
+  let finalistsInvalid = false;
+  if (played) {
+    const participantIds = Array.isArray(proof?.participantIds)
+      ? proof.participantIds
+      : (division === activeDivision ? finalEntrantIds(authoritativeFinalMatches) : []);
+    finalistsInvalid = !validateQualificationSelection(after, participantIds, proof?.tieSelections || {}).ok;
+  }
+  return { finalExists: true, played, changed: lines.length > 0, finalistsInvalid, lines };
+}
+
+/** 저장 전 확인: 본선 시작 전이면 변경 미리보기, 본선 시작 후 진출팀이 바뀌면 기본 차단(+비상용 정정). */
+function prelimCorrectionGate(match, sets) {
+  const impact = prelimCorrectionImpact(match, sets);
+  if (impact.played) {
+    if (!impact.finalistsInvalid) return null;
+    return {
+      kind: "blocked",
+      message: PRELIM_BLOCKED_AFTER_FINALS_MESSAGE,
+      lines: impact.lines,
+      override: emergencyFeaturesOpen ? {
+        label: "본부 결정으로 점수만 정정 (비상용)",
+        confirmText: PRELIM_OVERRIDE_CONFIRM_TEXT,
+        extra: { allowPostFinalCorrection: true },
+      } : null,
+    };
+  }
+  if (!impact.finalExists || !impact.changed) return null;
+  return {
+    kind: "preview",
+    message: "이 점수로 바꾸면 예선 순위가 달라집니다. 본선 대진을 새 순위로 다시 만들어야 합니다.",
+    lines: impact.lines,
+    confirmLabel: "이대로 저장",
+    extra: { prelimRankChanged: true },
+  };
+}
+
 function openPrelimScoreModal(match) {
   const snapshot = prelimDirectScoreContext(match.id);
   if (snapshot.error) {
@@ -5027,7 +5121,8 @@ function openPrelimScoreModal(match) {
     existingSets: match.sets || [],
     reasonRequired: true,
     reasonNote: "관리자가 직접 입력·수정합니다. 사유는 감사 기록에 남습니다.",
-    onSave: async (sets, reason) => {
+    onPreflight: (sets) => prelimCorrectionGate(match, sets),
+    onSave: async (sets, reason, extra = {}) => {
       if (!prelimDirectScoreContextIsCurrent(snapshot)) {
         throw new Error("경기·팀·코트·대기열 또는 공식 점수 버전이 변경되었습니다. 최신 상태에서 점수 입력을 다시 여세요.");
       }
@@ -5039,8 +5134,15 @@ function openPrelimScoreModal(match) {
         expectedOfficialRevision: snapshot.officialRevision,
       };
       if (snapshot.requiresQueueCas) request.expectedQueueRevision = snapshot.queueRevision;
+      if (extra.allowPostFinalCorrection) request.allowPostFinalCorrection = true;
       await adminWorkflowCallable("directEditOfficialScore", request);
-      showToast("관리자 수정 점수를 승인했습니다.");
+      if (extra.allowPostFinalCorrection) {
+        showToast("예선 점수만 정정했습니다. 본선 대진과 본선 결과는 그대로입니다.", 7000);
+      } else if (extra.prelimRankChanged) {
+        showToast("예선 점수를 저장했습니다. 순위가 바뀌었으니 본선 탭에서 ‘새 순위로 대진 다시 만들기’를 눌러 주세요.", 9000);
+      } else {
+        showToast("관리자 수정 점수를 승인했습니다.");
+      }
     },
   });
 }
@@ -5235,6 +5337,10 @@ async function prepareFinalQualificationFromServer() {
 
 async function handleQualificationRevalidation() {
   if (qualificationPreparationInFlight) return;
+  if (qualificationPostFinalCorrected() && qualificationHasFinalPlay()) {
+    showToast("이 부문은 본선 시작 후 예선 점수를 정정했습니다. 본선 진출팀과 대진은 그대로 유지되어 다시 확인할 필요가 없습니다.", 6000);
+    return;
+  }
   const beforeParticipants = finalEntrantIds(finalMatches);
   try {
     const prepared = await prepareFinalQualificationFromServer();
@@ -5921,12 +6027,13 @@ async function handlePublishBracket() {
   }
   const qualificationStateForPublish = qualificationServerState || qualificationStateForCurrentData();
   const finalParticipants = finalEntrantIds(finalMatches);
-  const qualificationValidation = qualificationSelectionValidation(
+  const postFinalCorrected = qualificationPostFinalCorrected() && qualificationHasFinalPlay();
+  const qualificationValidation = postFinalCorrected ? { ok: true } : qualificationSelectionValidation(
     qualificationStateForPublish,
     finalParticipants,
     qualificationTieSelections,
   );
-  if (qualificationDraftStale) {
+  if (qualificationDraftStale && !postFinalCorrected) {
     showToast("예선 점수가 바뀌었습니다. 먼저 ‘현재 순위로 확인’을 누르세요.", 6000);
     return;
   }
@@ -5938,7 +6045,7 @@ async function handlePublishBracket() {
     showToast("예선 점수가 바뀌어 본선 대진표 확인이 필요합니다. 먼저 ‘현재 순위로 확인’을 누르세요.", 6000);
     return;
   }
-  if (qualificationStateHasStructuralBlockers(qualificationStateForPublish)) {
+  if (!postFinalCorrected && qualificationStateHasStructuralBlockers(qualificationStateForPublish)) {
     const messages = qualificationGuidanceForBlockers(qualificationStateForPublish);
     showToast(messages.join(" ") || "참가팀이 있는 모든 조의 예선을 완료해야 공개할 수 있습니다.", 6000);
     return;
@@ -6326,7 +6433,7 @@ function openReasonModal({ title, description = "", confirmLabel, danger = false
 /** 점수 입력 모달. reasonRequired면 사유를 입력해야만 저장할 수 있고 onSave(sets, reason)으로 넘긴다. */
 function openScoreModal({
   teamAName, teamBName, setLabels, targets, existingSets, requireComplete = false,
-  reasonRequired = false, reasonNote = "", onSave,
+  reasonRequired = false, reasonNote = "", onSave, onPreflight = null,
 }) {
   const box = document.createElement("div");
   box.className = "modal-box";
@@ -6421,14 +6528,72 @@ function openScoreModal({
       errorMsg.classList.add("show");
       return;
     }
-    saveBtn.disabled = true;
-    try {
-      await onSave(sets, reason);
-      overlay.remove();
-    } catch (err) {
-      saveBtn.disabled = reasonRequired && !reasonField.value();
-      reportError("점수 저장", err);
+    const commit = async (extra) => {
+      saveBtn.disabled = true;
+      try {
+        await onSave(sets, reason, extra);
+        overlay.remove();
+      } catch (err) {
+        saveBtn.disabled = reasonRequired && !reasonField.value();
+        reportError("점수 저장", err);
+      }
+    };
+    const gate = onPreflight ? onPreflight(sets, reason) : null;
+    if (!gate) {
+      await commit({});
+      return;
     }
+    // 저장 전 확인 단계: 입력칸은 잠그고 안내 패널만 보여 준다.
+    const panel = document.createElement("div");
+    panel.className = `prelim-gate is-${gate.kind}`;
+    panel.setAttribute("role", "alertdialog");
+    const text = document.createElement("p");
+    text.className = "prelim-gate-message";
+    text.textContent = gate.message;
+    panel.appendChild(text);
+    if (gate.lines?.length) {
+      const list = document.createElement("ul");
+      list.className = "prelim-gate-lines";
+      gate.lines.forEach((line) => {
+        const item = document.createElement("li");
+        item.textContent = line;
+        list.appendChild(item);
+      });
+      panel.appendChild(list);
+    }
+    if (gate.override) {
+      const confirmText = document.createElement("p");
+      confirmText.className = "prelim-gate-confirm";
+      confirmText.textContent = gate.override.confirmText;
+      panel.appendChild(confirmText);
+    }
+    const gateActions = document.createElement("div");
+    gateActions.className = "row modal-actions";
+    const backBtn = document.createElement("button");
+    backBtn.className = "btn ghost";
+    backBtn.textContent = gate.kind === "preview" ? "취소 (저장 안 함)" : "돌아가기";
+    const closeGate = () => {
+      panel.remove();
+      actions.hidden = false;
+      box.querySelectorAll("input, textarea").forEach((el) => { el.disabled = false; });
+    };
+    backBtn.addEventListener("click", closeGate);
+    gateActions.appendChild(backBtn);
+    const proceed = gate.kind === "preview" ? gate : gate.override;
+    if (proceed) {
+      const proceedBtn = document.createElement("button");
+      proceedBtn.className = `btn ${gate.kind === "blocked" ? "danger" : "primary"}`;
+      proceedBtn.textContent = gate.kind === "preview" ? gate.confirmLabel : gate.override.label;
+      proceedBtn.addEventListener("click", () => {
+        proceedBtn.disabled = true;
+        commit(proceed.extra || {});
+      });
+      gateActions.appendChild(proceedBtn);
+    }
+    panel.appendChild(gateActions);
+    box.querySelectorAll("input, textarea").forEach((el) => { el.disabled = true; });
+    actions.hidden = true;
+    box.appendChild(panel);
   });
   actions.append(cancelBtn, saveBtn);
   box.appendChild(actions);
@@ -6450,6 +6615,11 @@ function reportError(action, err) {
   if (err?.details?.reason === "qualification_unverified"
       || String(err?.message || "") === "qualification_unverified") {
     showToast(`${action}을(를) 중단했습니다. ‘현재 순위로 확인’을 누른 뒤 진행하세요. 기존 기록은 유지됩니다.`, 7000);
+    return;
+  }
+  if (err?.details?.reason === "prelim_correction_after_finals"
+      || String(err?.message || "") === "prelim_correction_after_finals") {
+    showToast(PRELIM_BLOCKED_AFTER_FINALS_MESSAGE, 9000);
     return;
   }
   if (/preliminary match has official history/i.test(String(err?.message || ""))) {

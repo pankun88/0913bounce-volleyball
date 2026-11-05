@@ -162,6 +162,8 @@ function testActualSourceInvalidationAndForeignRecords() {
     "qualificationSnapshotForCurrentData",
     "qualificationSourceChanged",
     "qualificationHasFinalBracket",
+    "qualificationPostFinalCorrected",
+    "qualificationHasFinalPlay",
   ], {
     activeDivision: "men",
     tournamentInfo: { qualifyPerGroup: { men: 2 } },
@@ -188,6 +190,7 @@ function testActualSourceInvalidationAndForeignRecords() {
     qualificationSourceInitialized: false,
     qualificationSourceKey: "",
     qualificationDraftStale: false,
+    qualificationProof: null,
   });
 
   const snapshot = jsonValue(call(context, "qualificationSnapshotForCurrentData"));
@@ -364,7 +367,7 @@ function finalUiFixture() {
   const context = loadAdminFunctions([
     "cloneFinalMatches", "finalBaselineDescriptor", "sameFinalBaseline", "resetFinalDraft", "finalMutationAllowed",
     "qualificationHasFinalBracket", "qualificationHasFinalPlay", "finalEntrantIds",
-    "qualificationProofStatus", "qualificationBlockerCode", "qualificationBlockerMessage",
+    "qualificationProofStatus", "qualificationPostFinalCorrected", "qualificationBlockerCode", "qualificationBlockerMessage",
     "qualificationStateBlockers", "qualificationStateHasStructuralBlockers",
     "qualificationStateReadyForSelection", "qualificationGuidanceForBlockers",
     "qualificationGroupTeamIds", "canonicalQualificationTieSelections",
@@ -775,7 +778,7 @@ function testPublishedProofSurvivesDivisionSwitchAndReload() {
   const context = loadAdminFunctions([
     "switchActiveDivision",
     "syncQualificationProofFromTournamentInfo",
-    "qualificationProofStatus",
+    "qualificationProofStatus", "qualificationPostFinalCorrected",
     "qualificationHasFinalBracket",
     "finalMutationAllowed",
   ], {
@@ -850,7 +853,7 @@ function testPublishedProofSurvivesDivisionSwitchAndReload() {
 function testReplacementAvailableAfterReload() {
   const bracket = [{ id: "m_r1_0", round: 1, teamA: { id: "a" }, teamB: { id: "b" }, status: "pending" }];
   const context = loadAdminFunctions([
-    "qualificationReplacementAvailable", "qualificationProofStatus",
+    "qualificationReplacementAvailable", "qualificationProofStatus", "qualificationPostFinalCorrected",
     "qualificationHasFinalBracket", "qualificationHasFinalPlay",
   ], {
     activeDivision: "men",
@@ -885,6 +888,8 @@ function testLateTournamentInfoDoesNotStaleAPublishedFinal() {
     "qualificationSnapshotForCurrentData",
     "qualificationSourceChanged",
     "qualificationHasFinalBracket",
+    "qualificationPostFinalCorrected",
+    "qualificationHasFinalPlay",
   ], {
     activeDivision: "men",
     tournamentInfo: {},
@@ -902,6 +907,7 @@ function testLateTournamentInfoDoesNotStaleAPublishedFinal() {
     qualificationSourceKey: "",
     qualificationDraftStale: false,
     qualificationRevalidatedLocally: false,
+    qualificationProof: null,
   });
   assert.equal(call(context, "qualificationSourceChanged"), false, "collections before tournament info only set a provisional key");
   assert.equal(context.qualificationSourceInitialized, false);
@@ -969,7 +975,7 @@ async function testByeLotteryGeneratesAndPublishes() {
   const context = loadAdminFunctions([
     "cloneFinalMatches", "finalBaselineDescriptor", "resetFinalDraft", "finalMutationAllowed",
     "qualificationHasFinalBracket", "qualificationHasFinalPlay", "finalEntrantIds",
-    "qualificationProofStatus", "qualificationBlockerCode", "qualificationBlockerMessage",
+    "qualificationProofStatus", "qualificationPostFinalCorrected", "qualificationBlockerCode", "qualificationBlockerMessage",
     "qualificationStateBlockers", "qualificationStateHasStructuralBlockers",
     "qualificationStateReadyForSelection", "qualificationGuidanceForBlockers",
     "qualificationGroupTeamIds", "canonicalQualificationTieSelections",

@@ -959,6 +959,12 @@ function renderPrelim() {
       scroll.className = "table-scroll";
       scroll.appendChild(table);
       card.appendChild(scroll);
+      if (tournamentInfo.finalQualification?.[activeDivision]?.postFinalCorrection?.groupIds?.includes(group.id)) {
+        const note = document.createElement("p");
+        note.className = "prelim-corrected-note";
+        note.textContent = "본선 시작 후 정정됨";
+        card.appendChild(note);
+      }
     }
 
     if (!groupMatches.length) {

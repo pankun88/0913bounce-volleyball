@@ -2976,3 +2976,12 @@ body.dashboard-page .footer-note {
   body.dashboard-page #venueNextDivision { grid-column: 1; }
   body.dashboard-page #venueCountdown { grid-column: 2; grid-row: 1 / span 2; }
 }
+
+/* 본선 시작 후 예선 정정: 저장 전 확인 패널과 순위표 주석 */
+.prelim-gate { margin-top: 12px; padding: 12px 14px; border-radius: 10px; border: 1px solid #e0a23a; background: #fff6e3; display: grid; gap: 8px; }
+.prelim-gate.is-blocked { border-color: #c0392b; background: #fdeceb; }
+.prelim-gate-message { margin: 0; font-size: 13.5px; font-weight: 700; line-height: 1.55; }
+.prelim-gate-lines { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.6; }
+.prelim-gate-confirm { margin: 0; font-size: 13px; line-height: 1.55; color: var(--ink); }
+.prelim-gate .modal-actions { margin-top: 4px; }
+.prelim-corrected-note { margin: 6px 0 0; font-size: 12px; font-weight: 700; color: #8c5a12; }

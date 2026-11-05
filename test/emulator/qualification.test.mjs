@@ -602,6 +602,106 @@ export async function runQualificationSuite() {
     assert.equal(sameCountRoot.data().finalQualification.men.status, 'current', 'same-count-does-not-mark-proof-stale');
     await cleanupScenario(compatible);
 
+    // 본선 시작 후 예선 정정: 기본 차단 -> 사유 없는 플래그 거부 -> 비상용 정정 허용(진출팀·본선 유지)
+    const postFinal = await seedQualificationScenario({
+      prefix: 'post-final',
+      groupSpecs: [
+        { name: 'g1', teams: ['a', 'b', 'c'] },
+        { name: 'g2', teams: ['d', 'e', 'f'] },
+      ],
+    });
+    const postFinalContinuation = await seedFinalContinuation('post-final', 'post-final-final');
+    const postFinalIds = ['a', 'b', 'd', 'e'].map((suffix) => `post-final-${suffix}`);
+    const postFinalStructure = finalBracket4('post-final', postFinalIds);
+    postFinal.finalIds.push(...postFinalStructure.map((match) => match.id));
+    const postFinalInitial = await publishQualification({ matches: postFinalStructure });
+    const postFinalPlayed = await publishQualification({
+      expectedMatches: finalStructureBaseline(postFinalInitial.matches),
+      matches: postFinalStructure,
+      scoreDrafts: ['post-final-semi-a', 'post-final-semi-b'].map((matchId) => ({
+        matchId, sets, reason: '', expectedSubmissionVersion: 0,
+      })),
+    });
+    const postFinalMatch = postFinal.matches.find((match) => (
+      match.teamA === 'post-final-b' && match.teamB === 'post-final-c'
+    ));
+    const postFinalBefore = await f.seed((db) => getDoc(doc(db, path('prelimMatches', postFinalMatch.id))));
+    const postFinalRootBefore = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    const postFinalRequest = {
+      tournamentId: 'main',
+      matchKey: postFinalMatch.id,
+      score: { sets: [{ a: 8, b: 10 }, { a: 8, b: 10 }] },
+      expectedOfficialRevision: 1,
+      expectedQueueRevision: null,
+    };
+    // (c) 기본: 순위가 바뀌어 본선 진출팀이 무효가 되면 한글 매핑용 reason 으로 차단되고 아무것도 쓰지 않는다.
+    await assert.rejects(call('directEditOfficialScore', {
+      ...postFinalRequest, reason: '기록 오기 정정',
+    }), (error) => error?.details?.reason === 'prelim_correction_after_finals',
+    'post-final-correction-blocked-by-default-with-reason-code');
+    // 비상용 플래그는 사유가 있어야 하고, 불리언이어야 한다.
+    await assert.rejects(call('directEditOfficialScore', {
+      ...postFinalRequest, reason: '  ', allowPostFinalCorrection: true,
+    }), /reason|correction/i, 'post-final-override-without-reason-rejected');
+    await assert.rejects(call('directEditOfficialScore', {
+      ...postFinalRequest, allowPostFinalCorrection: true,
+    }), /reason|correction/i, 'post-final-override-missing-reason-rejected');
+    await assert.rejects(call('directEditOfficialScore', {
+      ...postFinalRequest, reason: '기록 오기 정정', allowPostFinalCorrection: 'yes',
+    }), /correction/i, 'post-final-override-flag-must-be-boolean');
+    const postFinalUnchanged = await f.seed((db) => getDoc(doc(db, path('prelimMatches', postFinalMatch.id))));
+    assert.deepEqual(postFinalUnchanged.data(), postFinalBefore.data(), 'rejected-post-final-corrections-write-nothing');
+    const postFinalRootUnchanged = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.deepEqual(
+      postFinalRootUnchanged.data().finalQualification.men,
+      postFinalRootBefore.data().finalQualification.men,
+      'rejected-post-final-corrections-keep-proof',
+    );
+    // 허용: 점수만 바로잡고 진출팀·본선 대진은 그대로, 감사 표식이 남는다.
+    const postFinalOverride = await call('directEditOfficialScore', {
+      ...postFinalRequest, reason: '대회 본부 결정: 기록 오기 정정', allowPostFinalCorrection: true,
+    });
+    const postFinalCorrected = await f.seed((db) => getDoc(doc(db, path('prelimMatches', postFinalMatch.id))));
+    assert.equal(postFinalCorrected.data().officialRevision, 2, 'post-final-override-corrects-the-score');
+    const postFinalRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    const postFinalProof = postFinalRoot.data().finalQualification.men;
+    assert.equal(postFinalProof.status, 'current', 'post-final-override-keeps-proof-current');
+    assert.equal(postFinalProof.reason, 'prelim_corrected_after_finals', 'post-final-override-records-reason-marker');
+    assert.deepEqual(postFinalProof.participantIds, [...postFinalIds].sort(), 'post-final-override-keeps-finalists');
+    assert.deepEqual(postFinalProof.tieSelections, postFinalRootBefore.data().finalQualification.men.tieSelections,
+      'post-final-override-keeps-tie-selections');
+    assert.deepEqual(postFinalProof.postFinalCorrection.groupIds, ['post-final-g1'], 'post-final-override-marks-division-group');
+    const postFinalAudit = await f.seed((db) => getDoc(doc(db, path('auditEvents', postFinalOverride.transitionId))));
+    assert.equal(postFinalAudit.data().reason, '대회 본부 결정: 기록 오기 정정', 'post-final-override-reason-is-audited');
+    assert.equal(postFinalAudit.data().after.qualification.postFinalCorrection, true, 'post-final-override-audit-marker');
+    for (const id of postFinalStructure.map((match) => match.id)) {
+      assert.equal((await f.seed((db) => getDoc(
+        doc(db, 'tournaments/main/divisions/men/finalMatches', id),
+      ))).exists(), true, 'post-final-override-keeps-final-bracket');
+    }
+    // 정정 뒤에도 본선 기록관은 막히지 않는다 (qualification_unverified 아님).
+    const postFinalQueue = await f.seed((db) => getDoc(doc(db, path('courtQueues', postFinalContinuation.courtId))));
+    const postFinalClaim = await call('claimRecorderDraft', {
+      tournamentId: 'main',
+      matchKey: postFinalContinuation.finalKey,
+      courtId: postFinalContinuation.courtId,
+      recorderName: 'Qualification Recorder',
+      sessionId: 'post-final-recorder-session',
+      queueRevision: postFinalQueue.data().queueRevision,
+    });
+    assert.equal(postFinalClaim.sessionId, 'post-final-recorder-session', 'final-scoring-stays-available-after-post-final-override');
+    // 같은 대진 재공개도 새 순위가 아닌 기록된 진출팀 기준으로 허용된다.
+    const postFinalRepublished = await publishQualification({
+      expectedMatches: finalStructureBaseline(postFinalPlayed.matches),
+      matches: postFinalStructure,
+    });
+    assert.equal(postFinalRepublished.matches.length, postFinalStructure.length, 'post-final-republication-keeps-bracket');
+    const postFinalRepublishedRoot = await f.seed((db) => getDoc(doc(db, 'tournaments/main')));
+    assert.deepEqual(postFinalRepublishedRoot.data().finalQualification.men.participantIds, [...postFinalIds].sort(),
+      'post-final-republication-keeps-finalists');
+    assert.equal(postFinalRepublishedRoot.data().finalQualification.men.status, 'current', 'post-final-republication-stays-current');
+    await cleanupScenario(postFinal);
+
     const playedNoProof = await seedQualificationScenario({
       prefix: 'played-without-proof',
       groupSpecs: [{ name: 'g1', teams: ['a', 'b', 'c'] }],

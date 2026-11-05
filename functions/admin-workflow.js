@@ -469,23 +469,27 @@ function finalQualificationStatus(context) {
     : context.finalQualification?.status === 'stale' ? 'stale' : 'unverified';
 }
 
-function assertFinalQualificationCurrent(context) {
+export function assertFinalQualificationCurrent(context) {
   if (finalQualificationStatus(context) !== 'current'
       || typeof context.finalQualification?.fingerprint !== 'string'
       || context.finalQualification.fingerprint !== context.fingerprint
       || !Array.isArray(context.finalQualification?.participantIds)) {
     callableError('qualification_unverified');
   }
-  const selection = validateQualificationSelection(
-    context.state,
-    context.finalQualification.participantIds,
-    context.finalQualification.tieSelections || {},
-  );
-  if (!selection.ok) callableError('qualification_unverified');
+  // 본선 시작 후 정정(비상용)으로 기록된 진출팀은 새 순위와 달라도 그대로 인정한다.
+  // 결승 진출팀 집합이 대진표와 정확히 같은지는 아래에서 계속 확인한다.
+  if (!context.finalQualification.postFinalCorrection) {
+    const selection = validateQualificationSelection(
+      context.state,
+      context.finalQualification.participantIds,
+      context.finalQualification.tieSelections || {},
+    );
+    if (!selection.ok) callableError('qualification_unverified');
+  }
   assertExactFinalParticipants(context.finalsSnap, context.finalQualification.participantIds);
 }
 
-function planQualificationChange(context, proposedSnapshot, tieSelections = null) {
+export function planQualificationChange(context, proposedSnapshot, tieSelections = null, correction = null) {
   if (!context.finalQualification && context.finalsSnap.empty) return null;
   const played = hasRealFinalPlay(context.finals, context.assignments, context.workflows, context.division);
   let metadata = context.finalQualification;
@@ -506,8 +510,32 @@ function planQualificationChange(context, proposedSnapshot, tieSelections = null
       metadata.participantIds,
       selections,
     );
-    if (!selection.ok) bad('Preliminary correction would invalidate played finalists.');
+    if (!selection.ok && !correction?.allowPostFinalCorrection) {
+      callableError('prelim_correction_after_finals');
+    }
     assertExactFinalParticipants(context.finalsSnap, metadata.participantIds);
+    if (!selection.ok) {
+      // 대회 본부가 정정하기로 한 경우: 점수만 바로잡고 진출팀·추첨 기록·본선 대진은 그대로 둔다.
+      const priorGroupIds = Array.isArray(metadata.postFinalCorrection?.groupIds)
+        ? metadata.postFinalCorrection.groupIds : [];
+      return {
+        metadata: {
+          ...metadata,
+          status: 'current',
+          fingerprint: qualificationFingerprint(proposedSnapshot),
+          participantIds: [...metadata.participantIds].sort(),
+          tieSelections: metadata.tieSelections || {},
+          reason: 'prelim_corrected_after_finals',
+          postFinalCorrection: {
+            at: Date.now(),
+            count: (Number(metadata.postFinalCorrection?.count) || 0) + 1,
+            groupIds: [...new Set([...priorGroupIds, correction.groupId].filter(Boolean))].sort(),
+          },
+        },
+        fingerprint: qualificationFingerprint(proposedSnapshot),
+        state: proposedState,
+      };
+    }
     return {
       metadata: {
         ...metadata,
@@ -545,7 +573,7 @@ function qualificationContextProof(context) {
   };
 }
 
-function planPrelimQualificationChange(context, assignment, official, evaluated, revision, transition) {
+export function planPrelimQualificationChange(context, assignment, official, evaluated, revision, transition, correction = {}) {
   if (assignment.matchType !== 'prelim') return null;
   const current = context.prelims.get(assignment.matchId || assignment.matchKey) || official;
   const proposedMatches = context.snapshot.matches.map((match) => (
@@ -564,7 +592,10 @@ function planPrelimQualificationChange(context, assignment, official, evaluated,
       } : match
   ));
   const proposedSnapshot = { ...context.snapshot, matches: proposedMatches };
-  return planQualificationChange(context, proposedSnapshot);
+  return planQualificationChange(context, proposedSnapshot, null, {
+    allowPostFinalCorrection: correction.allowPostFinalCorrection === true,
+    groupId: current.groupId,
+  });
 }
 
 function unresolvedOfficial(assignment, official) {
@@ -1663,17 +1694,23 @@ export async function publishFinalStructure(request) {
       bad('replace_unplayed requires an existing stale pre-play publication.');
     }
     const proposedParticipantIds = finalEntrantIdsFromRecords(matches);
-    const qualificationSelection = qualificationSelectionErrors(
-      qualificationContext.state,
-      proposedParticipantIds,
-      tieSelections,
-    );
+    // 본선 시작 후 정정된 부문은 새 순위가 아니라 기록된 진출팀 집합(변경 불가)을 기준으로 한다.
+    const postFinalCorrection = Boolean(qualificationContext.finalQualification?.postFinalCorrection)
+      && publicationHasRealFinalPlay
+      && !replacement;
+    const qualificationSelection = postFinalCorrection
+      ? { ok: true }
+      : qualificationSelectionErrors(
+        qualificationContext.state,
+        proposedParticipantIds,
+        tieSelections,
+      );
     const canonicalParticipantIds = qualificationSelection.ok
       ? [...new Set(proposedParticipantIds)].sort() : [];
     // 부전승 추첨 기록은 선택 사항이지만, 보냈다면 서버가 예선 순위에서 후보·자리 수를 다시
     // 계산하고 실제 대진표의 부전승 자리가 기록과 일치하는지 확인한 뒤에만 저장한다.
     let canonicalByeSelection = null;
-    if (Object.hasOwn(request.data, 'byeSelection')) {
+    if (!postFinalCorrection && Object.hasOwn(request.data, 'byeSelection')) {
       const byeValidation = validateByeSelection(
         qualificationContext.state,
         canonicalParticipantIds,
@@ -2089,7 +2126,13 @@ export async function publishFinalStructure(request) {
     }
     const topologyChanged = obsolete.length > 0 || [...desiredKeys].some((key) => !assignments.has(key));
     const topologyRevision = (tournamentSnap.data()?.courtTopologyRevision || 0) + (topologyChanged ? 1 : 0);
-    const finalQualification = {
+    const finalQualification = postFinalCorrection ? {
+      ...qualificationContext.finalQualification,
+      status: 'current',
+      fingerprint: qualificationContext.fingerprint,
+      participantIds: canonicalParticipantIds,
+      reason: 'prelim_corrected_after_finals',
+    } : {
       status: 'current',
       fingerprint: qualificationContext.fingerprint,
       participantIds: canonicalParticipantIds,
@@ -3057,7 +3100,13 @@ async function approve(request, direct = false) {
   const uid = await admin(request, request.data);
   const {
     matchKey, score, reason, expectedSubmissionVersion, expectedOfficialRevision, expectedQueueRevision,
+    allowPostFinalCorrection,
   } = request.data;
+  if (allowPostFinalCorrection !== undefined
+      && (typeof allowPostFinalCorrection !== 'boolean'
+        || (allowPostFinalCorrection && (!direct || typeof reason !== 'string' || !reason.trim())))) {
+    throw new HttpsError('invalid-argument', 'A post-final correction requires a direct edit with a reason.');
+  }
   if (!matchKey) throw new HttpsError('invalid-argument', 'matchKey required.');
   return db().runTransaction(async (tx) => {
     await assertTournamentWritable(tx);
@@ -3141,7 +3190,9 @@ async function approve(request, direct = false) {
     const revision = (workflow.officialRevision || 0) + 1;
     const id = transitionId(matchKey, direct ? 'admin_direct_edit' : 'review_approved', revision);
     const qualificationPlan = qualificationContext
-      ? planPrelimQualificationChange(qualificationContext, assignment, officialMatch, evaluated, revision, id)
+      ? planPrelimQualificationChange(qualificationContext, assignment, officialMatch, evaluated, revision, id, {
+        allowPostFinalCorrection: allowPostFinalCorrection === true,
+      })
       : null;
     const official = {
       ...evaluated,
@@ -3266,6 +3317,7 @@ async function approve(request, direct = false) {
       qualification: qualificationPlan ? {
         before: qualificationContext.finalQualification,
         after: qualificationPlan.metadata,
+        postFinalCorrection: qualificationPlan.metadata?.reason === 'prelim_corrected_after_finals',
       } : null,
     }, direct ? reason.trim() : 'review_approved');
     return { transitionId: id, official };
