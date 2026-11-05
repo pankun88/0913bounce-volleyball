@@ -433,12 +433,17 @@ export function parseStoredRecorderDraft(raw) {
   };
 }
 
-export function readStoredRecorderDraft(storage, key) {
+export function readStoredRecorderDraft(storage, key, { expectedMatchKey = null } = {}) {
   if (!key || !storage || typeof storage.getItem !== "function") return { ok: false, reason: "blocked" };
   try {
     const raw = storage.getItem(key);
     if (raw === null) return { ok: true, found: false, value: null };
     const parsed = parseStoredRecorderDraft(raw);
+    // A record stamped with another match is never loaded for this match.
+    if (parsed.ok && expectedMatchKey && parsed.value.identity
+        && parsed.value.identity.matchKey !== expectedMatchKey) {
+      return { ok: false, reason: "match_mismatch", value: parsed.value };
+    }
     return parsed.ok ? { ...parsed, found: true } : parsed;
   } catch {
     return { ok: false, reason: "blocked" };
@@ -455,6 +460,10 @@ export function writeStoredRecorderDraft(storage, key, value) {
       || !Array.isArray(value?.touched) || value.touched.some((item) => typeof item !== "string")
       || !identity) {
     return { ok: false, reason: identity ? "invalid" : "missing_identity" };
+  }
+  // The scores belong to exactly one match; never stamp them with another match's identity.
+  if (value.expectedMatchKey && value.expectedMatchKey !== identity.matchKey) {
+    return { ok: false, reason: "match_mismatch" };
   }
   const serialized = JSON.stringify({
     schemaVersion: RECORDER_DRAFT_SCHEMA_VERSION,

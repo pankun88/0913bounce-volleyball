@@ -31,8 +31,9 @@ let readyContextVersion = 0, courtContextVersion = 0, matchContextVersion = 0, s
 const tabInstanceId = crypto.randomUUID();
 let renderedFormKey = "";
 let activeStorageKey = "";
+let observedDraftState = null;
 const edit = {
-  token: null, serverDraft: null, localDraft: null, dirty: false, touched: new Set(), reviewedPayload: null,
+  token: null, serverDraft: null, localDraft: null, draftMatchKey: null, dirty: false, touched: new Set(), reviewedPayload: null,
   request: "idle", savedRevision: null, inputVersion: 0, pendingSave: null, saveConflict: null,
   pendingSubmit: null, pendingEnd: null, pendingDiscard: null,
 };
@@ -48,10 +49,15 @@ const storageFailureMessages = {
   invalid: "이 기기의 임시 점수를 저장할 수 없습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
   missing_identity: "이 기기의 이전 임시 점수에는 경기 식별 정보가 없어 자동으로 불러오지 않았습니다.",
   preserve_failed: "기존 임시 점수를 보존하지 못했습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
+  match_mismatch: "이 기기에 있던 임시 점수는 다른 경기의 것이라 불러오지 않고 따로 보관했습니다.",
 };
 const ownershipLostMessage = "입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.";
 let ownershipWarning = null;
 let submissionWarning = null;
+// Set once another screen takes this match's input lease. The tab holds nothing and does nothing until reloaded.
+let inertTab = null;
+const inertTabMessage = "다른 화면에서 이 경기를 입력하고 있습니다. 이 탭을 닫으세요.";
+const releasedInputMessage = "관리자가 입력 권한을 해제했습니다. 이 화면에 입력한 점수는 지웠습니다. 다시 입력하려면 ‘경기 입력 시작’을 누르세요.";
 const isFinal = () => ["final", "tournament", "finals"].includes(assignment?.matchType) || ["final", "finals"].includes(assignment?.phase);
 const scoreKey = () => auth.currentUser && matchKey ? `recorder-score:${TOURNAMENT_ID}:${matchKey}:${auth.currentUser.uid}` : "";
 const storageKeyForEdit = () => activeStorageKey || scoreKey();
@@ -91,15 +97,24 @@ function currentFixtureIdentity() {
   return cloneRecorderFixtureIdentity(fixtureIdentity);
 }
 function readStored() {
-  const result = readStoredRecorderDraft(getLocalStorage(), storageKeyForEdit());
-  if (!result.ok) setStorageStatus(result.reason);
+  const key = storageKeyForEdit();
+  const result = readStoredRecorderDraft(getLocalStorage(), key, { expectedMatchKey: matchKey });
+  if (!result.ok) {
+    setStorageStatus(result.reason);
+    if (result.reason === "match_mismatch") {
+      // Keep the foreign record in its recovery slot, then free this match's slot.
+      if (preserveStoredRecorderDraft(getLocalStorage(), key, result.value).ok) clearStoredKey(key);
+    }
+  }
   return result;
 }
 function storeDraft({ identity = currentFixtureIdentity(), storageKey = storageKeyForEdit() } = {}) {
-  if (!edit.localDraft || !storageKey || !identity) return false;
+  if (inertTab || !edit.localDraft || !storageKey || !identity) return false;
+  // Held scores belong to exactly one match; never write them under another match.
+  if (!edit.draftMatchKey || edit.draftMatchKey !== identity.matchKey) return false;
   const result = writeStoredRecorderDraft(getLocalStorage(), storageKey, {
     draft: edit.localDraft, touched: [...edit.touched], revision: edit.savedRevision,
-    identity,
+    identity, expectedMatchKey: edit.draftMatchKey,
   });
   if (result.ok) clearStorageStatus();
   else setStorageStatus(result.reason);
@@ -114,6 +129,15 @@ function clearStoredKey(key, identity = null) {
   if (!result.ok) setStorageStatus(result.reason);
   else if (key === storageKeyForEdit()) clearStorageStatus();
   return result.ok;
+}
+/** Remove the device draft for one match and tell the other tabs on this device to drop theirs. */
+function clearDeviceDraft(key = storageKeyForEdit(), identity = null) {
+  if (!key) return true;
+  const result = removeStoredRecorderDraft(getLocalStorage(), key, identity);
+  if (!result.ok) { setStorageStatus(result.reason); return false; }
+  if (key === storageKeyForEdit()) clearStorageStatus();
+  if (!result.preserved) channel?.postMessage({ type: "draft_cleared", storageKey: key, instance: tabInstanceId });
+  return true;
 }
 function draftTeamPair(identity) {
   return `${identity?.teamAName || "A팀"} vs ${identity?.teamBName || "B팀"}`;
@@ -141,6 +165,7 @@ function restoreStoredAfterClaim(saved, currentIdentity, serverRevision) {
   const currentPair = draftTeamPair(assessment.currentIdentity);
   const useStored = (message) => {
     edit.localDraft = draftCopy(saved.value.draft);
+    edit.draftMatchKey = matchKey;
     edit.touched = new Set(saved.value.touched);
     edit.dirty = true;
     status(message);
@@ -351,7 +376,7 @@ function authActionsReady() {
   return authState?.kind === "ready" && Boolean(uid && readyUid === uid) && navigator.onLine !== false;
 }
 function actionsReady() {
-  return authActionsReady() && authoritativeDataReady();
+  return !inertTab && authActionsReady() && authoritativeDataReady();
 }
 function setSnapshotState(key, metadata) {
   setDataState(key, metadata?.fromCache ? "loading" : "ready");
@@ -456,6 +481,7 @@ function resetMatchEditor({ preservePendingSubmit = false } = {}) {
   edit.token = null;
   edit.serverDraft = null;
   edit.localDraft = null;
+  edit.draftMatchKey = null;
   edit.dirty = false;
   edit.touched.clear();
   edit.reviewedPayload = reviewedPayload;
@@ -467,7 +493,53 @@ function resetMatchEditor({ preservePendingSubmit = false } = {}) {
   if (!reviewedPayload) clearConfirmation();
   if (ui.scoreFields && ui.scoreLegend) ui.scoreFields.replaceChildren(ui.scoreLegend);
 }
+/**
+ * Held scores are saved only under the match they were typed for, then the
+ * editor is emptied so they can never follow the screen to another match.
+ */
+function releaseHeldScores() {
+  if (!inertTab && edit.dirty && edit.localDraft && edit.draftMatchKey && edit.draftMatchKey === matchKey) storeDraft();
+  const keepPending = Boolean(edit.pendingSubmit && edit.pendingSubmit.matchKey === matchKey);
+  resetMatchEditor({ preservePendingSubmit: keepPending });
+  edit.savedRevision = null;
+  edit.pendingSave = null;
+}
+/**
+ * Another screen took the lease ("taken") or the administrator released it
+ * ("released"). Inputs are cleared at once; a taken tab becomes inert until reload.
+ */
+function loseLease(kind) {
+  const lostKey = matchKey;
+  const storageKey = storageKeyForEdit();
+  const identity = currentFixtureIdentity();
+  stopHeartbeat();
+  edit.token = null;
+  edit.pendingSave = null;
+  edit.saveConflict = null;
+  ownershipWarning = null;
+  if (kind === "released") {
+    if (storageKey) clearDeviceDraft(storageKey, identity);
+    resetMatchEditor({ preservePendingSubmit: true });
+    edit.savedRevision = null;
+    clearConfirmation();
+    edit.reviewedPayload = null;
+    status(releasedInputMessage);
+    render();
+    return;
+  }
+  inertTab = { matchKey: lostKey, message: inertTabMessage };
+  resetMatchEditor();
+  edit.pendingEnd = null;
+  edit.pendingDiscard = null;
+  edit.savedRevision = null;
+  stopAll();
+  clearConfirmation();
+  status(inertTabMessage);
+  action("");
+  render();
+}
 function clearCurrentMatch() {
+  releaseHeldScores();
   matchContextVersion += 1;
   matchStops.forEach((fn) => fn());
   matchStops = [];
@@ -532,11 +604,12 @@ function renderForm() {
     ui.scoreForm.hidden = false;
     return;
   }
+  const formMatchKey = matchKey;
   const previous = edit.localDraft || edit.serverDraft || { sets: [] }; const targets = isFinal() ? [10,10,7] : [10,10];
   ui.scoreLegend.textContent = `${name("a")} vs ${name("b")} 점수`; ui.scoreFields.replaceChildren(ui.scoreLegend);
   targets.forEach((target, i) => {
     const row = document.createElement("div"); row.className = "score-row"; const label = document.createElement("label"); label.textContent = `${i + 1}세트 · ${target}점`;
-    const input = (side) => { const node = document.createElement("input"); node.type = "number"; node.inputMode = "numeric"; node.min = "0"; node.max = "15"; node.value = previous.sets[i]?.[side] ?? ""; node.setAttribute("aria-label", `${i + 1}세트 ${name(side)} 점수`); node.addEventListener("input", () => { edit.inputVersion += 1; edit.dirty = true; edit.touched.add(`${i}-${side}`); edit.localDraft = { sets: formScore().sets.map((set) => ({ a: set.a, b: set.b })) }; edit.reviewedPayload = null; clearConfirmation(); const stored = storeDraft(); action(stored ? "미저장" : "미저장 · 이 화면의 점수를 별도로 기록하세요."); updateThird(); }); return node; };
+    const input = (side) => { const node = document.createElement("input"); node.type = "number"; node.inputMode = "numeric"; node.min = "0"; node.max = "15"; node.value = previous.sets[i]?.[side] ?? ""; node.setAttribute("aria-label", `${i + 1}세트 ${name(side)} 점수`); node.addEventListener("input", () => { if (inertTab || formMatchKey !== matchKey) { node.value = ""; return; } edit.draftMatchKey = formMatchKey; edit.inputVersion += 1; edit.dirty = true; edit.touched.add(`${i}-${side}`); edit.localDraft = { sets: formScore().sets.map((set) => ({ a: set.a, b: set.b })) }; edit.reviewedPayload = null; clearConfirmation(); const stored = storeDraft(); action(stored ? "미저장" : "미저장 · 이 화면의 점수를 별도로 기록하세요."); updateThird(); }); return node; };
     const a = input("a"), b = input("b"), left = document.createElement("div"), right = document.createElement("div"), colon = document.createElement("span"); left.className = right.className = "score-entry"; colon.textContent = ":"; left.append(Object.assign(document.createElement("span"), { textContent: name("a") }), a); right.append(Object.assign(document.createElement("span"), { textContent: name("b") }), b); row.append(label,left,colon,right); ui.scoreFields.append(row);
   });
   const updateThird = () => { if (!isFinal()) return; const inputs = ui.scoreFields.querySelectorAll(".score-row:nth-of-type(3) input"); const first = formScore().sets.slice(0,2).map((set) => ({ a: Number(set.a), b: Number(set.b) })); const enabled = first.every((set) => Number.isFinite(set.a) && Number.isFinite(set.b)) && finalNeedsThirdSet([...first,{a:0,b:0}]); inputs.forEach((input) => { input.disabled = !enabled; if (!enabled) input.value = ""; }); };
@@ -586,13 +659,14 @@ let contextVersion = 0;
 function bumpContext() {
   const hadPendingSave = Boolean(edit.pendingSave);
   const hadBusy = busy;
-  if (edit.pendingSave?.context?.storageKey) {
+  if (!inertTab && edit.pendingSave?.context?.storageKey) {
     const pending = edit.pendingSave;
     const stored = writeStoredRecorderDraft(getLocalStorage(), pending.context.storageKey, {
       draft: pending.draft,
       touched: [...pending.touched],
       revision: pending.expectedRevision,
       identity: pending.fixtureIdentity || pending.context.fixtureIdentity,
+      expectedMatchKey: pending.context.matchKey,
     });
     if (!stored.ok) setStorageStatus(stored.reason);
   }
@@ -671,6 +745,7 @@ function fenceFixtureIdentity(nextIdentity) {
   edit.token = null;
   edit.serverDraft = null;
   edit.localDraft = null;
+  edit.draftMatchKey = null;
   edit.dirty = false;
   edit.touched.clear();
   edit.savedRevision = null;
@@ -754,6 +829,7 @@ function fenceAssignmentContext(key) {
   );
   const lostStorageKey = edit.pendingSave?.context?.storageKey || storageKeyForEdit();
   const pendingSaveDraft = draftCopy(edit.pendingSave?.draft);
+  const lostPendingMatchKey = edit.pendingSave?.context?.matchKey || matchKey;
   const pendingSaveTouched = edit.pendingSave?.touched ? [...edit.pendingSave.touched] : [];
   const pendingSaveRevision = edit.pendingSave?.expectedRevision;
   const hadPendingSave = Boolean(edit.pendingSave);
@@ -762,6 +838,7 @@ function fenceAssignmentContext(key) {
   bumpContext();
   if (pendingSaveDraft && (!edit.localDraft || !hadDirtyDraft)) {
     edit.localDraft = pendingSaveDraft;
+    edit.draftMatchKey = lostPendingMatchKey;
     edit.touched = new Set(pendingSaveTouched);
     edit.savedRevision = Number.isInteger(pendingSaveRevision) ? pendingSaveRevision : edit.savedRevision;
     edit.dirty = true;
@@ -809,17 +886,12 @@ function reconcileWorkflowOwnership(value, metadata, key = matchKey) {
     if (result.status === "expected_release") clearVerifiedOperationWarning(pendingOperationFor(result.operation));
     return result;
   }
-  const lostToken = edit.token;
-  stopHeartbeat();
-  edit.token = null;
-  renderedFormKey = "";
-  if (edit.dirty) {
-    setOwnershipLostWarning(key, lostToken, {
-      identity: currentFixtureIdentity(),
-      storageKey: storageKeyForEdit(),
-    });
-  }
+  loseLease(leaseLossKind(value, edit.token));
   return result;
+}
+// A different lock on the match means another screen took it; no lock means a release (admin force unlock etc.).
+function leaseLossKind(value, token) {
+  return value?.lock && value.lock.token !== token ? "taken" : "released";
 }
 function reconcileFailedOperationOwnership(kind, operation, ambiguous) {
   if (!operation || dataHealth.workflow?.status !== "ready") return;
@@ -872,6 +944,7 @@ function applyWorkflowSnapshot(value, metadata = null) {
       const changedSinceSave = edit.inputVersion !== pendingSave.inputVersion;
       if (!changedSinceSave) {
         edit.localDraft = reconciliation.draft;
+        edit.draftMatchKey = pendingSave.context.matchKey;
         edit.dirty = false;
         edit.touched.clear();
       } else {
@@ -938,6 +1011,19 @@ function render() {
   renderCourtSchedule();
   renderDataState();
   renderSaveRecovery();
+  if (inertTab) {
+    if (ui.connectionStatus.textContent !== inertTab.message) status(inertTab.message);
+    if (ui.rejectionNotice) ui.rejectionNotice.hidden = true;
+    if (ui.lockNotice) { ui.lockNotice.hidden = false; ui.lockNotice.textContent = inertTab.message; }
+    if (ui.claimButton) ui.claimButton.hidden = true;
+    if (ui.scoreForm) ui.scoreForm.hidden = true;
+    if (ui.discardPanel) ui.discardPanel.hidden = true;
+    applyActionGate();
+    // Nothing is loading or retryable on a tab that is closed for input.
+    if (ui.dataStatus) ui.dataStatus.hidden = true;
+    if (ui.retryDataButton) ui.retryDataButton.hidden = true;
+    return;
+  }
   if (viewState !== "operations" || !matchKey) {
     if (viewState === "operations" && !matchKey && ui.matchSummary) {
       ui.matchSummary.textContent = recorderWaitingMessage("no_current", { schedule: currentCourtSchedule() });
@@ -984,12 +1070,27 @@ function render() {
   applyActionGate();
   fenceAmbiguousOperation();
 }
+// Submit, approval and rejection end the typed attempt; the device copy must not outlive it.
+function reconcileFinishedMatch(value, metadata, key) {
+  if (metadata?.fromCache === true || !value) return;
+  const previous = observedDraftState;
+  observedDraftState = value.draftState;
+  if (previous === value.draftState || !["submitted", "approved", "rejected"].includes(value.draftState)) return;
+  if (edit.token || edit.pendingSubmit?.matchKey === key) return;
+  clearDeviceDraft(scoreKey());
+  if (!inertTab && (edit.dirty || edit.localDraft)) {
+    resetMatchEditor({ preservePendingSubmit: true });
+    edit.savedRevision = null;
+  }
+}
 function attachMatch(key) {
   const localMatchVersion = ++matchContextVersion;
   if (key !== matchKey) {
     const submittedMatch = edit.pendingSubmit?.matchKey === matchKey;
     if (submittedMatch) resetMatchEditor({ preservePendingSubmit: true });
     bumpContext();
+    releaseHeldScores();
+    observedDraftState = null;
     activeStorageKey = "";
     fixtureIdentity = null;
   }
@@ -1021,9 +1122,10 @@ function attachMatch(key) {
     setSnapshotState("workflow", metadata);
     workflow = value;
     reconcileWorkflowOwnership(value, metadata, key);
+    reconcileFinishedMatch(value, metadata, key);
     const { remote, remoteRevision } = applyWorkflowSnapshot(value, metadata);
     if (!edit.dirty && !edit.pendingSave && remote && remoteRevision !== null && remoteRevision !== edit.savedRevision) {
-      edit.serverDraft = remote; edit.localDraft = remote; edit.savedRevision = remoteRevision;
+      edit.serverDraft = remote; edit.localDraft = remote; edit.draftMatchKey = key; edit.savedRevision = remoteRevision;
     }
     render();
   }, (error) => {
@@ -1174,6 +1276,7 @@ function attachCourt(value) {
   matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {};
   matchContextVersion += 1;
   bumpContext();
+  releaseHeldScores();
   activeStorageKey = "";
   fixtureIdentity = null;
   courtId = value || "";
@@ -1260,7 +1363,11 @@ function beginHeartbeat() {
       if (epoch !== heartbeatEpoch || !contextIsCurrent(context) || edit.token !== token) return;
       if ([edit.pendingSubmit, edit.pendingEnd, edit.pendingDiscard]
         .some((operation) => operation?.matchKey === context.matchKey && operation?.token === token)) return;
-      if (["ownership_lost", "lease_expired"].includes(reasonCode(error))) {
+      if (reasonCode(error) === "ownership_lost") {
+        loseLease(leaseLossKind(workflow, token));
+        return;
+      }
+      if (reasonCode(error) === "lease_expired") {
         edit.token = null;
         renderedFormKey = "";
         if (edit.dirty) {
@@ -1276,7 +1383,7 @@ function beginHeartbeat() {
   });
 }
 function channelMessage(message) {
-  if (message.instance === tabInstanceId) return;
+  if (message.instance === tabInstanceId || inertTab) return;
   if (message.type === "probe" && message.session === recorderSessionId()) {
     channel?.postMessage({ type: "collision", target: message.instance, instance: tabInstanceId });
     return;
@@ -1288,6 +1395,14 @@ function channelMessage(message) {
   }
   if (message.type === "claimed" && message.matchKey === matchKey && message.session !== recorderSessionId()) {
     status("다른 탭에서도 이 경기 입력을 열었습니다. 저장 전 초안을 확인하세요.");
+  }
+  if (message.type === "draft_cleared" && !inertTab && !edit.token && message.storageKey === storageKeyForEdit()) {
+    // Another tab finished this match (submit/approve/reject/discard/force unlock): drop what this tab holds.
+    if (edit.dirty || edit.localDraft) {
+      resetMatchEditor({ preservePendingSubmit: true });
+      edit.savedRevision = null;
+      render();
+    }
   }
 }
 watchRecorderAuthState((state) => {
@@ -1405,6 +1520,7 @@ ui.recorderSelect.onchange=()=>{
   render();
 };
 if (ui.enterCourtButton) ui.enterCourtButton.onclick=()=>{
+  if (inertTab) return;
   if (selectorLocked()) {
     renderCourtSelectors();
     return;
@@ -1421,6 +1537,7 @@ if (ui.enterCourtButton) ui.enterCourtButton.onclick=()=>{
   focus(ui.courtScheduleHeading || ui.workflowTitle);
 };
 if (ui.changeCourtButton) ui.changeCourtButton.onclick=()=>{
+  if (inertTab) return;
   const blocked = busy || Boolean(edit.token || edit.pendingSubmit || edit.pendingSave || edit.pendingEnd || edit.pendingDiscard || edit.dirty);
   if (blocked) {
     action("현재 경기 입력을 먼저 제출하거나 입력 종료/초안 폐기까지 마친 뒤 코트를 변경하세요. 저장하지 않은 점수는 버리지 않습니다.");
@@ -1433,7 +1550,7 @@ if (ui.changeCourtButton) ui.changeCourtButton.onclick=()=>{
   focus(ui.courtSelect);
 };
 async function persistDraft(score, context = captureContext()) {
-  if (!score || !contextIsCurrent(context) || !actionsReady() || !edit.token) return false;
+  if (inertTab || !score || !contextIsCurrent(context) || !actionsReady() || !edit.token) return false;
   const attemptedDraft = draftCopy(score);
   if (!attemptedDraft) return false;
   const pending = {
@@ -1466,6 +1583,7 @@ async function persistDraft(score, context = captureContext()) {
     const changedSinceSave = edit.inputVersion !== pending.inputVersion;
     if (!changedSinceSave) {
       edit.localDraft = attemptedDraft;
+      edit.draftMatchKey = context.matchKey;
       edit.dirty = false;
       edit.touched.clear();
       const cleared = clearStored();
@@ -1498,11 +1616,12 @@ async function persistDraft(score, context = captureContext()) {
     const changedSinceSave = edit.inputVersion !== pending.inputVersion;
     const localDraft = changedSinceSave ? draftCopy(edit.localDraft) : attemptedDraft;
     const touched = changedSinceSave ? [...edit.touched] : [...pending.touched];
-    const stored = writeStoredRecorderDraft(getLocalStorage(), context.storageKey, {
+    const stored = inertTab ? { ok: false, reason: "blocked" } : writeStoredRecorderDraft(getLocalStorage(), context.storageKey, {
       draft: localDraft,
       touched,
       revision: pending.expectedRevision,
       identity: context.fixtureIdentity,
+      expectedMatchKey: context.matchKey,
     });
     if (!stored.ok) setStorageStatus(stored.reason);
     else clearStorageStatus();
@@ -1544,6 +1663,7 @@ ui.claimButton.onclick=async()=>{
     action("현재 경기의 공식 식별 정보를 확인한 뒤 다시 시도하세요.");
     return;
   }
+  const afterReject = workflow?.draftState === "rejected";
   setBusy(true);
   try {
     const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft;
@@ -1560,6 +1680,7 @@ ui.claimButton.onclick=async()=>{
     edit.token=result.token;
     edit.serverDraft=draftCopy(result.draft);
     edit.localDraft=edit.serverDraft;
+    edit.draftMatchKey=matchKey;
     edit.savedRevision=result.draftRevision;
     edit.pendingSave=null;
     edit.saveConflict=null;
@@ -1567,8 +1688,13 @@ ui.claimButton.onclick=async()=>{
     edit.dirty=false;
     fixtureIdentity = cloneRecorderFixtureIdentity(context.fixtureIdentity);
     activeStorageKey = scoreKey();
-    const saved=readStored();
-    restoreStoredAfterClaim(saved, fixtureIdentity, result.draftRevision);
+    if (afterReject) {
+      // Re-entry after a rejection starts from the last submitted score; no device draft is applied.
+      clearDeviceDraft(activeStorageKey);
+    } else {
+      const saved=readStored();
+      restoreStoredAfterClaim(saved, fixtureIdentity, result.draftRevision);
+    }
     channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId});
     beginHeartbeat(); renderedFormKey=""; render(); navigateToWorkflowEntry(context, edit.token);
   } catch(error) {
@@ -1600,6 +1726,7 @@ ui.keepLocalButton.onclick=async()=>{
   edit.savedRevision = resolution.expectedRevision;
   edit.serverDraft = draftCopy(edit.saveConflict.remoteDraft);
   edit.localDraft = draftCopy(resolution.draft);
+  edit.draftMatchKey = matchKey;
   edit.dirty = true;
   edit.pendingSave = null;
   edit.saveConflict = null;
@@ -1613,6 +1740,7 @@ ui.useServerButton.onclick=()=>{
   if (resolution.status !== "use_remote") return;
   edit.serverDraft = resolution.draft;
   edit.localDraft = resolution.draft;
+  edit.draftMatchKey = matchKey;
   edit.savedRevision = resolution.revision;
   edit.dirty = false;
   edit.inputVersion += 1;
@@ -1626,7 +1754,7 @@ ui.useServerButton.onclick=()=>{
   focus(ui.scoreFields.querySelector("input"));
 };
 ui.retryDataButton.onclick=()=>{
-  if (busy || !readyUid) return;
+  if (inertTab || busy || !readyUid) return;
   subscribeReadyCollections();
   if (courtId && viewState === "operations") {
     courtContextVersion += 1;
@@ -1719,7 +1847,7 @@ ui.submitButton.onclick=async()=>{
       }
       return;
     }
-    const cleared = clearStoredKey(completion.clearStorageKey, pending.fixtureIdentity);
+    const cleared = clearDeviceDraft(completion.clearStorageKey, pending.fixtureIdentity);
     if (completion.resetCurrent) {
       resetMatchEditor();
       ui.scoreError.textContent = "";
@@ -1850,7 +1978,7 @@ ui.confirmDiscardButton.onclick=async()=>{
     clearVerifiedOperationWarning(pending);
     const keepOwnershipWarning = preserveOwnershipWarning(pending);
     edit.pendingDiscard = null;
-    const cleared = clearStored();
+    const cleared = clearDeviceDraft();
     edit.token = null;
     edit.dirty = false;
     edit.reviewedPayload = null;

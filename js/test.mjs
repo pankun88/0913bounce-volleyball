@@ -3328,6 +3328,7 @@ function createAdminProjectionHarness() {
   const bridge = `
     const originalRenderCourtBoard = renderCourtBoard;
     const originalRenderCourtSettings = renderCourtSettings;
+    const originalRenderScoreReviews = renderScoreReviews;
     renderGroupList = () => {};
     renderTeamGroupSelect = () => {};
     renderGroupTeamLists = () => {};
@@ -3712,6 +3713,31 @@ function createAdminProjectionHarness() {
         });
       },
       toggleEmergency(button, panel) { toggleEmergencyFeatures(button, panel); },
+      // 제출된 점수 하나가 검수 카드에 올라온 상태로 실제 renderScoreReviews를 돌린다.
+      reviewCardButtons() {
+        const savedRender = renderScoreReviews;
+        const savedCorrectionCards = renderCorrectionMatchCards;
+        renderScoreReviews = originalRenderScoreReviews;
+        renderCorrectionMatchCards = () => {};
+        try {
+          allTeams = [{ id: "a", name: "A팀" }, { id: "b", name: "B팀" }];
+          allGroups = [];
+          allPrelimMatches = [{ id: "m-rev", division: "men", teamA: "a", teamB: "b", sets: [] }];
+          reviewAssignments = [{ id: "m-rev", matchKey: "m-rev", matchId: "m-rev", matchType: "prelim", publicStatus: "under_review", courtId: null }];
+          reviewWorkflows = new Map([["m-rev", {
+            draftState: "submitted", submissionVersion: 1, lock: null,
+            submittedSnapshot: { sets: [{ a: 10, b: 4 }, { a: 10, b: 5 }] },
+          }]]);
+          reviewQueues = new Map();
+          reviewCourts = new Map();
+          reviewAudits = new Map();
+          originalRenderScoreReviews();
+          return [...document.getElementById("scoreReviewList").querySelectorAll("button")].map((button) => button.textContent);
+        } finally {
+          renderScoreReviews = savedRender;
+          renderCorrectionMatchCards = savedCorrectionCards;
+        }
+      },
     };
     globalThis.__adminGrantTest = {
       setCallable(fn) {
@@ -4279,6 +4305,27 @@ check(
   ui.reason.toggleEmergency(toggle, panel);
   check('emergency toggle hides it again and collapses it',
     panel.hidden === true && panel.open === false && toggle.attrs["aria-expanded"] === "false");
+
+  // 반려는 비상용: 평소 검수 카드에는 승인만, 비상용 기능을 연 동안에만 반려가 보인다.
+  {
+    const adminSourceText = fs.readFileSync(new URL('./admin.js', import.meta.url), 'utf8');
+    const helpText = adminHtml.match(/aria-label="제출 결과 검수 설명" data-help="([^"]*)"/)?.[1] || '';
+    check('review card help text no longer advertises 반려 as a normal action', !/승인·반려/.test(helpText) && /점수 수정/.test(helpText));
+    check('emergency area is described as including 반려', /제출 점수 반려/.test(adminHtml));
+    check('submitted-review guard message points to 점수 수정 instead of 반려', !/승인하거나 반려하여/.test(adminSourceText));
+    const reviewUi = createAdminProjectionHarness();
+    const closedPanel = { hidden: true, open: false };
+    const closedToggle = { textContent: "비상용 기능 보기", setAttribute() {} };
+    const labels = () => reviewUi.reason.reviewCardButtons();
+    const byDefault = labels();
+    check('review card shows 승인 and hides 반려 by default', byDefault.includes("승인") && !byDefault.includes("반려"));
+    reviewUi.reason.toggleEmergency(closedToggle, closedPanel);
+    const whileOpen = labels();
+    check('opening 비상용 기능 shows 반려 on the review card beside 승인', whileOpen.includes("승인") && whileOpen.includes("반려"));
+    reviewUi.reason.toggleEmergency(closedToggle, closedPanel);
+    const afterClose = labels();
+    check('closing 비상용 기능 hides 반려 again', afterClose.includes("승인") && !afterClose.includes("반려"));
+  }
 
   const findModalParts = () => {
     const root = ui.modalRoot();

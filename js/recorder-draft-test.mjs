@@ -304,14 +304,14 @@ function submitRaceHarness() {
   ui.authPanel.hidden = true;
   ui.successPanel.hidden = true;
   const edit = {
-    token: "M1-token", localDraft: score, serverDraft: score, dirty: true, touched: new Set(["0-a"]),
+    token: "M1-token", localDraft: score, draftMatchKey: "M1", serverDraft: score, dirty: true, touched: new Set(["0-a"]),
     savedRevision: 0,
     reviewedPayload: score, pendingSubmit: null, pendingSave: null, pendingEnd: null, pendingDiscard: null,
   };
   const requests = [], warnings = [], actions = [], attachments = [];
   let queueListener;
   const context = {
-    ui, edit, busy: false, viewState: "operations", courtId: "court-a", matchKey: "M1",
+    ui, edit, inertTab: null, channel: null, busy: false, viewState: "operations", courtId: "court-a", matchKey: "M1",
     courtContextVersion: 1, contextVersion: 0, fixtureIdentity: identities.get("M1"),
     workflow: { submissionVersion: 0 }, assignment: { id: "M1" },
     dataHealth: { queue: { status: "ready" } },
@@ -349,7 +349,7 @@ function submitRaceHarness() {
   };
   vm.createContext(context);
   const names = ["currentFixtureIdentity", "operationContextIsCurrent", "syncScreenVisibility",
-    "resetMatchEditor", "clearStoredKey", "storeDraft", "fenceAmbiguousOperation", "followCourtQueue", "subscribeCourtStreams",
+    "resetMatchEditor", "clearStoredKey", "clearDeviceDraft", "storeDraft", "fenceAmbiguousOperation", "followCourtQueue", "subscribeCourtStreams",
     "showSubmissionWarning", "clearSubmissionWarning"];
   const start = recorderSource.indexOf("ui.submitButton.onclick=async()=>{");
   const end = recorderSource.indexOf("\nui.endButton.onclick", start);
@@ -504,6 +504,130 @@ for (const regenerateSameKey of [false, true]) {
   assert.equal(h.ui.successPanel.hidden, false);
   assert.match(h.ui.successTitle.textContent, /M1 A팀 vs M1 B팀/, "the receipt identifies the submitted match");
   assert.deepEqual(h.warnings, [], "successful stale responses are not reported as submission errors");
+}
+
+
+// ---- 탭 안전(1108): 다른 경기 번호의 기기 초안은 읽지도 쓰지도 않는다 ----
+{
+  const store = storage();
+  const m1 = { ...current, matchKey: "M1" };
+  const m2 = { ...current, matchKey: "M2" };
+  assert.equal(writeStoredRecorderDraft(store, "k", { draft, touched: [], revision: 0, identity: m1, expectedMatchKey: "M2" }).reason,
+    "match_mismatch", "a draft is never stamped with a match other than the one it was typed for");
+  assert.equal(store.getItem("k"), null);
+  assert.equal(writeStoredRecorderDraft(store, "k", { draft, touched: [], revision: 0, identity: m1, expectedMatchKey: "M1" }).ok, true);
+  const refused = readStoredRecorderDraft(store, "k", { expectedMatchKey: "M2" });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, "match_mismatch", "a draft recorded for M1 is refused when M2 is opened");
+  assert.equal(readStoredRecorderDraft(store, "k", { expectedMatchKey: "M1" }).found, true);
+  assert.equal(readStoredRecorderDraft(store, "k").found, true, "callers that pass no expected match keep the old behaviour");
+  void m2;
+}
+
+function tabSafetyHarness({ matchKey = "M1" } = {}) {
+  const local = storage();
+  const messages = [], statuses = [];
+  const ids = new Map(["M1", "M2"].map((key) => [key, { ...current, matchKey: key }]));
+  const ui = Object.fromEntries(["scoreFields", "scoreLegend", "scoreForm", "lockNotice", "claimButton", "rejectionNotice",
+    "discardPanel", "connectionStatus", "actionStatus"].map((id) => [id, { hidden: false, disabled: false, textContent: "", replaceChildren() {} }]));
+  const edit = {
+    token: "tok", serverDraft: null, localDraft: null, draftMatchKey: null, dirty: false, touched: new Set(),
+    reviewedPayload: null, savedRevision: 3, pendingSave: null, saveConflict: null, pendingSubmit: null, pendingEnd: null, pendingDiscard: null,
+  };
+  const context = {
+    ui, edit, matchKey, inertTab: null, ownershipWarning: "x", renderedFormKey: "k", activeStorageKey: "",
+    fixtureIdentity: ids.get(matchKey), channel: { postMessage: (m) => messages.push(m) }, tabInstanceId: "tab-a",
+    inertTabMessage: "다른 화면에서 이 경기를 입력하고 있습니다. 이 탭을 닫으세요.",
+    releasedInputMessage: "released", stopped: 0, heartbeatStopped: 0,
+    getLocalStorage: () => local, storageKeyForEdit: () => `score:${context.matchKey}`,
+    cloneRecorderFixtureIdentity, writeStoredRecorderDraft, removeStoredRecorderDraft,
+    setStorageStatus() {}, clearStorageStatus() {},
+    clearStoredKey: (key, identity) => removeStoredRecorderDraft(local, key, identity).ok,
+    clearConfirmation() {}, render() {}, status: (m) => statuses.push(m), action() {},
+    stopHeartbeat() { context.heartbeatStopped += 1; }, stopAll() { context.stopped += 1; },
+    stopScheduleStreams() {}, setDataState() {}, matchStops: [], officialStop() {}, matchContextVersion: 0,
+    recorderWaitingMessage: () => "", currentCourtSchedule: () => [], assignment: null, workflow: null, official: null,
+  };
+  vm.createContext(context);
+  const names = ["currentFixtureIdentity", "storeDraft", "clearDeviceDraft", "resetMatchEditor", "releaseHeldScores", "loseLease"];
+  vm.runInContext(names.map(recorderFunction).join("\n"), context);
+  const type = (key, draft) => {
+    edit.localDraft = draft; edit.draftMatchKey = key; edit.dirty = true; edit.touched = new Set(["0-a"]);
+  };
+  return { context, edit, local, messages, statuses, ids, ui, type };
+}
+
+// Owner scenario: held scores + the match changes under the screen (lease already lost, queue advances).
+{
+  const h = tabSafetyHarness();
+  const held = { sets: [{ a: 10, b: 4 }, { a: 10, b: 5 }] };
+  h.type("M1", held);
+  h.context.matchKey = "M2"; h.context.fixtureIdentity = h.ids.get("M2");
+  assert.equal(h.context.storeDraft(), false, "scores typed for M1 are not written under M2");
+  assert.equal(h.local.getItem("score:M2"), null);
+  h.context.matchKey = "M1"; h.context.fixtureIdentity = h.ids.get("M1");
+  h.context.releaseHeldScores();
+  assert.deepEqual(readStoredRecorderDraft(h.local, "score:M1").value.draft, held, "held scores are kept under their original match");
+  assert.equal(h.edit.localDraft, null);
+  assert.equal(h.edit.dirty, false);
+  assert.equal(h.edit.touched.size, 0);
+  assert.equal(h.edit.token, null);
+  h.context.matchKey = "M2"; h.context.fixtureIdentity = h.ids.get("M2");
+  assert.equal(h.local.getItem("score:M2"), null, "nothing was ever written for M2");
+}
+
+// Tab whose lease was taken by another screen: inputs cleared, notice shown, inert, nothing written.
+{
+  const h = tabSafetyHarness();
+  h.type("M1", { sets: [{ a: 10, b: 4 }, { a: 10, b: 5 }] });
+  h.context.loseLease("taken");
+  assert.equal(h.context.inertTab.matchKey, "M1");
+  assert.equal(h.statuses.at(-1), "다른 화면에서 이 경기를 입력하고 있습니다. 이 탭을 닫으세요.");
+  assert.equal(h.edit.localDraft, null);
+  assert.equal(h.edit.token, null);
+  assert.equal(h.context.stopped, 1, "all subscriptions stop so the tab cannot react to the next match");
+  assert.equal(h.local.getItem("score:M1"), null, "an inert tab writes no device draft");
+  h.type("M1", { sets: [{ a: 1, b: 2 }] });
+  assert.equal(h.context.storeDraft(), false, "an inert tab can never write a draft again");
+  assert.equal(h.local.getItem("score:M1"), null);
+}
+
+// Force unlock ("released"): the device draft is removed and other tabs are told.
+{
+  const h = tabSafetyHarness();
+  const held = { sets: [{ a: 10, b: 4 }] };
+  h.type("M1", held);
+  assert.equal(h.context.storeDraft(), true);
+  assert.notEqual(h.local.getItem("score:M1"), null);
+  h.context.loseLease("released");
+  assert.equal(h.local.getItem("score:M1"), null, "force unlock removes the device draft");
+  assert.equal(JSON.stringify(h.messages), JSON.stringify([{ type: "draft_cleared", storageKey: "score:M1", instance: "tab-a" }]));
+  assert.equal(h.edit.localDraft, null);
+  assert.equal(h.context.inertTab, null, "an administrator release does not make the tab inert");
+}
+
+// Submit/approve/reject/discard share clearDeviceDraft: remove + broadcast.
+{
+  const h = tabSafetyHarness();
+  h.type("M1", { sets: [{ a: 10, b: 4 }] });
+  h.context.storeDraft();
+  assert.equal(h.context.clearDeviceDraft("score:M1", h.ids.get("M1")), true);
+  assert.equal(h.local.getItem("score:M1"), null);
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages[0].type, "draft_cleared");
+}
+
+// tab1 submits match 1 and tab2 enters match 2: the submit path empties tab1's editor, so M2 stays clean.
+{
+  const h = submitRaceHarness();
+  const sending = h.ui.submitButton.onclick();
+  h.requests[0].resolve({ submitted: true });
+  await sending;
+  assert.equal(h.local.getItem("score:M1"), null);
+  assert.equal(h.edit.localDraft, null, "tab1's fields are cleared by the submit");
+  h.snapshot("M2");
+  assert.deepEqual(readStoredRecorderDraft(h.local, "score:M2").value.draft, h.nextDraft, "match 2's own draft is untouched");
+  assert.equal(h.edit.draftMatchKey, null);
 }
 
 console.log("recorder draft identity and submit ordering fixtures passed");

@@ -412,7 +412,9 @@ const queue = (changes = {}) => ({
     reasonCode: () => 'ownership_lost',
     recorderReason: () => 'ownership lost',
     status: (value) => statusCalls.push(value),
-    setOwnershipLostWarning: (matchKey, token) => statusCalls.push(`lost:${matchKey}:${token}`),
+    workflow: { lock: { token: 'someone-else' } },
+    leaseLossKind: (workflow, token) => (workflow?.lock && workflow.lock.token !== token ? 'taken' : 'released'),
+    loseLease: (kind) => { statusCalls.push(`lost:${kind}`); renderCalls.push(true); },
     render: () => renderCalls.push(true),
   };
   const { beginHeartbeat } = runInNewContext(`(() => {
@@ -436,7 +438,7 @@ const queue = (changes = {}) => ({
   edit.token = 'token-3';
   beginHeartbeat();
   callbacks[2]({ code: 'aborted' });
-  assert.deepEqual(statusCalls, ['lost:M1:token-3']);
+  assert.deepEqual(statusCalls, ['lost:taken'], 'a lease taken by another screen clears this tab through loseLease');
   assert.deepEqual(renderCalls, [true]);
 }
 

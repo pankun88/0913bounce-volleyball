@@ -2677,7 +2677,9 @@ function renderScoreReviews() {
       });
     });
     if (isSubmitted) {
-      actions.append(approve, reject);
+      // 반려는 비상용: 평소에는 승인만 보이고, 「비상용 기능 보기」를 연 동안에만 카드에 나타난다.
+      actions.append(approve);
+      if (emergencyFeaturesOpen) actions.append(reject);
     }
     if (workflow.lock) {
       const release = document.createElement("button");
@@ -3467,12 +3469,15 @@ function switchActiveDivision(nextDivision) {
 }
 
 /** 승인 취소·재입력(비상용)은 평소 숨겨 두고, 이 버튼을 눌러야만 보인다. */
+let emergencyFeaturesOpen = false;
 function toggleEmergencyFeatures(button, panel) {
   const opening = panel.hidden;
   panel.hidden = !opening;
   if (!opening) panel.open = false;
+  emergencyFeaturesOpen = opening;
   button.setAttribute("aria-expanded", String(opening));
   button.textContent = opening ? "비상용 기능 숨기기" : "비상용 기능 보기";
+  renderScoreReviews();
 }
 
 function bindStaticHandlers() {
@@ -4949,7 +4954,7 @@ function prelimDirectScoreContext(matchId) {
     return { error: "기록관이 점수를 입력 중이거나 잠금 상태입니다. 기록관 작업이 끝난 뒤 진행하세요." };
   }
   if (states.some((state) => state === "submitted" || state === "under_review")) {
-    return { error: "기록관 점수가 제출되어 검수 중입니다. 점수를 바꾸지 말고 승인하거나 반려하여 정정을 요청하세요." };
+    return { error: "기록관 점수가 제출되어 검수 중입니다. 점수를 바꾸지 말고 승인한 뒤 「점수 수정」으로 고치세요." };
   }
   if (states.some((state) => [
     "rejected", "replay", "replay_required", "rework", "rework_required",
