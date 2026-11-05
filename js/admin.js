@@ -543,6 +543,12 @@ function finalByeSelectionComplete(lottery, selection = finalByeSelection) {
     && selection.reason.trim().length > 0;
 }
 
+// 화면을 새로 열면 qualificationDraftStale 은 초기화되지만 서버 기록(stale)은 남는다.
+// 어느 쪽이든 본선 시작 전이면 '새 순위로 대진 다시 만들기'를 보여 준다.
+function qualificationReplacementAvailable() {
+  return qualificationProofStatus() === "stale" && !qualificationHasFinalPlay();
+}
+
 function qualificationProofStatus() {
   if (!qualificationHasFinalBracket()) return "none";
   if (qualificationDraftStale) return "stale";
@@ -5471,7 +5477,7 @@ function renderFinalTeamPicker() {
   revalidate.disabled = qualificationPreparationInFlight;
   revalidate.addEventListener("click", handleQualificationRevalidation);
   actions.appendChild(revalidate);
-  if (qualificationDraftStale && !qualificationHasFinalPlay()) {
+  if (qualificationReplacementAvailable()) {
     const replacement = document.createElement("button");
     replacement.type = "button";
     replacement.className = "btn small danger";

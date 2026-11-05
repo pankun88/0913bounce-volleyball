@@ -845,6 +845,38 @@ function testPublishedProofSurvivesDivisionSwitchAndReload() {
   assert.equal(call(context, "switchActiveDivision", "women"), false, "switching to the active division is a no-op");
 }
 
+// 7번 캡처 회귀: 화면을 새로 열어 qualificationDraftStale 이 false 여도 서버 기록이 stale 이면
+// 안내문이 가리키는 '새 순위로 대진 다시 만들기' 버튼을 만들 수 있어야 한다.
+function testReplacementAvailableAfterReload() {
+  const bracket = [{ id: "m_r1_0", round: 1, teamA: { id: "a" }, teamB: { id: "b" }, status: "pending" }];
+  const context = loadAdminFunctions([
+    "qualificationReplacementAvailable", "qualificationProofStatus",
+    "qualificationHasFinalBracket", "qualificationHasFinalPlay",
+  ], {
+    activeDivision: "men",
+    qualificationDraftStale: false,
+    qualificationRevalidatedLocally: false,
+    qualificationServerFingerprint: "",
+    qualificationServerState: null,
+    qualificationTieSelections: {},
+    qualificationProof: { status: "stale", fingerprint: "f".repeat(64) },
+    finalMatches: structuredClone(bracket),
+    authoritativeFinalMatches: structuredClone(bracket),
+    finalScoreDrafts: new Map(),
+    reviewAssignments: [],
+    reviewWorkflows: new Map(),
+  });
+  assert.equal(call(context, "qualificationReplacementAvailable"), true,
+    "a reloaded page with a stale server proof still offers replacement before final play");
+  context.qualificationProof = { status: "current", fingerprint: "f".repeat(64) };
+  assert.equal(call(context, "qualificationReplacementAvailable"), false,
+    "a current proof does not offer replacement");
+  context.qualificationProof = { status: "stale", fingerprint: "f".repeat(64) };
+  context.finalScoreDrafts.set("m_r1_0", { sets: [] });
+  assert.equal(call(context, "qualificationReplacementAvailable"), false,
+    "replacement is never offered after final play");
+}
+
 // 항목 2 회귀: 대회 문서(qualifyPerGroup)가 조·팀·예선보다 늦게 도착해도 첫 기준선을 빈 값으로
 // 잡아 멀쩡한 본선을 'stale'로 오판하지 않아야 한다.
 function testLateTournamentInfoDoesNotStaleAPublishedFinal() {
@@ -1049,6 +1081,7 @@ async function runQualificationUiSuite() {
   testPublishedProofSurvivesDivisionSwitchAndReload();
   testLateTournamentInfoDoesNotStaleAPublishedFinal();
   testFinalPublicationStatusCopy();
+  testReplacementAvailableAfterReload();
   await testByeLotteryGeneratesAndPublishes();
   testActualSourceInvalidationAndForeignRecords();
   testActualSelectionState();
