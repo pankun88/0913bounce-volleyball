@@ -149,8 +149,8 @@ let prelimHistoryReadiness = { status: "loading", error: null };
 
 const DIVISION_LABELS = { men: "남자부", women: "여자부" };
 const divisionLabel = () => DIVISION_LABELS[activeDivision];
-const PRELIM_HISTORY_GUIDANCE = "공식 예선 이력이 있는 경기는 조·팀·예선 초기화와 대진 재생성을 할 수 없습니다. 전체 초기화로 결과를 지우지 말고, 기록·검수 탭의 ‘승인 결과 정정’에서 해당 경기를 선택해 감사 사유와 함께 정정 절차를 진행하세요.";
-const PRELIM_HISTORY_DISABLED_TITLE = "공식 예선 이력이 있어 비활성화되었습니다. 기록·검수 탭에서 승인 결과 정정을 진행하세요.";
+const PRELIM_HISTORY_GUIDANCE = "공식 예선 이력이 있는 경기는 조·팀·예선 초기화와 대진 재생성을 할 수 없습니다. 전체 초기화로 결과를 지우지 말고, 예선 탭에서 해당 경기의 ‘점수 수정’으로 사유와 함께 고치세요. 본선이 이미 진행된 뒤에는 본선 진출팀이 바뀌는 수정은 할 수 없습니다.";
+const PRELIM_HISTORY_DISABLED_TITLE = "공식 예선 이력이 있어 비활성화되었습니다. 예선 탭에서 해당 경기의 ‘점수 수정’을 사용하세요.";
 const PRELIM_HISTORY_LOADING_GUIDANCE = "예선 이력을 서버에서 확인하는 중입니다. 확인이 끝날 때까지 결과를 지울 수 있는 초기화·대진 재생성을 사용할 수 없습니다.";
 
 function resetRecorderGrantAuth(uid) {
@@ -315,7 +315,7 @@ function qualificationBlockerMessage(blocker) {
     bye_selection_invalid: "부전승 추첨 기록을 확인하세요.",
     bye_lottery_not_required: "이 대진은 부전승 추첨이 필요하지 않습니다. 추첨 기록을 지우고 다시 시도하세요.",
     bye_reason_required: "부전승 추첨 메모(추첨 방법·입회자 등)를 입력하세요.",
-    bye_candidates_mismatch: "부전승 추첨 후보가 현재 예선 순위와 다릅니다. 진출팀을 다시 확인하세요.",
+    bye_candidates_mismatch: "부전승 추첨 후보가 현재 예선 순위와 다릅니다. ‘현재 순위로 확인’을 누르세요.",
     bye_slots_mismatch: "부전승 자리 수만큼 추첨 당첨 팀을 선택하세요.",
     bye_non_candidate: "부전승 추첨 후보만 당첨 팀으로 선택할 수 있습니다.",
     bye_placement_mismatch: "대진표의 부전승 자리가 추첨 결과와 다릅니다. 추첨 당첨 팀은 부전승 자리에, 나머지 후보는 1라운드 경기 자리에 두거나 대진표를 다시 생성하세요.",
@@ -569,7 +569,7 @@ function qualificationStructureLocked() {
 function blockQualificationStructureEdit() {
   if (!qualificationStructureLocked()) return false;
   showToast(
-    "본선이 공개된 뒤 조·팀의 추가/삭제·조 이동·예선 재생성은 Rules로 차단됩니다. 표시 이름과 순서만 조정하고, 진출 근거는 다시 확인하세요.",
+    "본선이 공개된 뒤 조·팀의 추가/삭제·조 이동·예선 재생성은 Rules로 차단됩니다. 표시 이름과 순서만 조정하고, 본선 대진표가 지금 예선 순위와 맞는지 ‘현재 순위로 확인’으로 확인하세요.",
     7000,
   );
   return true;
@@ -2219,7 +2219,16 @@ function createWorkflowBoardCard(
   status.className = "badge";
   status.textContent = workflowStatusBadge(option.matchKey);
   card.append(teams, status);
-  if (completed) return card;
+  if (completed) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "btn small court-board-edit";
+    edit.textContent = "점수 수정";
+    edit.title = "승인된 점수가 틀렸다면 사유와 함께 바로 고칩니다.";
+    edit.addEventListener("click", () => openApprovedScoreEdit(option));
+    card.appendChild(edit);
+    return card;
+  }
 
   const controls = document.createElement("div");
   controls.className = "court-board-controls";
@@ -2253,6 +2262,24 @@ function createWorkflowBoardCard(
   });
   card.appendChild(controls);
   return card;
+}
+
+/** 기록·검수 탭의 완료 경기에서 승인된 점수를 ‘점수 수정’으로 바로 고친다. */
+function openApprovedScoreEdit(option) {
+  if (option.matchType === "prelim") {
+    const match = allPrelimMatches.find((item) => item.id === option.matchKey);
+    if (!match) return showToast("예선 경기를 찾을 수 없습니다. 새로고침 후 다시 시도하세요.", 4000);
+    openPrelimScoreModal(match);
+    return;
+  }
+  const division = option.divisionId || option.division;
+  if (division !== activeDivision) {
+    showToast(`${DIVISION_LABELS[division] || division}로 부문을 바꾼 뒤 본선 탭에서 점수를 수정하세요.`, 5000);
+    return;
+  }
+  const match = finalMatches.find((item) => item.id === option.matchId);
+  if (!match) return showToast("본선 경기를 찾을 수 없습니다. 본선 탭에서 확인하세요.", 4000);
+  openFinalScoreModal(match);
 }
 
 function renderCourtBoard() {
@@ -2626,16 +2653,22 @@ function renderScoreReviews() {
     const reject = document.createElement("button");
     reject.className = "btn danger small";
     reject.textContent = "반려";
-    reject.addEventListener("click", async () => {
-      const reason = requiredReason("반려");
-      if (!reason) return showToast("반려 사유는 필수입니다.");
-      const ok = await runWorkflowButton(reject, "점수 반려", () => adminWorkflowCallable("rejectScoreReview", {
-        matchKey: assignment.id,
-        reason,
-        expectedSubmissionVersion: workflow.submissionVersion,
-        expectedQueueRevision: reviewQueues.get(assignment.courtId)?.queueRevision ?? null,
-      }));
-      if (ok) showToast("반려했습니다.");
+    reject.addEventListener("click", () => {
+      openReasonModal({
+        title: "점수 반려",
+        description: "반려하면 기록관이 고쳐서 다시 제출합니다. 사유는 기록관에게 보이고 감사 기록에 남습니다.",
+        confirmLabel: "반려",
+        danger: true,
+        onSubmit: async (reason) => {
+          const ok = await runWorkflowButton(reject, "점수 반려", () => adminWorkflowCallable("rejectScoreReview", {
+            matchKey: assignment.id,
+            reason,
+            expectedSubmissionVersion: workflow.submissionVersion,
+            expectedQueueRevision: reviewQueues.get(assignment.courtId)?.queueRevision ?? null,
+          }));
+          if (ok) showToast("반려했습니다.");
+        },
+      });
     });
     if (isSubmitted) {
       actions.append(approve, reject);
@@ -3336,15 +3369,20 @@ function stageSubmittedFinalReview(assignment, workflow) {
   const official = authoritativeFinalMatches.find((item) => item.id === match.id);
   const changed = JSON.stringify(normalizePlayedSets(official?.sets, true))
     !== JSON.stringify(normalizePlayedSets(sets, true));
-  const reason = (official?.officialRevision || 0) > 0 && changed
-    ? requiredReason("승인된 본선 점수 정정")
-    : "";
-  if ((official?.officialRevision || 0) > 0 && changed && !reason) {
-    showToast("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
+  const stage = (reason) => {
+    stageFinalScoreDraft(match.id, sets, reason, workflow.submissionVersion);
+    showToast("제출 점수를 로컬 본선 초안에 반영했습니다. ‘관객·기록관 화면에 공개’해야 공식 결과가 되고 다음 라운드 기록관 입력이 열립니다.");
+  };
+  if (!((official?.officialRevision || 0) > 0 && changed)) {
+    stage("");
     return;
   }
-  stageFinalScoreDraft(match.id, sets, reason, workflow.submissionVersion);
-  showToast("제출 점수를 로컬 본선 초안에 반영했습니다. ‘관객·기록관 화면에 공개’해야 공식 결과가 되고 다음 라운드 기록관 입력이 열립니다.");
+  openReasonModal({
+    title: "승인된 본선 점수 정정",
+    description: "이미 승인된 점수와 다른 점수를 반영합니다. 사유는 감사 기록에 남습니다.",
+    confirmLabel: "공개 초안에 반영",
+    onSubmit: stage,
+  });
 }
 
 // ---------------- 대회설정: 대회명 ----------------
@@ -3384,7 +3422,7 @@ async function saveQualificationCount() {
 /** 부문을 바꾸면 이전 부문의 로컬 진출 검증 상태를 버리고, 새 부문의 서버 저장 검증 기록
  * (tournaments/main.finalQualification[부문])을 곧바로 다시 불러온다. 대회 문서 구독은 문서가
  * 바뀔 때만 다시 호출되므로, 여기서 다시 동기화하지 않으면 공개·검증이 끝난 본선도
- * '검증된 진출 근거가 없습니다'로 잘못 표시된다. */
+ * '아직 확인하지 않았습니다'로 잘못 표시된다. */
 function switchActiveDivision(nextDivision) {
   if (!nextDivision || nextDivision === activeDivision) return false;
   if (!finalMutationAllowed()) return false;
@@ -3422,7 +3460,19 @@ function switchActiveDivision(nextDivision) {
   return true;
 }
 
+/** 승인 취소·재입력(비상용)은 평소 숨겨 두고, 이 버튼을 눌러야만 보인다. */
+function toggleEmergencyFeatures(button, panel) {
+  const opening = panel.hidden;
+  panel.hidden = !opening;
+  if (!opening) panel.open = false;
+  button.setAttribute("aria-expanded", String(opening));
+  button.textContent = opening ? "비상용 기능 숨기기" : "비상용 기능 보기";
+}
+
 function bindStaticHandlers() {
+  const emergencyToggle = document.getElementById("emergencyFeaturesToggleBtn");
+  const emergencyPanel = document.getElementById("correctionAdvancedSettings");
+  emergencyToggle?.addEventListener("click", () => toggleEmergencyFeatures(emergencyToggle, emergencyPanel));
   document.querySelectorAll("[data-division]").forEach((button) => {
     button.addEventListener("click", () => switchActiveDivision(button.dataset.division));
   });
@@ -4964,11 +5014,12 @@ function openPrelimScoreModal(match) {
     setLabels: ["1세트 (10점)", "2세트 (10점)"],
     targets: [10, 10],
     existingSets: match.sets || [],
-    onSave: async (sets) => {
+    reasonRequired: true,
+    reasonNote: "관리자가 직접 입력·수정합니다. 사유는 감사 기록에 남습니다.",
+    onSave: async (sets, reason) => {
       if (!prelimDirectScoreContextIsCurrent(snapshot)) {
         throw new Error("경기·팀·코트·대기열 또는 공식 점수 버전이 변경되었습니다. 최신 상태에서 점수 입력을 다시 여세요.");
       }
-      const reason = requiredReason("관리자 직접 수정");
       if (!reason) throw new Error("정정 사유는 필수입니다.");
       const request = {
         matchKey: snapshot.matchId,
@@ -5123,16 +5174,16 @@ function updateQualificationProofUi() {
   banner.className = `qualification-proof-banner ${current ? "is-current" : "is-review"}`;
   if (status === "stale") {
     banner.textContent = qualificationHasFinalPlay()
-      ? "예선 원본이 바뀌어 본선 진출 근거가 오래되었습니다. 실제 진행 경기가 있어 대진 교체로 우회할 수 없습니다. ‘진출팀 다시 확인’으로 같은 진출팀이 여전히 유효한지 확인하세요."
-      : "예선 원본이 바뀌어 본선 초안의 진출 근거가 오래되었습니다. 점수·초안은 보존되어 있습니다. ‘진출팀 다시 확인’으로 같은 진출팀을 재검증하거나, 사유를 남겨 미진행 초안을 교체하세요.";
+      ? "예선 점수가 바뀌었습니다. 본선 경기가 이미 시작되어 대진표를 다시 만들 수 없습니다. ‘현재 순위로 확인’을 눌러 바뀐 점수로도 본선에 나가는 팀이 같은지 확인하세요."
+      : "예선 점수가 바뀌었습니다. 지금 본선 대진표는 바뀌기 전 순위로 만든 것입니다. 순위가 바뀌었다면 사유를 적고 ‘새 순위로 대진 다시 만들기’를 누르세요. 순위가 그대로라면 ‘현재 순위로 확인’을 누르면 됩니다. 예선 점수는 지워지지 않습니다.";
   } else if (status === "unverified") {
-    banner.textContent = "기존 본선에 검증된 예선 진출 근거가 없습니다. 진출팀을 다시 확인한 뒤 공개하세요.";
+    banner.textContent = "이 본선 대진표가 지금 예선 순위와 맞는지 아직 확인하지 않았습니다. ‘현재 순위로 확인’을 누른 뒤 공개하세요.";
   } else if (messages.length) {
     banner.textContent = messages.join(" ");
   } else if (qualificationPreparationError) {
     banner.textContent = qualificationPreparationError;
   } else {
-    banner.textContent = "예선 진출 근거가 최신입니다.";
+    banner.textContent = "본선 대진표가 지금 예선 순위와 맞습니다.";
   }
   if (qualificationPreparationError && status !== "stale"
       && banner.textContent !== qualificationPreparationError) {
@@ -5204,22 +5255,22 @@ async function handleQualificationRevalidation() {
     }
     renderFinalTeamPicker();
     renderFinalBracket();
-    showToast("예선 진출팀을 다시 확인했습니다. 기존 본선 점수와 초안은 보존됩니다.", 5000);
+    showToast("현재 예선 순위로 본선 대진표를 확인했습니다. 기존 본선 점수와 초안은 보존됩니다.", 5000);
   } catch (error) {
-    reportError("진출팀 다시 확인", error);
+    reportError("현재 순위로 확인", error);
   }
 }
 
 async function handleQualificationReplacement() {
   if (qualificationHasFinalPlay()) {
-    showToast("실제 진행된 본선은 초안 교체로 우회할 수 없습니다. 진출팀을 다시 확인하거나 정정 절차를 진행하세요.", 6000);
+    showToast("본선 경기가 이미 시작되어 대진표를 다시 만들 수 없습니다. ‘현재 순위로 확인’을 눌러 확인하세요.", 6000);
     return;
   }
   const reasonInput = document.getElementById("qualificationReplacementReason");
   const reason = (reasonInput?.value || "").trim();
   if (!reason) {
     reasonInput?.focus();
-    showToast("미진행 본선 초안을 교체하려면 사유를 입력하세요.", 5000);
+    showToast("아직 시작 안 한 본선 대진표를 새 순위로 다시 만들려면 사유를 입력하세요.", 5000);
     return;
   }
   qualificationReplacement = { reason, mode: "replace_unplayed" };
@@ -5236,9 +5287,9 @@ async function handleQualificationReplacement() {
     showToast(qualificationPreparationError, 6000);
     return;
   }
-  const warning = `${divisionLabel()} 미진행 본선 초안을 예선 최신 진출팀으로 교체합니다.
+  const warning = `${divisionLabel()} 아직 시작 안 한 본선 대진표를 현재 예선 순위로 다시 만듭니다.
 사유: ${reason}
-현재 입력된 점수·자리 조정은 이 초안 교체로 사라질 수 있습니다. 계속할까요?`;
+지금까지 입력한 점수·자리 조정은 대진표를 다시 만들면 사라질 수 있습니다. 계속할까요?`;
   if (!confirm(warning)) return;
   const teamsInSeedOrder = seedSelection.map((id) => ({ id, name: teamName(id) }));
   const { matches } = generateBracket(teamsInSeedOrder);
@@ -5249,7 +5300,7 @@ async function handleQualificationReplacement() {
   bracketPublishPending = true;
   renderFinalBracket();
   renderFinalTeamPicker();
-  showToast("미진행 본선 초안을 교체했습니다. 사유와 함께 ‘관객·기록관 화면에 공개’해야 서버에 확정됩니다.", 6000);
+  showToast("새 순위로 본선 대진표를 다시 만들었습니다. 사유와 함께 ‘관객·기록관 화면에 공개’해야 서버에 확정됩니다.", 6000);
 }
 
 function renderFinalTeamPicker() {
@@ -5390,7 +5441,7 @@ function renderFinalTeamPicker() {
     exportDraft.type = "button";
     exportDraft.className = "btn small ghost";
     exportDraft.textContent = "본선 점수 초안 JSON 내보내기";
-    exportDraft.title = "예선 원본 변경이나 명시적 교체 전에 현재 점수 초안을 보관합니다.";
+    exportDraft.title = "예선 점수가 바뀌었거나 대진표를 다시 만들기 전에 현재 점수 초안을 보관합니다.";
     exportDraft.addEventListener("click", () => {
       const stamp = dateStamp();
       downloadJson(
@@ -5416,7 +5467,7 @@ function renderFinalTeamPicker() {
   revalidate.type = "button";
   revalidate.className = "btn small ghost";
   revalidate.id = "revalidateQualificationBtn";
-  revalidate.textContent = qualificationPreparationInFlight ? "확인 중…" : "진출팀 다시 확인";
+  revalidate.textContent = qualificationPreparationInFlight ? "확인 중…" : "현재 순위로 확인";
   revalidate.disabled = qualificationPreparationInFlight;
   revalidate.addEventListener("click", handleQualificationRevalidation);
   actions.appendChild(revalidate);
@@ -5425,7 +5476,7 @@ function renderFinalTeamPicker() {
     replacement.type = "button";
     replacement.className = "btn small danger";
     replacement.id = "replaceQualificationBtn";
-    replacement.textContent = "미진행 초안 교체";
+    replacement.textContent = "새 순위로 대진 다시 만들기";
     replacement.addEventListener("click", handleQualificationReplacement);
     actions.appendChild(replacement);
 
@@ -5433,8 +5484,8 @@ function renderFinalTeamPicker() {
     reason.id = "qualificationReplacementReason";
     reason.rows = 2;
     reason.maxLength = 500;
-    reason.setAttribute("aria-label", "미진행 본선 초안 교체 사유");
-    reason.placeholder = "초안 교체 사유 (필수)";
+    reason.setAttribute("aria-label", "아직 시작 안 한 본선 대진표를 다시 만드는 사유");
+    reason.placeholder = "대진표를 다시 만드는 사유 (필수)";
     reason.value = qualificationReplacement?.reason || "";
     reason.style.width = "100%";
     reason.style.marginTop = "6px";
@@ -5535,7 +5586,7 @@ function teamGroupRankLabel(teamId) {
 async function handleClearBracket() {
   if (!finalMutationAllowed()) return;
   if (qualificationHasFinalPlay()) {
-    return showToast("이 부문의 본선 점수 입력·제출 기록이 있어 초기화할 수 없습니다. 점수 수정 또는 정정 절차를 이용하세요.", 6000);
+    return showToast("이 부문의 본선 점수 입력·제출 기록이 있어 초기화할 수 없습니다. 점수가 틀렸다면 해당 경기의 ‘점수 수정’을 이용하세요.", 6000);
   }
   if (!confirm(`${divisionLabel()}의 아직 시작하지 않은 본선 대진표를 초기화할까요? 예선 결과는 유지됩니다. 기록이 시작된 본선 경기가 있으면 초기화가 거부됩니다.`)) return;
   try {
@@ -5582,7 +5633,7 @@ async function onGenerateBracket() {
     return showToast(message || "진출팀 선택을 확인하세요.", 6000);
   }
   if (qualificationDraftStale && qualificationHasFinalBracket()) {
-    return showToast("예선 원본이 바뀌었습니다. 먼저 ‘진출팀 다시 확인’ 또는 미진행 초안 교체를 진행하세요.", 6000);
+    return showToast("예선 점수가 바뀌었습니다. 먼저 ‘현재 순위로 확인’이나 ‘새 순위로 대진 다시 만들기’를 하세요.", 6000);
   }
   const localByeProblem = finalByeSelectionProblem(localState, seedSelection, [], { requireRecord: true });
   if (localByeProblem) {
@@ -5769,9 +5820,9 @@ function finalPublicationStatus(input) {
   if (needsReview || byeProblem) {
     return {
       state: "blocked",
-      title: pending ? "공개 전 — 기록관이 점수를 입력할 수 없음" : "진출 근거 확인 필요",
+      title: pending ? "공개 전 — 기록관이 점수를 입력할 수 없음" : "예선 순위 확인 필요",
       message: [
-        needsReview ? "예선 진출 근거를 다시 확인해야 공개할 수 있습니다. 현재 초안과 점수는 보존됩니다." : "",
+        needsReview ? "예선 점수가 바뀌어 대진표를 다시 확인해야 공개할 수 있습니다. 지금 대진표와 점수는 지워지지 않습니다." : "",
         byeProblem,
         pending ? recorderNote : "",
       ].filter(Boolean).join(" "),
@@ -5865,15 +5916,15 @@ async function handlePublishBracket() {
     qualificationTieSelections,
   );
   if (qualificationDraftStale) {
-    showToast("예선 원본이 바뀌었습니다. 먼저 ‘진출팀 다시 확인’을 완료하세요.", 6000);
+    showToast("예선 점수가 바뀌었습니다. 먼저 ‘현재 순위로 확인’을 누르세요.", 6000);
     return;
   }
   if (!qualificationServerFingerprint) {
-    showToast("공개 전에 ‘진출팀 다시 확인’으로 서버 검증을 받아야 합니다.", 6000);
+    showToast("공개하기 전에 ‘현재 순위로 확인’을 눌러 주세요.", 6000);
     return;
   }
   if (authoritativeFinalMatches.length > 0 && qualificationProofStatus() !== "current") {
-    showToast("기존 본선의 진출 근거가 오래되었습니다. 먼저 ‘진출팀 다시 확인’을 완료하세요.", 6000);
+    showToast("예선 점수가 바뀌어 본선 대진표 확인이 필요합니다. 먼저 ‘현재 순위로 확인’을 누르세요.", 6000);
     return;
   }
   if (qualificationStateHasStructuralBlockers(qualificationStateForPublish)) {
@@ -5883,7 +5934,7 @@ async function handlePublishBracket() {
   }
   if (!qualificationValidation.ok) {
     const message = qualificationValidationMessages(qualificationValidation).join(" ");
-    showToast(message || "본선 진출팀을 다시 확인하세요.", 6000);
+    showToast(message || "‘현재 순위로 확인’을 눌러 본선 진출팀을 확인하세요.", 6000);
     return;
   }
   const byeProblem = finalByeSelectionProblem(qualificationStateForPublish, finalParticipants);
@@ -6035,7 +6086,7 @@ async function handleConfirmBye(match) {
 async function handleBracketSlotSwap(fromSlot, toSlot) {
   if (!finalMutationAllowed()) return;
   if (qualificationHasFinalPlay()) {
-    showToast("경기 입력·승인 이력이 있어 팀 자리를 바꿀 수 없습니다. 승인 취소 후에도 같은 팀 순서로 점수를 다시 입력하세요.", 6000);
+    showToast("경기 입력·승인 이력이 있어 팀 자리를 바꿀 수 없습니다. 점수가 틀렸다면 해당 경기의 ‘점수 수정’으로 같은 팀 순서에서 고치세요.", 6000);
     return;
   }
   const result = swapFinalSeedSlots(finalMatches, fromSlot, toSlot);
@@ -6060,6 +6111,7 @@ function openFinalScoreModal(match) {
     return;
   }
   const modalContext = finalScoreModalContext(match);
+  const approvedAtOpen = (authoritativeFinalMatches.find((item) => item.id === match.id)?.officialRevision || 0) > 0;
   openScoreModal({
     teamAName: match.teamA ? match.teamA.name : "",
     teamBName: match.teamB ? match.teamB.name : "",
@@ -6067,7 +6119,9 @@ function openFinalScoreModal(match) {
     targets: [10, 10, 7],
     existingSets: match.sets || [],
     requireComplete: true,
-    onSave: async (sets) => {
+    reasonRequired: approvedAtOpen,
+    reasonNote: approvedAtOpen ? "이미 승인된 점수입니다. 고치려면 사유가 필요하며 감사 기록에 남습니다." : "",
+    onSave: async (sets, reason) => {
       if (!finalMutationAllowed()) throw new Error("본선 공개 처리 중입니다. 완료 후 다시 입력하세요.");
       if (!finalScoreModalContextIsCurrent(modalContext)) {
         bracketPublishConflict = true;
@@ -6091,7 +6145,7 @@ function openFinalScoreModal(match) {
         showToast("승인된 본선 점수와 동일합니다. 공개할 변경사항이 없습니다.");
         return;
       }
-      const correctionReason = approved && scoreChanged ? requiredReason("승인된 본선 점수 정정") : null;
+      const correctionReason = approved && scoreChanged ? (reason || "").trim() : null;
       if (approved && scoreChanged && !correctionReason) throw new Error("승인된 점수를 바꾸려면 정정 사유가 필요합니다.");
 
       stageFinalScoreDraft(modalContext.matchId, sets, correctionReason || "", modalContext.submissionVersion);
@@ -6156,44 +6210,182 @@ function isFinalScoreStagingBlocked(match) {
 
 // ---------------- 모달 / 토스트 ----------------
 
-function openScoreModal({ teamAName, teamBName, setLabels, targets, existingSets, requireComplete = false, onSave }) {
-  const root = document.getElementById("modalRoot");
+/** 모달 겹판(overlay)을 만들어 modalRoot에 붙인다. 바깥 영역을 누르면 닫힌다. */
+function mountModal(box) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+  document.getElementById("modalRoot").appendChild(overlay);
+  return overlay;
+}
+
+const REASON_QUICK_PICKS = ["기록관 오기", "팀 순서 바뀜", "세트 누락"];
+
+/** 모달 안 사유 입력칸: 빠른 선택 버튼 + 직접 입력. 값은 공백을 뺀 문자열이며 비어 있으면 저장할 수 없다. */
+function createReasonField({ quickPicks = REASON_QUICK_PICKS, onChange = () => {} } = {}) {
+  const element = document.createElement("div");
+  element.className = "reason-field";
+  const label = document.createElement("label");
+  label.className = "reason-field-label";
+  label.textContent = "사유 (필수)";
+  const picks = document.createElement("div");
+  picks.className = "reason-quick-picks";
+  picks.setAttribute("role", "group");
+  picks.setAttribute("aria-label", "사유 빠른 선택");
+  const input = document.createElement("textarea");
+  input.className = "reason-field-input";
+  input.rows = 2;
+  input.maxLength = 500;
+  input.placeholder = "위에서 고르거나 직접 입력하세요";
+  input.setAttribute("aria-label", "사유");
+  const buttons = quickPicks.map((text) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn small ghost reason-quick-pick";
+    button.textContent = text;
+    button.setAttribute("aria-pressed", "false");
+    button.addEventListener("click", () => {
+      input.value = text;
+      syncPressed();
+      onChange();
+      input.focus();
+    });
+    picks.appendChild(button);
+    return button;
+  });
+  function syncPressed() {
+    const current = input.value.trim();
+    buttons.forEach((button) => {
+      const pressed = button.textContent === current;
+      button.setAttribute("aria-pressed", String(pressed));
+      button.classList.toggle("is-selected", pressed);
+    });
+  }
+  input.addEventListener("input", () => { syncPressed(); onChange(); });
+  label.setAttribute("for", "reasonFieldInput");
+  input.id = "reasonFieldInput";
+  element.append(label, picks, input);
+  return { element, input, value: () => input.value.trim() };
+}
+
+/** 사유만 받는 모달(반려, 승인된 본선 점수 정정 반영). 사유가 비어 있으면 확인 버튼을 누를 수 없다. */
+function openReasonModal({ title, description = "", confirmLabel, danger = false, quickPicks, onSubmit }) {
+  const box = document.createElement("div");
+  box.className = "modal-box reason-modal";
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  box.appendChild(heading);
+  if (description) {
+    const note = document.createElement("p");
+    note.className = "reason-modal-note";
+    note.textContent = description;
+    box.appendChild(note);
+  }
+  const confirmBtn = document.createElement("button");
+  const reasonField = createReasonField({ quickPicks, onChange: () => { confirmBtn.disabled = !reasonField.value(); } });
+  box.appendChild(reasonField.element);
+  const actions = document.createElement("div");
+  actions.className = "row modal-actions";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn ghost";
+  cancelBtn.textContent = "취소";
+  confirmBtn.className = `btn ${danger ? "danger" : "primary"}`;
+  confirmBtn.textContent = confirmLabel;
+  confirmBtn.disabled = true;
+  const overlay = mountModal(box);
+  cancelBtn.addEventListener("click", () => overlay.remove());
+  confirmBtn.addEventListener("click", async () => {
+    const reason = reasonField.value();
+    if (!reason) return;
+    confirmBtn.disabled = true;
+    overlay.remove();
+    try {
+      await onSubmit(reason);
+    } catch (err) {
+      reportError(title, err);
+    }
+  });
+  actions.append(cancelBtn, confirmBtn);
+  box.appendChild(actions);
+  reasonField.input.focus();
+  return overlay;
+}
+
+/** 점수 입력 모달. reasonRequired면 사유를 입력해야만 저장할 수 있고 onSave(sets, reason)으로 넘긴다. */
+function openScoreModal({
+  teamAName, teamBName, setLabels, targets, existingSets, requireComplete = false,
+  reasonRequired = false, reasonNote = "", onSave,
+}) {
   const box = document.createElement("div");
   box.className = "modal-box";
-  box.innerHTML = `<h3>${escapeHtml(teamAName)} vs ${escapeHtml(teamBName)}</h3>`;
+  const heading = document.createElement("h3");
+  heading.textContent = `${teamAName} vs ${teamBName}`;
+  box.appendChild(heading);
+  if (reasonNote) {
+    const note = document.createElement("p");
+    note.className = "reason-modal-note";
+    note.textContent = reasonNote;
+    box.appendChild(note);
+  }
 
   const errorMsg = document.createElement("div");
   errorMsg.className = "modal-error-msg";
   box.appendChild(errorMsg);
 
+  const inputs = [];
   setLabels.forEach((label, i) => {
     const existing = existingSets[i] || { a: "", b: "" };
     const row = document.createElement("div");
     row.className = "set-input-row";
-    row.innerHTML = `<label>${label}</label>
-      <input type="number" min="0" max="15" data-side="a" data-idx="${i}" value="${existing.a === 0 ? 0 : existing.a || ""}" placeholder="${escapeHtml(teamAName)}" />
-      :
-      <input type="number" min="0" max="15" data-side="b" data-idx="${i}" value="${existing.b === 0 ? 0 : existing.b || ""}" placeholder="${escapeHtml(teamBName)}" />`;
+    const labelEl = document.createElement("label");
+    labelEl.textContent = label;
+    const makeInput = (side, value, placeholder) => {
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = "0";
+      input.max = "15";
+      input.dataset.side = side;
+      input.dataset.idx = String(i);
+      input.value = value === 0 ? "0" : String(value || "");
+      input.placeholder = placeholder;
+      return input;
+    };
+    const inputA = makeInput("a", existing.a, teamAName);
+    const inputB = makeInput("b", existing.b, teamBName);
+    const colon = document.createElement("span");
+    colon.textContent = ":";
+    inputs.push([inputA, inputB]);
+    row.append(labelEl, inputA, colon, inputB);
     box.appendChild(row);
   });
 
+  const saveBtn = document.createElement("button");
+  const reasonField = reasonRequired
+    ? createReasonField({ onChange: () => { saveBtn.disabled = !reasonField.value(); } })
+    : null;
+  if (reasonField) box.appendChild(reasonField.element);
+
   const actions = document.createElement("div");
-  actions.className = "row";
-  actions.style.justifyContent = "flex-end";
-  actions.style.marginTop = "12px";
+  actions.className = "row modal-actions";
   const cancelBtn = document.createElement("button");
   cancelBtn.className = "btn ghost";
   cancelBtn.textContent = "취소";
+  const overlay = mountModal(box);
   cancelBtn.addEventListener("click", () => overlay.remove());
-  const saveBtn = document.createElement("button");
   saveBtn.className = "btn primary";
   saveBtn.textContent = "저장";
+  saveBtn.disabled = reasonRequired;
   saveBtn.addEventListener("click", async () => {
-    const rawSets = setLabels.map((_, i) => {
-      const a = box.querySelector(`input[data-side="a"][data-idx="${i}"]`).value;
-      const b = box.querySelector(`input[data-side="b"][data-idx="${i}"]`).value;
+    const reason = reasonField ? reasonField.value() : "";
+    if (reasonRequired && !reason) {
+      errorMsg.textContent = "사유를 입력하거나 위에서 고르세요.";
+      errorMsg.classList.add("show");
+      return;
+    }
+    const rawSets = inputs.map(([inputA, inputB]) => {
+      const a = inputA.value;
+      const b = inputB.value;
       return { a: a === "" ? 0 : Number(a), b: b === "" ? 0 : Number(b) };
     });
 
@@ -6220,20 +6412,16 @@ function openScoreModal({ teamAName, teamBName, setLabels, targets, existingSets
     }
     saveBtn.disabled = true;
     try {
-      await onSave(sets);
+      await onSave(sets, reason);
       overlay.remove();
     } catch (err) {
-      saveBtn.disabled = false;
+      saveBtn.disabled = reasonRequired && !reasonField.value();
       reportError("점수 저장", err);
     }
   });
-  actions.appendChild(cancelBtn);
-  actions.appendChild(saveBtn);
+  actions.append(cancelBtn, saveBtn);
   box.appendChild(actions);
-
-  overlay.appendChild(box);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
-  root.appendChild(overlay);
+  return overlay;
 }
 
 let toastTimer = null;
@@ -6250,7 +6438,7 @@ function reportError(action, err) {
   console.error(`[${action} 실패]`, err);
   if (err?.details?.reason === "qualification_unverified"
       || String(err?.message || "") === "qualification_unverified") {
-    showToast(`${action}을(를) 중단했습니다. 본선 진출팀을 다시 확인한 뒤 진행하세요. 기존 기록은 유지됩니다.`, 7000);
+    showToast(`${action}을(를) 중단했습니다. ‘현재 순위로 확인’을 누른 뒤 진행하세요. 기존 기록은 유지됩니다.`, 7000);
     return;
   }
   if (/preliminary match has official history/i.test(String(err?.message || ""))) {

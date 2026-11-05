@@ -2226,10 +2226,22 @@ export async function runFunctionsSuite() {
       assert.deepEqual(after, before, `${id}-corrupt-state-zero-writes`);
     }
     const approvedQueueBefore = await f.seed((db) => getDoc(doc(db, path('courtQueues', 'direct-approved-court'))).then((snap) => snap.data()));
-    await call(functions, 'directEditOfficialScore', {
+    for (const blankReason of [undefined, '', '   ']) {
+      await assert.rejects(call(functions, 'directEditOfficialScore', {
+        ...data, matchKey: 'direct-approved', score: { sets: [{ a: 10, b: 6 }, { a: 10, b: 8 }] },
+        reason: blankReason, expectedOfficialRevision: 1,
+      }), /correction reason is required/, 'approved-score-edit-without-reason-rejected');
+    }
+    const unchangedByBlankReason = await f.seed((db) => getDoc(doc(db, path('prelimMatches', 'direct-approved'))));
+    assert.equal(unchangedByBlankReason.data().officialRevision, 1, 'blank-reason-edit-leaves-official-score-untouched');
+    const approvedEdit = await call(functions, 'directEditOfficialScore', {
       ...data, matchKey: 'direct-approved', score: { sets: [{ a: 10, b: 6 }, { a: 10, b: 8 }] },
-      reason: 'approved correction', expectedOfficialRevision: 1,
+      reason: '  기록관 오기  ', expectedOfficialRevision: 1,
     });
+    const approvedEditAudit = await f.seed((db) => getDoc(doc(db, path('auditEvents', approvedEdit.transitionId))));
+    assert.equal(approvedEditAudit.data().eventType, 'admin_direct_edit', 'approved-score-edit-writes-an-audit-event');
+    assert.equal(approvedEditAudit.data().reason, '기록관 오기', 'approved-score-edit-audit-records-the-trimmed-reason');
+    assert.equal(approvedEditAudit.data().matchKey, 'direct-approved', 'approved-score-edit-audit-names-the-match');
     const [approvedCorrection, approvedQueueAfter] = await f.seed(async (db) => Promise.all([
       getDoc(doc(db, path('prelimMatches', 'direct-approved'))),
       getDoc(doc(db, path('courtQueues', 'direct-approved-court'))),

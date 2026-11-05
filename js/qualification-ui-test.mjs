@@ -714,12 +714,15 @@ async function testAdministratorReentryAfterCorrection() {
   context.reviewWorkflows.set(key, workflow);
   let modal;
   context.openScoreModal = (options) => { modal = options; };
-  context.requiredReason = () => "승인 취소 후 관리자 재입력";
   assert.equal(call(context, "isFinalScoreStagingBlocked", context.finalMatches[0]), false);
   call(context, "openFinalScoreModal", context.finalMatches[0]);
   assert.ok(modal, "reentry waiting opens the administrator score modal");
   const correctedSets = [{ a: 5, b: 10 }, { a: 10, b: 8 }, { a: 4, b: 7 }];
-  await modal.onSave(correctedSets);
+  assert.equal(modal.reasonRequired, true, "an approved final score can only be changed with a reason field in the modal");
+  await assert.rejects(modal.onSave(correctedSets, ""), /정정 사유가 필요/, "saving without a reason is refused");
+  await assert.rejects(modal.onSave(correctedSets, "   "), /정정 사유가 필요/, "a blank reason is refused");
+  assert.equal(context.finalScoreDrafts.size, 0, "a refused save leaves no draft behind");
+  await modal.onSave(correctedSets, "승인 취소 후 관리자 재입력");
   const draft = context.finalScoreDrafts.get(matchId);
   assert.equal(draft.expectedSubmissionVersion, 2);
   assert.equal(draft.reason, "승인 취소 후 관리자 재입력");
@@ -743,12 +746,12 @@ async function testAdministratorReentryAfterCorrection() {
   context.reviewWorkflows.set(key, workflow);
   call(context, "openFinalScoreModal", context.finalMatches[0]);
   context.reviewWorkflows.set(key, { ...workflow, submissionVersion: 3 });
-  await assert.rejects(modal.onSave(correctedSets), /제출 기록이 바뀌었습니다/);
+  await assert.rejects(modal.onSave(correctedSets, "승인 취소 후 관리자 재입력"), /제출 기록이 바뀌었습니다/);
   assert.equal(context.finalScoreDrafts.size, 0, "a changed submission version cannot be silently adopted");
   context.reviewWorkflows.set(key, workflow);
   call(context, "openFinalScoreModal", context.finalMatches[0]);
   context.reviewWorkflows.set(key, { ...workflow, draftState: "editing", lock: { token: "new-claim" } });
-  await assert.rejects(modal.onSave(correctedSets), /입력 또는 제출이 시작되었습니다/);
+  await assert.rejects(modal.onSave(correctedSets, "승인 취소 후 관리자 재입력"), /입력 또는 제출이 시작되었습니다/);
   assert.equal(context.finalScoreDrafts.size, 0, "recorder input starting after the modal opens prevents overwrite");
 }
 

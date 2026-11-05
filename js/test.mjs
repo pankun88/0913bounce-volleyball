@@ -3686,6 +3686,33 @@ function createAdminProjectionHarness() {
         };
       },
     };
+    globalThis.__adminReasonTest = {
+      openApprovedPrelimEdit(calls) {
+        allPrelimMatches = [{
+          id: "m-approved", division: "men", groupId: "g1", teamA: "a", teamB: "b",
+          sets: [{ a: 10, b: 8 }, { a: 10, b: 8 }], officialRevision: 1,
+        }];
+        reviewAssignments = [{
+          id: "m-approved", matchKey: "m-approved", matchType: "prelim", publicStatus: "completed",
+          officialRevision: 1, courtId: null,
+        }];
+        reviewWorkflows = new Map([["m-approved", { draftState: "approved", officialRevision: 1 }]]);
+        reviewQueues = new Map();
+        __setAdminWorkflowCallable(async (name, payload) => { calls.push([name, payload]); return { data: {} }; });
+        openPrelimScoreModal(allPrelimMatches[0]);
+      },
+      openReject(calls) {
+        const reject = { textContent: "반려", disabled: false };
+        __setAdminWorkflowCallable(async (name, payload) => { calls.push([name, payload]); return { data: {} }; });
+        openReasonModal({
+          title: "점수 반려", confirmLabel: "반려", danger: true,
+          onSubmit: async (reason) => {
+            await runWorkflowButton(reject, "점수 반려", () => adminWorkflowCallable("rejectScoreReview", { matchKey: "m1", reason }));
+          },
+        });
+      },
+      toggleEmergency(button, panel) { toggleEmergencyFeatures(button, panel); },
+    };
     globalThis.__adminGrantTest = {
       setCallable(fn) {
         globalThis.__setAdminWorkflowCallable(fn);
@@ -3741,6 +3768,8 @@ function createAdminProjectionHarness() {
     swapDraft: () => context.__adminProjectionTest.swapDraft(),
     board: (mixed) => context.__adminProjectionTest.boardSetup(mixed),
     grant: context.__adminGrantTest,
+    reason: context.__adminReasonTest,
+    modalRoot: () => context.document.getElementById("modalRoot"),
   };
 }
 
@@ -4231,6 +4260,102 @@ check(
     /관리자가 다음 경기를 진행/.test(recorderWaitingMessage('no_current', {
       schedule: [{ status: 'waiting', baseStatus: 'waiting', assignment: { matchType: 'prelim' } }],
     })));
+}
+
+
+// ---- A안: 승인 취소·재입력은 평소 숨기고, 점수 수정/반려는 모달 안의 사유 입력으로 통일한다 ----
+{
+  const emergencyHtml = adminHtml.match(/<details[^>]*id="correctionAdvancedSettings"[^>]*>/)?.[0] || '';
+  check('emergency correction area is hidden by default in admin.html', /\bhidden\b/.test(emergencyHtml));
+  check('emergency toggle button exists and starts collapsed',
+    /id="emergencyFeaturesToggleBtn"[^>]*aria-expanded="false"/.test(adminHtml)
+      && /aria-controls="correctionAdvancedSettings"/.test(adminHtml));
+  const ui = createAdminProjectionHarness();
+  const toggle = { textContent: "비상용 기능 보기", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+  const panel = { hidden: true, open: true };
+  ui.reason.toggleEmergency(toggle, panel);
+  check('emergency toggle reveals the correction area on explicit click',
+    panel.hidden === false && toggle.attrs["aria-expanded"] === "true" && toggle.textContent === "비상용 기능 숨기기");
+  ui.reason.toggleEmergency(toggle, panel);
+  check('emergency toggle hides it again and collapses it',
+    panel.hidden === true && panel.open === false && toggle.attrs["aria-expanded"] === "false");
+
+  const findModalParts = () => {
+    const root = ui.modalRoot();
+    return {
+      overlay: root.children.at(-1),
+      buttons: root.querySelectorAll("button"),
+      textarea: root.querySelectorAll("textarea")[0],
+      inputs: root.querySelectorAll("input"),
+      error: root.querySelectorAll(".modal-error-msg")[0],
+    };
+  };
+  const press = (parts, label) => parts.buttons.find((button) => button.textContent === label);
+
+  // 점수 수정(예선): 사유 없이는 저장되지 않는다
+  const editCalls = [];
+  ui.reason.openApprovedPrelimEdit(editCalls);
+  let parts = findModalParts();
+  const quickPicks = parts.buttons.filter((button) => button.classList.contains("reason-quick-pick")).map((b) => b.textContent);
+  check('score edit modal offers the three quick-pick reasons',
+    JSON.stringify(quickPicks) === JSON.stringify(["기록관 오기", "팀 순서 바뀜", "세트 누락"]));
+  check('score edit modal has a free-text reason field', Boolean(parts.textarea));
+  check('score edit save is disabled while the reason is empty', press(parts, "저장").disabled === true);
+  press(parts, "저장").click();
+  await Promise.resolve();
+  check('clicking save without a reason sends nothing to the server', editCalls.length === 0);
+  parts.textarea.value = "   ";
+  parts.textarea.eventHandlers.input.forEach((handler) => handler({}));
+  check('a whitespace-only reason keeps save disabled', press(parts, "저장").disabled === true);
+  press(parts, "저장").click();
+  await Promise.resolve();
+  check('a whitespace-only reason is not sent either', editCalls.length === 0);
+
+  // 빠른 선택 → 저장 가능, 사유가 서버 요청에 실린다
+  press(parts, "팀 순서 바뀜").click();
+  check('quick pick fills the reason and enables save',
+    parts.textarea.value === "팀 순서 바뀜" && press(parts, "저장").disabled === false);
+  parts.inputs[0].value = "10"; parts.inputs[1].value = "6";
+  parts.inputs[2].value = "10"; parts.inputs[3].value = "7";
+  press(parts, "저장").click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  check('score edit sends directEditOfficialScore with the chosen reason and new score',
+    editCalls.length === 1 && editCalls[0][0] === "directEditOfficialScore"
+      && editCalls[0][1].reason === "팀 순서 바뀜"
+      && editCalls[0][1].matchKey === "m-approved"
+      && editCalls[0][1].expectedOfficialRevision === 1
+      && JSON.stringify(editCalls[0][1].score.sets) === JSON.stringify([{ a: 10, b: 6 }, { a: 10, b: 7 }]));
+  check('score edit modal closes after a successful save', ui.modalRoot().children.length === 0);
+
+  // 직접 입력
+  ui.reason.openApprovedPrelimEdit(editCalls);
+  parts = findModalParts();
+  parts.textarea.value = "  기록지 대조 결과 3번째 세트 점수 오기  ";
+  parts.textarea.eventHandlers.input.forEach((handler) => handler({}));
+  press(parts, "저장").click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  check('free-text reason is trimmed and recorded',
+    editCalls.length === 2 && editCalls[1][1].reason === "기록지 대조 결과 3번째 세트 점수 오기");
+
+  // 반려: 같은 사유 모달
+  const rejectCalls = [];
+  ui.reason.openReject(rejectCalls);
+  parts = findModalParts();
+  check('reject modal reuses the quick-pick reason field',
+    parts.buttons.filter((b) => b.classList.contains("reason-quick-pick")).length === 3
+      && press(parts, "반려").disabled === true);
+  press(parts, "반려").click();
+  await Promise.resolve();
+  check('reject without a reason sends nothing', rejectCalls.length === 0);
+  press(parts, "세트 누락").click();
+  press(parts, "반려").click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  check('reject sends the reason from the modal',
+    rejectCalls.length === 1 && rejectCalls[0][0] === "rejectScoreReview" && rejectCalls[0][1].reason === "세트 누락");
+
+  const adminSource = fs.readFileSync(new URL('./admin.js', import.meta.url), 'utf8');
+  check('score edit and reject no longer use the browser prompt for reasons',
+    !/requiredReason\("(관리자 직접 수정|승인된 본선 점수 정정|반려)"\)/.test(adminSource));
 }
 
 

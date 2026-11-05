@@ -46,7 +46,7 @@ export function renderBracket(container, matches, options = {}) {
   } else if (options.editable && options.onSwapSlot && locked) {
     const hint = document.createElement("div");
     hint.className = "empty-hint bracket-history-hint";
-    hint.textContent = "경기 입력·승인 이력이 있어 팀 자리는 고정됩니다. 승인 취소 후에도 같은 팀 순서로 점수를 다시 입력하세요.";
+    hint.textContent = "경기 입력·승인 이력이 있어 팀 자리는 고정됩니다. 점수가 틀렸다면 해당 경기의 ‘점수 수정’으로 같은 팀 순서에서 고치세요.";
     container.appendChild(hint);
   }
 
