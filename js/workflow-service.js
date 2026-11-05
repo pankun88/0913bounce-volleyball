@@ -16,15 +16,15 @@ const base = (collection, id) => doc(db, "tournaments", TOURNAMENT_ID, collectio
 const sessionStorageKey = `recorder-session:${TOURNAMENT_ID}`;
 const reasonMessages = {
   unresolved_teams: "대진이 확정되기를 기다리고 있습니다.",
-  stale_queue: "경기 순서가 변경되었습니다. 현재 경기를 다시 확인하세요.",
-  ownership_lost: "다른 탭 또는 기록관이 이 입력을 이어받았습니다.",
-  lease_expired: "입력 시간이 만료되었습니다. 초안을 이어서 하세요.",
+  stale_queue: "경기 순서가 바뀌었습니다. 화면이 새로 바뀐 뒤 다시 눌러 주세요.",
+  ownership_lost: "다른 사람이나 다른 화면이 이 경기 입력을 이어받았습니다.",
+  lease_expired: "입력 시간이 끝났습니다. ‘입력 다시 시작’을 눌러 이어서 입력하세요.",
   submitted: "이미 제출된 경기입니다.",
-  maintenance: "대회 점검 중입니다. 점검 후 다시 시도하세요.",
-  recorder_access_required: "현재 기록관 권한이 필요합니다.",
-  recorder_name_changed: "담당 기록관 이름이 변경되었습니다. 코트를 다시 선택하세요.",
-  operation_mismatch: "이 요청은 이전 작업과 일치하지 않습니다. 현재 경기 상태를 다시 확인하세요.",
-  stale_revision: "다른 저장 내용이 먼저 반영되었습니다. 최신 초안을 다시 확인하세요.",
+  maintenance: "대회 점검 중입니다. 점검이 끝난 뒤 다시 시도하세요.",
+  recorder_access_required: "기록관 권한이 필요합니다. 대회 코드를 다시 입력하세요.",
+  recorder_name_changed: "담당 기록관 이름이 바뀌었습니다. 코트를 다시 선택하세요.",
+  operation_mismatch: "이전 요청과 달라 처리하지 못했습니다. 화면을 새로 고친 뒤 다시 시도하세요.",
+  stale_revision: "다른 곳에서 먼저 저장한 점수가 있습니다. 화면의 안내에 따라 선택하세요.",
   qualification_unverified: "본선 진출팀을 다시 확인해야 합니다. 관리자에게 확인을 요청하세요.",
 };
 
@@ -58,8 +58,13 @@ export function rotateRecorderSessionId() {
 }
 export function operationId() { return crypto.randomUUID(); }
 export function recorderReason(error) {
-  const reason = error?.details?.reason || error?.details?.code || error?.message?.match(/\b(unresolved_teams|stale_queue|ownership_lost|lease_expired|submitted|maintenance|recorder_access_required|recorder_name_changed|operation_mismatch|qualification_unverified)\b/)?.[1];
-  return reasonMessages[reason] || error?.message || "처리 중 오류가 발생했습니다.";
+  const reason = error?.details?.reason || error?.details?.code || error?.message?.match(/\b(unresolved_teams|stale_queue|ownership_lost|lease_expired|submitted|maintenance|recorder_access_required|recorder_name_changed|operation_mismatch|stale_revision|qualification_unverified)\b/)?.[1];
+  if (reasonMessages[reason]) return reasonMessages[reason];
+  if (/(?:unavailable|deadline-exceeded|internal|unknown|network)$/.test(String(error?.code || ""))) {
+    return "인터넷 연결이 불안정합니다. 연결을 확인한 뒤 다시 눌러 주세요.";
+  }
+  const message = String(error?.message || "");
+  return /[가-힣]/.test(message) ? message : "처리하지 못했습니다. 인터넷 연결을 확인하고 다시 눌러 주세요.";
 }
 export function subscribeCourt(courtId, callback, onError) {
   return onSnapshot(base("courts", courtId), { includeMetadataChanges: true }, (s) => callback(s.exists() ? { id: s.id, ...s.data() } : null, s.metadata), onError);

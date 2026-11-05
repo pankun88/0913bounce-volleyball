@@ -47,14 +47,15 @@
         </div>
         <button id="changeCourtButton" class="quiet-button" type="button">코트 변경</button>
       </header>
+      <p id="courtChangeNotice" class="notice rejection" role="alert" hidden></p>
       <section class="court-schedule" aria-labelledby="courtScheduleHeading">
         <h2 id="courtScheduleHeading">코트 경기 일정</h2>
         <p id="courtScheduleStatus" class="court-schedule-status" role="status" aria-live="polite"></p>
         <ol id="courtScheduleList" class="court-schedule-list"></ol>
       </section>
       <section id="workflowPanel" class="panel" hidden aria-labelledby="workflowTitle">
-        <h2 id="workflowTitle" tabindex="-1">점수 입력</h2><div id="matchSummary" class="match-summary"></div><aside id="rejectionNotice" class="notice rejection" hidden></aside><aside id="lockNotice" class="notice" hidden></aside>
-        <aside id="saveRecoveryNotice" class="notice rejection" hidden><h3 id="saveRecoveryTitle" tabindex="-1">저장 상태를 확인하세요</h3><p id="saveRecoveryMessage"></p><div class="actions"><button id="retrySaveButton" class="secondary-button" type="button" hidden>같은 초안 다시 저장</button><button id="keepLocalButton" class="secondary-button" type="button" hidden>로컬 초안 유지 후 다시 저장</button><button id="useServerButton" class="danger-button" type="button" hidden>서버 초안 사용</button></div></aside>
+        <h2 id="workflowTitle" tabindex="-1">점수 입력</h2><div id="matchSummary" class="match-summary"></div><aside id="rejectionNotice" class="notice rejection" hidden></aside><aside id="lockNotice" class="notice" hidden><p id="lockNoticeText"></p><div class="actions"><button id="lockActionButton" class="primary-button" type="button" hidden>입력 다시 시작</button></div></aside><aside id="entryNotice" class="notice success-notice" role="status" aria-live="polite" hidden></aside>
+        <aside id="saveRecoveryNotice" class="notice rejection" hidden><h3 id="saveRecoveryTitle" tabindex="-1">저장 상태를 확인하세요</h3><p id="saveRecoveryMessage"></p><div class="actions"><button id="retrySaveButton" class="secondary-button" type="button" hidden>다시 저장</button><button id="keepLocalButton" class="secondary-button" type="button" hidden>내 점수 유지</button><button id="useServerButton" class="danger-button" type="button" hidden>서버 점수 사용</button></div></aside>
         <button id="claimButton" class="primary-button" type="button" hidden>경기 입력 시작</button>
         <form id="scoreForm" hidden novalidate>
           <fieldset id="scoreFields"><legend id="scoreLegend">세트 점수</legend></fieldset>
@@ -73,11 +74,12 @@
         </form>
         <section id="discardPanel" class="notice" hidden aria-labelledby="discardTitle"><h3 id="discardTitle" tabindex="-1">초안을 폐기할까요?</h3><p id="discardMessage"></p><div class="actions"><button id="keepDraftButton" class="secondary-button" type="button">계속 입력</button><button id="confirmDiscardButton" class="danger-button" type="button">초안 폐기</button></div></section>
       </section>
-      <section id="successPanel" class="notice success-notice" hidden aria-labelledby="successTitle" role="status" aria-live="polite"><h2 id="successTitle" tabindex="-1">제출 완료</h2><p>관리자 승인 대기 중입니다.</p></section>
+      <section id="successPanel" class="notice success-notice" hidden aria-labelledby="successTitle" role="status" aria-live="polite"><h2 id="successTitle" tabindex="-1">제출 완료</h2><p id="successNote">운영본부 확인을 기다리는 중입니다. 다음 경기가 열리면 이어서 입력하세요.</p></section>
     </section>
     <section id="confirmPanel" class="panel" hidden aria-labelledby="confirmTitle">
       <h2 id="confirmTitle" tabindex="-1">제출 전 확인</h2>
       <p class="confirm-intro">점수를 확인한 뒤 제출하세요.</p>
+      <p id="submitNotice" class="notice rejection" role="alert" hidden></p>
       <div id="confirmScore" class="confirm-score">
         <div class="confirm-metadata" aria-label="기록 정보">
           <div class="confirm-meta-item"><span>코트</span><strong id="confirmCourt"></strong></div>

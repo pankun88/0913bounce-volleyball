@@ -18,11 +18,11 @@ import {
   recorderDataState, reconcileRecorderAssignment, reconcileRecorderOwnership, resolveRecorderConflict,
   writeStoredRecorderDraft, buildRecorderFixtureIdentity, cloneRecorderFixtureIdentity,
   recorderFixtureIdentityEqual, reconcileRecorderDraftIdentity, preserveStoredRecorderDraft,
-  recorderWaitingMessage,
+  recorderWaitingMessage, RECORDER_NOTICES, classifyWorkflowReadError, recorderSubmissionConfirmed, describeRecorderLock,
 } from "./recorder-state.js";
 
 const $ = (id) => document.getElementById(id);
-const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
+const ui = Object.fromEntries(["logoutButton","connectionStatus","actionStatus","storageStatus","dataStatus","retryDataButton","authPanel","authTitle","authMessage","identity","googleLoginButton","accessCodeForm","accessCode","accessCodeButton","courtPanel","courtTitle","courtSelect","recorderSelect","courtMessage","enterCourtButton","courtOperationsPanel","selectedCourtLabel","selectedRecorderLabel","changeCourtButton","courtScheduleList","courtScheduleStatus","courtScheduleHeading","workflowPanel","workflowTitle","matchSummary","rejectionNotice","lockNotice","lockNoticeText","lockActionButton","entryNotice","submitNotice","courtChangeNotice","successNote","saveRecoveryNotice","saveRecoveryTitle","saveRecoveryMessage","retrySaveButton","keepLocalButton","useServerButton","claimButton","scoreForm","scoreFields","scoreLegend","scoreError","saveButton","reviewButton","endButton","discardButton","discardPanel","discardTitle","discardMessage","keepDraftButton","confirmDiscardButton","confirmPanel","confirmTitle","confirmScore","confirmCourt","confirmRecorder","confirmMatchLabel","confirmTeamA","confirmTeamB","confirmSets","confirmOutcome","backToEditButton","submitButton","successPanel","successTitle"].map((id) => [id, $(id)]));
 let courts = [], queue, assignment, workflow, official, teams = new Map(), groups = new Map(), courtId = "", pendingCourtId = "", recorder = "", matchKey = "", busy = false, authState, readyUid = null, lastAuthKind = "", viewState = "selection";
 let fixtureIdentity = null;
 let courtAssignments = [], scheduleOfficial = new Map(), scheduleState = "idle";
@@ -40,8 +40,8 @@ const edit = {
 const dataHealth = Object.fromEntries(["courts","teams","groups","queue","court","schedule","assignment","workflow","official"]
   .map((key) => [key, { status: "idle", error: null }]));
 const dataLabels = {
-  courts: "코트 목록", teams: "팀 목록", groups: "조 목록", queue: "코트 대기열", schedule: "코트 경기 목록",
-  court: "코트 정보", assignment: "경기 배정", workflow: "점수 워크플로", official: "공식 경기",
+  courts: "코트 목록", teams: "팀 목록", groups: "조 목록", queue: "코트 진행 순서", schedule: "코트 경기 목록",
+  court: "코트 정보", assignment: "경기 배정", workflow: "경기 입력 상태", official: "공식 경기",
 };
 const storageFailureMessages = {
   blocked: "이 기기의 임시 점수 저장이 차단되었습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
@@ -51,18 +51,66 @@ const storageFailureMessages = {
   preserve_failed: "기존 임시 점수를 보존하지 못했습니다. 화면을 닫지 말고 점수를 별도로 기록하세요.",
   match_mismatch: "이 기기에 있던 임시 점수는 다른 경기의 것이라 불러오지 않고 따로 보관했습니다.",
 };
-const ownershipLostMessage = "입력 권한을 잃었습니다. 로컬 초안은 보관되어 있습니다.";
+const ownershipLostMessage = RECORDER_NOTICES.leaseExpiredKept;
 let ownershipWarning = null;
 let submissionWarning = null;
 // Set once another screen takes this match's input lease. The tab holds nothing and does nothing until reloaded.
 let inertTab = null;
-const inertTabMessage = "다른 화면에서 이 경기를 입력하고 있습니다. 이 탭을 닫으세요.";
-const releasedInputMessage = "관리자가 입력 권한을 해제했습니다. 이 화면에 입력한 점수는 지웠습니다. 다시 입력하려면 ‘경기 입력 시작’을 누르세요.";
+const inertTabMessage = "다른 화면에서 이 경기를 입력하고 있습니다. 이 화면은 닫으세요.";
+const releasedInputMessage = "운영본부가 입력 잠금을 풀었습니다. 이 화면에 입력한 점수는 지웠습니다. 다시 입력하려면 ‘점수 입력’을 누르세요.";
 const isFinal = () => ["final", "tournament", "finals"].includes(assignment?.matchType) || ["final", "finals"].includes(assignment?.phase);
 const scoreKey = () => auth.currentUser && matchKey ? `recorder-score:${TOURNAMENT_ID}:${matchKey}:${auth.currentUser.uid}` : "";
 const storageKeyForEdit = () => activeStorageKey || scoreKey();
 const status = (text) => { ui.connectionStatus.textContent = text; };
 const action = (text) => { ui.actionStatus.textContent = text; ui.actionStatus.hidden = !text; };
+const connectionLabel = () => (navigator.onLine === false ? "오프라인" : "온라인");
+// The last "could not load" text shown in the status line; render() removes it once that data is healthy again.
+let dataFailureText = "";
+const reportDataFailure = (text) => { dataFailureText = text; status(text); };
+const clearFailureNotice = () => {
+  if (dataFailureText && ui.connectionStatus.textContent === dataFailureText) status(connectionLabel());
+  dataFailureText = "";
+};
+// A denied workflow read: the rules hide the document from everyone but the lock owner, so a denial on the court's
+// current, in-progress match means another account still holds the lock. Only a claim attempt tells when it ended.
+let workflowDeniedKey = "";
+const workflowDenial = () => (workflowDeniedKey && workflowDeniedKey === matchKey && !edit.token
+  ? classifyWorkflowReadError({
+    denied: true, matchKey, queueCurrentMatchKey: queue?.currentMatchKey || "", assignmentStatus: assignment?.publicStatus || "",
+  }) : "none");
+const isBlocked = () => workflowDenial() === "blocked_by_other";
+// Own lease ran out and re-claiming it quietly has not worked yet (usually: no internet). Retried by the housekeeping tick.
+let reclaimPending = false, reclaiming = false, claiming = false;
+let heartbeatNotice = "";
+let lastAutoSubmitAt = 0, autoSubmitTries = 0;
+let submitUnconfirmedFor = null;
+// The match the 「제출 완료」 panel talks about; the panel goes away once that match is shown for input again.
+let successMatchKey = "";
+let entryNoticeTimer = null;
+function setLockNotice(text, buttonLabel = "") {
+  if (!ui.lockNotice) return;
+  ui.lockNotice.hidden = !text;
+  if (ui.lockNoticeText) ui.lockNoticeText.textContent = text || "";
+  if (ui.lockActionButton) {
+    ui.lockActionButton.hidden = !text || !buttonLabel;
+    ui.lockActionButton.textContent = buttonLabel || "";
+    ui.lockActionButton.disabled = busy || claiming || Boolean(edit.pendingSubmit) || !actionsReady();
+  }
+}
+function showCourtNotice(text) {
+  if (!ui.courtChangeNotice) return;
+  ui.courtChangeNotice.textContent = text || "";
+  ui.courtChangeNotice.hidden = !text;
+}
+const currentUid = () => auth.currentUser?.uid || authState?.user?.uid || "";
+function showEntryNotice(text, { sticky = false } = {}) {
+  if (!ui.entryNotice) return;
+  clearTimeout(entryNoticeTimer);
+  ui.entryNotice.textContent = text || "";
+  ui.entryNotice.hidden = !text;
+  if (text && !sticky) entryNoticeTimer = setTimeout(() => { ui.entryNotice.hidden = true; ui.entryNotice.textContent = ""; }, 12000);
+}
+
 const reasonCode = (error) => error?.details?.reason || error?.details?.code || "";
 const ambiguousNetworkResult = (error) => /(?:unavailable|deadline-exceeded|internal|unknown)$/.test(String(error?.code || ""));
 const focus = (element) => requestAnimationFrame(() => element?.focus());
@@ -368,8 +416,12 @@ function relevantDataKeys() {
   if (matchKey) keys.push("assignment", "workflow", "official");
   return keys;
 }
+function gatedDataKeys() {
+  // While another account holds the lock the workflow read is denied by design; that is not a data problem.
+  return relevantDataKeys().filter((key) => !(key === "workflow" && ["blocked_by_other", "pending"].includes(workflowDenial())));
+}
 function authoritativeDataReady() {
-  return relevantDataKeys().every((key) => dataHealth[key]?.status === "ready");
+  return gatedDataKeys().every((key) => dataHealth[key]?.status === "ready");
 }
 function authActionsReady() {
   const uid = authState?.user?.uid || auth.currentUser?.uid || null;
@@ -381,9 +433,14 @@ function actionsReady() {
 function setSnapshotState(key, metadata) {
   setDataState(key, metadata?.fromCache ? "loading" : "ready");
 }
+function clearHealedDataFailure() {
+  if (dataFailureText && authoritativeDataReady() && workflowDenial() === "none") clearFailureNotice();
+}
 function renderDataState() {
   if (!ui.dataStatus || !ui.retryDataButton) return;
-  const problems = relevantDataKeys()
+  clearHealedDataFailure();
+  if (workflowDenial() === "generic" && !dataFailureText) reportDataFailure(RECORDER_NOTICES.matchStateUnknown);
+  const problems = gatedDataKeys()
     .map((key) => ({ key, ...dataHealth[key] }))
     .filter(({ status }) => status !== "ready");
   if (!problems.length) {
@@ -396,8 +453,8 @@ function renderDataState() {
   const names = [...new Set(problems.map(({ key }) => dataLabels[key]))].join(", ");
   ui.dataStatus.hidden = false;
   ui.dataStatus.textContent = errors.length
-    ? `${names}를 확인하지 못했습니다. 최신 권위 데이터를 받은 뒤 다시 시도하세요.`
-    : `${names}를 확인하는 중입니다. 잠시 기다려 주세요.`;
+    ? `${names}를 불러오지 못했습니다. 잠시 뒤 자동으로 다시 시도합니다. 급하면 아래 ‘대회 데이터 다시 불러오기’를 누르세요.`
+    : `${names}를 불러오는 중입니다. 잠시만 기다려 주세요.`;
   ui.retryDataButton.hidden = false;
   ui.retryDataButton.disabled = busy || !authActionsReady();
 }
@@ -554,7 +611,8 @@ function clearCurrentMatch() {
   renderedFormKey = "";
   clearConfirmation();
   if (ui.matchSummary) ui.matchSummary.textContent = recorderWaitingMessage("no_current", { schedule: currentCourtSchedule() });
-  if (ui.lockNotice) ui.lockNotice.hidden = true;
+  setLockNotice("");
+  if (ui.entryNotice) ui.entryNotice.hidden = true;
   if (ui.claimButton) ui.claimButton.hidden = true;
   if (ui.scoreForm) ui.scoreForm.hidden = true;
 }
@@ -629,6 +687,14 @@ function renderSummary() {
   matchup.textContent = `${name("a")} vs ${name("b")}`;
   ui.matchSummary.replaceChildren(meta, matchup);
 }
+function renderSubmitNotice() {
+  const unconfirmed = Boolean(edit.pendingSubmit) && submitUnconfirmedFor === edit.pendingSubmit;
+  if (ui.submitNotice) {
+    ui.submitNotice.hidden = !unconfirmed;
+    ui.submitNotice.textContent = unconfirmed ? RECORDER_NOTICES.submitLost : "";
+  }
+  if (ui.submitButton) ui.submitButton.textContent = unconfirmed ? RECORDER_NOTICES.submitRetryLabel : RECORDER_NOTICES.submitLabel;
+}
 function renderSaveRecovery() {
   if (!ui.saveRecoveryNotice) return;
   const pending = edit.pendingSave;
@@ -638,12 +704,12 @@ function renderSaveRecovery() {
   ui.keepLocalButton.hidden = !conflict;
   ui.useServerButton.hidden = !conflict;
   if (pending) {
-    ui.saveRecoveryTitle.textContent = "저장 결과를 확인하는 중입니다.";
-    ui.saveRecoveryMessage.textContent = "연결이 끊겨 저장 결과를 확인하지 못했습니다. 최신 서버 초안이 같으면 자동으로 저장 완료 처리하며, 다르면 로컬 초안을 유지한 채 선택할 수 있습니다.";
+    ui.saveRecoveryTitle.textContent = "저장을 마치지 못했습니다.";
+    ui.saveRecoveryMessage.textContent = RECORDER_NOTICES.offlineSaveWaiting;
     ui.retrySaveButton.disabled = busy || !actionsReady();
   } else if (conflict) {
-    ui.saveRecoveryTitle.textContent = "서버 초안이 변경되었습니다.";
-    ui.saveRecoveryMessage.textContent = "서버의 최신 초안을 덮어쓰지 않았습니다. 로컬 초안을 유지해 새 버전을 기준으로 다시 저장하거나, 서버 초안을 직접 사용할 수 있습니다.";
+    ui.saveRecoveryTitle.textContent = RECORDER_NOTICES.saveConflictTitle;
+    ui.saveRecoveryMessage.textContent = RECORDER_NOTICES.saveConflict;
     ui.keepLocalButton.disabled = busy || !actionsReady();
     ui.useServerButton.disabled = busy || !actionsReady();
   }
@@ -808,7 +874,7 @@ function setOwnershipLostWarning(key, token, {
     const stored = storeDraft({ identity, storageKey });
     const message = stored
       ? ownershipLostMessage
-      : "입력 권한을 잃었습니다. 로컬 초안을 저장할 수 없습니다. 화면을 닫지 마세요.";
+      : RECORDER_NOTICES.leaseExpiredUnsaved;
     ownershipWarning = {
       matchKey: key,
       token,
@@ -957,6 +1023,7 @@ function applyWorkflowSnapshot(value, metadata = null) {
         action(stored ? "저장 확인됨 · 이후 변경은 미저장입니다." : "저장 확인됨 · 이후 변경을 별도로 기록하세요.");
       } else {
         const cleared = clearStored();
+        ui.scoreError.textContent = "";
         action(cleared ? "저장 확인됨" : "저장 확인됨 · 임시 저장 정리에 실패했습니다.");
       }
     } else if (reconciliation.status === "conflict" && contextIsCurrent(pendingSave.context)) {
@@ -1014,7 +1081,7 @@ function render() {
   if (inertTab) {
     if (ui.connectionStatus.textContent !== inertTab.message) status(inertTab.message);
     if (ui.rejectionNotice) ui.rejectionNotice.hidden = true;
-    if (ui.lockNotice) { ui.lockNotice.hidden = false; ui.lockNotice.textContent = inertTab.message; }
+    setLockNotice(inertTab.message);
     if (ui.claimButton) ui.claimButton.hidden = true;
     if (ui.scoreForm) ui.scoreForm.hidden = true;
     if (ui.discardPanel) ui.discardPanel.hidden = true;
@@ -1026,8 +1093,12 @@ function render() {
   }
   if (viewState !== "operations" || !matchKey) {
     if (viewState === "operations" && !matchKey && ui.matchSummary) {
-      ui.matchSummary.textContent = recorderWaitingMessage("no_current", { schedule: currentCourtSchedule() });
+      ui.matchSummary.textContent = dataHealth.queue?.status === "ready"
+        ? recorderWaitingMessage("no_current", { schedule: currentCourtSchedule() })
+        : RECORDER_NOTICES.loadingData;
     }
+    setLockNotice("");
+    if (ui.entryNotice) ui.entryNotice.hidden = true;
     if (ui.claimButton) ui.claimButton.hidden = true;
     if (ui.scoreForm) ui.scoreForm.hidden = true;
     applyActionGate();
@@ -1040,10 +1111,12 @@ function render() {
     ui.rejectionNotice.textContent = reason ? `반려 사유: ${reason} · 관리자 요청을 반영해 수정한 뒤 다시 제출하세요.` : "반려됨: 점수를 수정해 다시 제출하세요.";
   }
   const waiting = !resolved();
-  if (ui.lockNotice) {
-    ui.lockNotice.hidden = !(waiting || (workflow?.lock && !edit.token));
-    ui.lockNotice.textContent = waiting ? recorderWaitingMessage("unresolved", { assignment }) : "다른 탭 또는 기록관이 입력 중입니다.";
-  }
+  const lockView = describeRecorderLock({
+    workflow, uid: currentUid(), sessionId: recorderSessionId(), hasToken: Boolean(edit.token),
+    blocked: isBlocked(), resumable: canResumeCurrentMatch(workflow, recorder),
+    holdingScores: Boolean(edit.dirty && edit.localDraft),
+  });
+  setLockNotice(waiting ? recorderWaitingMessage("unresolved", { assignment }) : lockView.text, waiting ? "" : lockView.button);
   const selectorReady = Boolean(courtId && recorder && (ui.courtSelect?.value || pendingCourtId) === courtId);
   if (isStaleTerminalCurrent()) {
     if (ui.claimButton) {
@@ -1052,20 +1125,20 @@ function render() {
       ui.claimButton.textContent = reconcilingQueue ? "다음 경기 확인 중…" : "다음 경기로 이동";
     }
     if (ui.scoreForm) ui.scoreForm.hidden = true;
-    if (ui.lockNotice) {
-      ui.lockNotice.hidden = false;
-      ui.lockNotice.textContent = "이 경기는 관리자가 확정했습니다. 다음 경기로 이동하세요.";
-    }
+    setLockNotice("이 경기는 운영본부가 확정했습니다. ‘다음 경기로 이동’을 누르세요.", reconcilingQueue ? "다음 경기 확인 중…" : "다음 경기로 이동");
     applyActionGate();
     return;
   }
   const resumable = canResumeCurrentMatch(workflow, recorder);
   if (ui.claimButton) {
-    ui.claimButton.hidden = Boolean(edit.token) || waiting || !(resumable || ["idle","rejected"].includes(workflow?.draftState));
+    ui.claimButton.hidden = Boolean(edit.token) || waiting
+      || !(resumable || isBlocked() || ["idle","rejected"].includes(workflow?.draftState));
     ui.claimButton.hidden ||= !selectorReady;
     ui.claimButton.disabled = waiting || Boolean(edit.pendingSubmit) || !selectorReady || !actionsReady();
-    ui.claimButton.textContent = correctingRejectedScore ? "반려 점수 수정" : resumable ? "이전 작성 이어서 하기" : "경기 입력 시작";
+    ui.claimButton.textContent = isBlocked() ? lockView.button
+      : correctingRejectedScore ? "반려 점수 수정" : resumable ? RECORDER_NOTICES.restartButton : "경기 입력 시작";
   }
+  renderSubmitNotice();
   renderForm();
   applyActionGate();
   fenceAmbiguousOperation();
@@ -1093,6 +1166,14 @@ function attachMatch(key) {
     observedDraftState = null;
     activeStorageKey = "";
     fixtureIdentity = null;
+    workflowDeniedKey = "";
+    reclaimPending = false;
+    clearFailureNotice();
+    showEntryNotice("");
+    if (ui.successPanel && key === successMatchKey) {
+      ui.successPanel.hidden = true;
+      if (ui.actionStatus.textContent.startsWith("제출 완료")) action("");
+    }
   }
   matchStops.forEach((fn) => fn()); matchStops = []; officialStop(); officialStop = () => {}; matchKey = key; renderedFormKey = "";
   setDataState("assignment", "loading");
@@ -1120,6 +1201,7 @@ function attachMatch(key) {
   matchStops.push(subscribeWorkflow(key, (value, metadata) => {
     if (localMatchVersion !== matchContextVersion || key !== matchKey || viewState !== "operations") return;
     setSnapshotState("workflow", metadata);
+    if (workflowDeniedKey === key && metadata?.fromCache !== true) workflowDeniedKey = "";
     workflow = value;
     reconcileWorkflowOwnership(value, metadata, key);
     reconcileFinishedMatch(value, metadata, key);
@@ -1135,12 +1217,16 @@ function attachMatch(key) {
 function handleMatchSubscriptionError(error, key = "workflow") {
   setDataState(key, "error", error);
   if (authState?.kind === "ready" && /permission-denied/.test(String(error?.code || ""))) {
-    status("경기 상태를 다시 확인할 수 없습니다. 다음 경기로 이동하거나 데이터를 다시 불러오세요.");
+    // render() words it: "앞 기록관의 입력이 아직 끝나지 않았습니다" when the court's current match is held by someone else.
+    if (key === "workflow" && !edit.token) workflowDeniedKey = matchKey;
     render();
+    // Often just a race with the queue update that makes this match readable; look again shortly.
+    if (!isBlocked()) setTimeout(housekeeping, 2500);
     return;
   }
-  status(recorderReason(error));
+  reportDataFailure(RECORDER_NOTICES.dataLoadFailed);
   render();
+  setTimeout(housekeeping, 4000);
 }
 function attachOfficial(expectedMatchVersion = matchContextVersion) {
   if (!assignment?.matchId) {
@@ -1160,7 +1246,7 @@ function attachOfficial(expectedMatchVersion = matchContextVersion) {
   }, (error) => {
     if (expectedMatchVersion !== matchContextVersion || viewState !== "operations") return;
     setDataState("official", "error", error);
-    status(`공식 경기 데이터를 불러오지 못했습니다. ${recorderReason(error)}`);
+    reportDataFailure(RECORDER_NOTICES.dataLoadFailed);
     render();
   });
 }
@@ -1197,7 +1283,7 @@ function subscribeScheduleOfficialDocs(items, expectedCourtVersion, expectedSche
           || expectedDetailVersion !== scheduleDetailVersion) return;
       scheduleState = "error";
       setDataState("schedule", "error", error);
-      status(`코트 경기 목록을 불러오지 못했습니다. ${recorderReason(error)}`);
+      reportDataFailure(RECORDER_NOTICES.dataLoadFailed);
       renderCourtSchedule();
       renderDataState();
     }));
@@ -1224,7 +1310,7 @@ function subscribeCourtSchedule(expectedCourtVersion) {
     scheduleOfficial = new Map();
     scheduleState = "error";
     setDataState("schedule", "error", error);
-    status(`코트 경기 목록을 불러오지 못했습니다. ${recorderReason(error)}`);
+    reportDataFailure(RECORDER_NOTICES.dataLoadFailed);
     renderCourtSchedule();
     renderDataState();
   }));
@@ -1252,7 +1338,7 @@ function subscribeCourtStreams(expectedCourtVersion = courtContextVersion) {
     if (expectedCourtVersion !== courtContextVersion) return;
     queue = null;
     setDataState("queue", "error", error);
-    status(`코트 대기열을 불러오지 못했습니다. ${recorderReason(error)}`);
+    reportDataFailure(RECORDER_NOTICES.dataLoadFailed);
     render();
   }));
   courtStops.push(subscribeCourt(courtId, (court, metadata) => {
@@ -1263,7 +1349,7 @@ function subscribeCourtStreams(expectedCourtVersion = courtContextVersion) {
   }, (error) => {
     if (expectedCourtVersion !== courtContextVersion) return;
     setDataState("court", "error", error);
-    status(`코트 정보를 불러오지 못했습니다. ${recorderReason(error)}`);
+    reportDataFailure(RECORDER_NOTICES.dataLoadFailed);
     render();
   }));
   subscribeCourtSchedule(expectedCourtVersion);
@@ -1291,6 +1377,12 @@ function attachCourt(value) {
   setDataState("official", "idle");
   if (ui.workflowPanel) ui.workflowPanel.hidden = !value;
   if (ui.successPanel) ui.successPanel.hidden = true;
+  workflowDeniedKey = "";
+  reclaimPending = false;
+  submitUnconfirmedFor = null;
+  clearFailureNotice();
+  showEntryNotice("");
+  setLockNotice("");
   renderCourtSelectors();
   if (!value) {
     clearCurrentMatch();
@@ -1312,7 +1404,7 @@ function subscribeReadyCollections() {
     render();
   }, (error) => {
     if (expectedReadyVersion !== readyContextVersion) return;
-    setDataState("courts", "error", error); status(`코트 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
+    setDataState("courts", "error", error); reportDataFailure(RECORDER_NOTICES.dataLoadFailed); render();
   }));
   stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"teams"), { includeMetadataChanges: true }, (snap) => {
     if (expectedReadyVersion !== readyContextVersion || authState?.kind !== "ready") return;
@@ -1322,7 +1414,7 @@ function subscribeReadyCollections() {
     render();
   }, (error) => {
     if (expectedReadyVersion !== readyContextVersion) return;
-    setDataState("teams", "error", error); status(`팀 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
+    setDataState("teams", "error", error); reportDataFailure(RECORDER_NOTICES.dataLoadFailed); render();
   }));
   stop.push(onSnapshot(collection(db,"tournaments",TOURNAMENT_ID,"groups"), { includeMetadataChanges: true }, (snap) => {
     if (expectedReadyVersion !== readyContextVersion || authState?.kind !== "ready") return;
@@ -1330,7 +1422,7 @@ function subscribeReadyCollections() {
     groups=new Map(snap.docs.map((item)=>[item.id,{id:item.id,...item.data()}])); render();
   }, (error) => {
     if (expectedReadyVersion !== readyContextVersion) return;
-    setDataState("groups", "error", error); status(`조 목록을 불러오지 못했습니다. ${recorderReason(error)}`); render();
+    setDataState("groups", "error", error); reportDataFailure(RECORDER_NOTICES.dataLoadFailed); render();
   }));
 }
 function startReady() {
@@ -1349,6 +1441,46 @@ function stopHeartbeat() {
   heartbeat?.stop();
   heartbeat = null;
 }
+/**
+ * After sleep/wake or a long network gap this recorder's own lease can run out while nobody else took the match.
+ * `resume` without takeover succeeds only when no other screen holds a live lease, so this never steals input.
+ * Typed scores stay on screen; the server draft is only adopted when nothing is typed.
+ */
+async function reclaimOwnLease() {
+  if (reclaiming || edit.token || !reclaimPending || !matchKey || !courtId || !recorder || inertTab) return false;
+  if (!queue?.queueRevision && queue?.queueRevision !== 0) return false;
+  if (busy || edit.pendingSubmit || edit.pendingEnd || edit.pendingDiscard) return false;
+  const context = captureContext();
+  const lostWarning = ownershipWarning;
+  reclaiming = true;
+  try {
+    const result = await resumeRecorderDraft({ matchKey, courtId, queueRevision: queue.queueRevision, recorderName: recorder });
+    if (!contextIsCurrent(context) || edit.token) return false;
+    const typedElsewhere = edit.dirty && edit.savedRevision !== null && edit.savedRevision !== result.draftRevision;
+    if (typedElsewhere) { reclaimPending = false; return false; } // server draft moved on: let the person choose via 입력 다시 시작
+    edit.token = result.token;
+    edit.savedRevision = result.draftRevision;
+    edit.serverDraft = draftCopy(result.draft);
+    if (!edit.dirty) { edit.localDraft = edit.serverDraft; edit.draftMatchKey = matchKey; }
+    edit.pendingSave = null;
+    edit.saveConflict = null;
+    reclaimPending = false;
+    ownershipWarning = null;
+    if (lostWarning && ui.connectionStatus.textContent === lostWarning.message) status(connectionLabel());
+    else if (ui.connectionStatus.textContent === RECORDER_NOTICES.leaseExpiredKept) status(connectionLabel());
+    activeStorageKey = scoreKey();
+    beginHeartbeat(); renderedFormKey = ""; render();
+    showEntryNotice(RECORDER_NOTICES.reconnected);
+    return true;
+  } catch (error) {
+    // No internet yet: keep trying from the housekeeping tick. Anything else (someone else holds it): the button stays.
+    if (reasonCode(error) === "ownership_lost" || /permission-denied/.test(String(error?.code || ""))) reclaimPending = false;
+    return false;
+  } finally {
+    reclaiming = false;
+    if (contextIsCurrent(context)) render();
+  }
+}
 function beginHeartbeat() {
   stopHeartbeat();
   const context = captureContext();
@@ -1358,7 +1490,10 @@ function beginHeartbeat() {
     matchKey: context.matchKey,
     token,
     queueRevision: queue?.queueRevision,
-    onRenew: () => {},
+    onRenew: () => {
+      if (heartbeatNotice && ui.connectionStatus.textContent === heartbeatNotice) status(connectionLabel());
+      heartbeatNotice = "";
+    },
     onError: (error) => {
       if (epoch !== heartbeatEpoch || !contextIsCurrent(context) || edit.token !== token) return;
       if ([edit.pendingSubmit, edit.pendingEnd, edit.pendingDiscard]
@@ -1368,17 +1503,23 @@ function beginHeartbeat() {
         return;
       }
       if (reasonCode(error) === "lease_expired") {
+        // The lease ran out but nobody else has it (a takeover would answer ownership_lost). Take it back quietly.
+        stopHeartbeat();
         edit.token = null;
         renderedFormKey = "";
+        reclaimPending = true;
         if (edit.dirty) {
           setOwnershipLostWarning(context.matchKey, token, {
             identity: context.fixtureIdentity,
             storageKey: context.storageKey,
           });
-        }
-        else status(recorderReason(error));
+        } else status(RECORDER_NOTICES.leaseExpiredKept);
         render();
-      } else status(recorderReason(error));
+        reclaimOwnLease();
+      } else {
+        heartbeatNotice = recorderReason(error);
+        status(heartbeatNotice);
+      }
     },
   });
 }
@@ -1475,27 +1616,69 @@ watchRecorderAuthState((state) => {
   render();
   if (authKindChanged && !edit.token) focus(state.kind === "ready" ? ui.courtPanel.querySelector("h2") : ui.authTitle);
 });
-window.addEventListener("online", () => { status("온라인"); heartbeat?.start(); heartbeat?.reconcile(); applyActionGate(); render(); });
+window.addEventListener("online", () => { status("온라인"); heartbeat?.start(); heartbeat?.reconcile(); applyActionGate(); render(); housekeeping(); });
 window.addEventListener("offline", () => {
-  status("오프라인");
+  status(RECORDER_NOTICES.offlineBanner);
   heartbeat?.stop();
   if (edit.dirty) {
     const stored = storeDraft();
-    action(stored ? "오프라인 · 로컬 초안을 보관했습니다." : "오프라인 · 로컬 초안을 저장할 수 없습니다. 화면을 닫지 마세요.");
+    action(stored ? RECORDER_NOTICES.offlineAction : RECORDER_NOTICES.offlineActionUnsaved);
   }
   applyActionGate();
 });
-status(navigator.onLine ? "온라인" : "오프라인");
-document.addEventListener("visibilitychange", () => { if(document.hidden) heartbeat?.stop(); else { heartbeat?.start(); heartbeat?.reconcile(); } });
+status(navigator.onLine ? "온라인" : RECORDER_NOTICES.offlineBanner);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { heartbeat?.stop(); return; }
+  heartbeat?.start(); heartbeat?.reconcile();
+  housekeeping();
+});
+/**
+ * Quiet self-recovery, run when the screen wakes, the network returns and every 20 seconds:
+ * re-read data that failed, retry a save that never got an answer, check a submit whose answer was lost,
+ * take back this recorder's own expired lease, and (when blocked) try to take over from an expired lock.
+ * Nothing here ever steals a live lease: claim/resume without takeover are refused by the server in that case.
+ */
+let housekeepingRunning = false;
+async function housekeeping() {
+  if (housekeepingRunning || inertTab || document.hidden || navigator.onLine === false || !readyUid || viewState !== "operations") return;
+  housekeepingRunning = true;
+  try {
+    if (!busy && relevantDataKeys().some((key) => dataHealth[key]?.status === "error")
+        && !["blocked_by_other", "pending"].includes(workflowDenial())) refreshAllData();
+    if (!busy && edit.pendingSave && edit.token && actionsReady()) { await persistDraft(edit.pendingSave.draft, edit.pendingSave.context); }
+    if (!busy && edit.pendingSubmit && submitUnconfirmedFor === edit.pendingSubmit && operationContextIsCurrent(edit.pendingSubmit)
+        && await submissionAlreadyOnServer(edit.pendingSubmit)) {
+      if (ui.submitButton && !ui.submitButton.disabled) ui.submitButton.click();
+    }
+    if (!edit.token && reclaimPending) await reclaimOwnLease();
+    if (!edit.token && isBlocked() && !busy && actionsReady()) await claimCurrentMatch({ auto: true });
+  } finally {
+    housekeepingRunning = false;
+  }
+}
+setInterval(housekeeping, 20000);
 window.addEventListener("beforeunload", (event) => { if(edit.dirty || edit.pendingSubmit || edit.pendingEnd || edit.pendingDiscard) { event.preventDefault(); event.returnValue="완료되지 않은 기록관 작업이 있습니다."; } });
 channel = "BroadcastChannel" in window ? new BroadcastChannel(`recorder:${TOURNAMENT_ID}`) : null; channel?.addEventListener("message", (event) => channelMessage(event.data));
 channel?.postMessage({ type: "probe", session: recorderSessionId(), instance: tabInstanceId });
 ui.googleLoginButton.onclick=async()=>{setBusy(true);try{await loginWithGoogle();}catch(error){ui.authMessage.textContent=describeRecorderAuthError(error);}finally{setBusy(false);}};
 ui.accessCodeForm.onsubmit=async(event)=>{event.preventDefault();setBusy(true);try{await exchangeRecorderAccessCode(ui.accessCode.value);ui.accessCode.value="";}catch(error){ui.authMessage.textContent=describeRecorderAuthError(error);}finally{setBusy(false);}};
 ui.logoutButton.onclick=async()=>{
-  if ((edit.dirty || edit.token) && !window.confirm("로그아웃하면 현재 경기 잠금과 서버에 저장한 초안은 유지됩니다. 저장하지 않은 이 기기 초안은 삭제됩니다. 계속할까요?")) return;
+  if ((edit.dirty || edit.token) && !window.confirm(RECORDER_NOTICES.logoutConfirm)) return;
+  // Free this recorder's own lock first so the next recorder does not wait for the 3-minute lease to run out.
+  // The last saved server draft is kept; nothing typed after that survives, as the confirmation says.
+  let released = true;
+  if (edit.token && matchKey && courtId && !edit.pendingSubmit && !edit.pendingEnd && !edit.pendingDiscard) {
+    try {
+      await Promise.race([
+        cancelRecorderDraft({ matchKey, courtId, token: edit.token, queueRevision: queue?.queueRevision, discardDraft: false, operationId: operationId() }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 6000)),
+      ]);
+    } catch { released = false; }
+  }
+  stopHeartbeat();
   clearStored();
   await logoutRecorder();
+  if (!released) status(RECORDER_NOTICES.logoutReleaseFailed);
 };
 ui.courtSelect.onchange=()=>{
   if (selectorLocked()) {
@@ -1532,21 +1715,36 @@ if (ui.enterCourtButton) ui.enterCourtButton.onclick=()=>{
   }
   pendingCourtId = selection.courtId;
   recorder = selection.recorder;
+  showCourtNotice("");
+  showEntryNotice("");
+  action("");
+  status(connectionLabel());
   viewState = recorderRouteState(viewState, "enter", { canEnter: true });
   attachCourt(selection.courtId);
   focus(ui.courtScheduleHeading || ui.workflowTitle);
 };
 if (ui.changeCourtButton) ui.changeCourtButton.onclick=()=>{
   if (inertTab) return;
-  const blocked = busy || Boolean(edit.token || edit.pendingSubmit || edit.pendingSave || edit.pendingEnd || edit.pendingDiscard || edit.dirty);
+  const blocked = busy || Boolean(edit.token || edit.pendingSubmit || edit.pendingSave || edit.pendingEnd || edit.pendingDiscard);
   if (blocked) {
-    action("현재 경기 입력을 먼저 제출하거나 입력 종료/초안 폐기까지 마친 뒤 코트를 변경하세요. 저장하지 않은 점수는 버리지 않습니다.");
+    showCourtNotice(RECORDER_NOTICES.courtChangeBlocked);
     return;
   }
+  // Scores typed earlier but no longer being edited (입력 종료) are filed on this device under their own match,
+  // so leaving the court never loses them and they can never show up on another match.
+  if (edit.dirty && edit.localDraft && !storeDraft()) {
+    showCourtNotice(RECORDER_NOTICES.courtChangeUnsaved);
+    return;
+  }
+  showCourtNotice("");
+  showEntryNotice("");
+  status(connectionLabel());
   pendingCourtId = courtId;
   viewState = recorderRouteState(viewState, "change", { blocked: false });
   attachCourt("");
-  action("코트와 담당 기록관 이름을 다시 선택하세요.");
+  resetMatchEditor();
+  edit.savedRevision = null;
+  action(RECORDER_NOTICES.courtChangePick);
   focus(ui.courtSelect);
 };
 async function persistDraft(score, context = captureContext()) {
@@ -1587,6 +1785,7 @@ async function persistDraft(score, context = captureContext()) {
       edit.dirty = false;
       edit.touched.clear();
       const cleared = clearStored();
+      ui.scoreError.textContent = "";
       action(cleared
         ? `저장됨 ${new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"})}`
         : "저장됨 · 임시 저장 정리에 실패했습니다.");
@@ -1608,7 +1807,7 @@ async function persistDraft(score, context = captureContext()) {
           return reconciliationStatus === "confirmed";
         }
       } catch (refreshError) {
-        status(`최신 서버 초안을 확인하지 못했습니다. ${recorderReason(refreshError)}`);
+        status(RECORDER_NOTICES.offlineBanner);
       }
       if (!contextIsCurrent(context) || edit.pendingSave !== pending) return false;
     }
@@ -1626,9 +1825,9 @@ async function persistDraft(score, context = captureContext()) {
     if (!stored.ok) setStorageStatus(stored.reason);
     else clearStorageStatus();
     action(stored.ok
-      ? (ambiguous || stale ? "최신 서버 초안 확인 중 · 로컬 초안을 보관했습니다." : "저장 실패 · 로컬 초안을 보관했습니다.")
-      : "저장 실패 · 이 화면의 점수를 별도로 기록하세요.");
-    ui.scoreError.textContent = recorderReason(error);
+      ? (ambiguous || stale ? RECORDER_NOTICES.offlineAction : "저장하지 못했습니다. 입력한 점수는 이 기기에 보관되어 있습니다.")
+      : RECORDER_NOTICES.offlineActionUnsaved);
+    ui.scoreError.textContent = ambiguous ? "" : recorderReason(error);
     return false;
   } finally {
     if (contextIsCurrent(context)) {
@@ -1637,9 +1836,10 @@ async function persistDraft(score, context = captureContext()) {
     }
   }
 }
-ui.claimButton.onclick=async()=>{
-  if(!matchKey||busy||edit.pendingSubmit||!courtId||!recorder||!actionsReady())return;
+async function claimCurrentMatch({ auto = false } = {}) {
+  if(!matchKey||busy||claiming||edit.pendingSubmit||!courtId||!recorder||!actionsReady())return;
   if (isStaleTerminalCurrent()) {
+    if (auto) return;
     reconcilingQueue = true;
     render();
     try {
@@ -1660,20 +1860,23 @@ ui.claimButton.onclick=async()=>{
   }
   const context = captureContext();
   if (!context.fixtureIdentity) {
-    action("현재 경기의 공식 식별 정보를 확인한 뒤 다시 시도하세요.");
+    if (!auto) action("경기 정보를 불러오는 중입니다. 잠시 뒤 다시 눌러 주세요.");
     return;
   }
   const afterReject = workflow?.draftState === "rejected";
-  setBusy(true);
+  const wasBlocked = isBlocked();
+  claiming = true;
+  if (!auto) setBusy(true); else render();
   try {
     const fn=canResumeCurrentMatch(workflow,recorder)?resumeRecorderDraft:claimRecorderDraft;
+    const args={matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder};
     let result;
     try {
-      result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder});
+      result=await fn(args);
     } catch(error) {
-      if (workflow?.lock?.uid === auth.currentUser?.uid && reasonCode(error) === "ownership_lost"
-          && window.confirm("다른 탭에서 이 경기 입력을 열고 있습니다. 그 탭의 입력권을 이어받을까요? 다른 탭의 저장되지 않은 값은 자동으로 삭제되지 않습니다.")) {
-        result=await fn({matchKey,courtId,queueRevision:queue.queueRevision,recorderName:recorder,takeover:true});
+      if (!auto && workflow?.lock?.uid === auth.currentUser?.uid && reasonCode(error) === "ownership_lost"
+          && window.confirm(RECORDER_NOTICES.takeoverConfirm)) {
+        result=await fn({...args,takeover:true});
       } else throw error;
     }
     if (!contextIsCurrent(context)) return;
@@ -1686,6 +1889,10 @@ ui.claimButton.onclick=async()=>{
     edit.saveConflict=null;
     edit.touched.clear();
     edit.dirty=false;
+    workflowDeniedKey = "";
+    reclaimPending = false;
+    ownershipWarning = null;
+    clearFailureNotice();
     fixtureIdentity = cloneRecorderFixtureIdentity(context.fixtureIdentity);
     activeStorageKey = scoreKey();
     if (afterReject) {
@@ -1695,14 +1902,26 @@ ui.claimButton.onclick=async()=>{
       const saved=readStored();
       restoreStoredAfterClaim(saved, fixtureIdentity, result.draftRevision);
     }
+    if (ui.successPanel) ui.successPanel.hidden = true;
+    const inherited = (result.draft?.sets || []).length > 0;
+    showEntryNotice(wasBlocked ? (inherited ? RECORDER_NOTICES.takenOver : RECORDER_NOTICES.takenOverEmpty) : "");
     channel?.postMessage({type:"claimed",matchKey,session:recorderSessionId(),instance:tabInstanceId});
     beginHeartbeat(); renderedFormKey=""; render(); navigateToWorkflowEntry(context, edit.token);
+    // A denied read ends that listener for good; start fresh ones now that this screen owns the match.
+    if (wasBlocked) attachMatch(matchKey);
   } catch(error) {
-    if (contextIsCurrent(context)) status(recorderReason(error));
+    if (!contextIsCurrent(context)) return;
+    if (reasonCode(error) === "ownership_lost" && isBlocked()) {
+      // Still held by someone else: keep waiting, and say so only when the recorder asked.
+      if (!auto) showEntryNotice(RECORDER_NOTICES.blockedTryAgain);
+    } else if (!auto) status(recorderReason(error));
   } finally {
-    if (contextIsCurrent(context)) setBusy(false);
+    claiming = false;
+    if (contextIsCurrent(context)) { if (!auto) setBusy(false); else render(); }
   }
-};
+}
+ui.claimButton.onclick=()=>claimCurrentMatch();
+ui.lockActionButton.onclick=()=>claimCurrentMatch();
 ui.scoreForm.onsubmit=async(event)=>{
   event.preventDefault();
   if (busy || !actionsReady() || edit.pendingSave || edit.saveConflict) return;
@@ -1753,7 +1972,7 @@ ui.useServerButton.onclick=()=>{
   render();
   focus(ui.scoreFields.querySelector("input"));
 };
-ui.retryDataButton.onclick=()=>{
+function refreshAllData() {
   if (inertTab || busy || !readyUid) return;
   subscribeReadyCollections();
   if (courtId && viewState === "operations") {
@@ -1766,7 +1985,8 @@ ui.retryDataButton.onclick=()=>{
   }
   if (matchKey && viewState === "operations") attachMatch(matchKey);
   render();
-};
+}
+ui.retryDataButton.onclick=refreshAllData;
 ui.reviewButton.onclick=()=>{
   if (!actionsReady() || busy || edit.pendingSave || edit.saveConflict) return;
   const check=validate(true);
@@ -1789,6 +2009,11 @@ ui.reviewButton.onclick=()=>{
   focus(ui.confirmTitle);
 };
 ui.backToEditButton.onclick=()=>{edit.reviewedPayload=null;clearConfirmation();render();focus(ui.scoreFields.querySelector("input"));};
+function submissionAlreadyOnServer(pending) {
+  return fetchRecorderWorkflow(pending.matchKey)
+    .then((fresh) => recorderSubmissionConfirmed({ workflow: fresh, pendingSubmit: pending, uid: currentUid() }))
+    .catch(() => false);
+}
 ui.submitButton.onclick=async()=>{
   if (busy || (!edit.reviewedPayload && !edit.pendingSubmit) || !actionsReady()) return;
   const submittedMatchKey = matchKey;
@@ -1813,11 +2038,19 @@ ui.submitButton.onclick=async()=>{
     edit.pendingSubmit = pending;
   }
   setBusy(true);
+  let foundOnServer = false;
   try {
-    await submitRecorderDraft(pending);
+    try {
+      await submitRecorderDraft(pending);
+    } catch (submitError) {
+      // A lost response does not mean a lost submission: ask the server before telling anyone to submit again.
+      if (!ambiguousNetworkResult(submitError) || !(await submissionAlreadyOnServer(pending))) throw submitError;
+      foundOnServer = true;
+    }
     if (edit.pendingSubmit !== pending) return;
     clearVerifiedOperationWarning(pending);
     clearSubmissionWarning(pending);
+    if (submitUnconfirmedFor === pending) submitUnconfirmedFor = null;
     const completion = reconcileRecorderSubmit({
       pendingSubmit: pending,
       currentMatchKey: matchKey,
@@ -1831,7 +2064,11 @@ ui.submitButton.onclick=async()=>{
       clearConfirmation();
     }
     ui.successTitle.textContent = `제출 완료 · ${draftTeamPair(pending.fixtureIdentity)}`;
+    if (ui.successNote) ui.successNote.textContent = foundOnServer
+      ? RECORDER_NOTICES.submitFoundOnServer
+      : "운영본부 확인을 기다리는 중입니다. 다음 경기가 열리면 이어서 입력하세요.";
     ui.successPanel.hidden = false;
+    successMatchKey = pending.matchKey;
     if (completion.status === "completed_stale") {
       const preserved = preserveStoredRecorderDraft(getLocalStorage(), pending.storageKey, {
         draft: pending.score,
@@ -1872,7 +2109,7 @@ ui.submitButton.onclick=async()=>{
         clearConfirmation();
       }
     }
-    ui.scoreError.textContent = recorderReason(error);
+    ui.scoreError.textContent = ambiguous ? "" : recorderReason(error);
     if (!ambiguous && queue && dataHealth.queue?.status === "ready"
         && queue.currentMatchKey !== pending.matchKey) {
       if (edit.localDraft && !storeDraft()) {
@@ -1885,10 +2122,10 @@ ui.submitButton.onclick=async()=>{
       showSubmissionWarning(pending, `${draftTeamPair(pending.fixtureIdentity)} 제출 실패: ${recorderReason(error)} 입력은 임시 초안으로 보관하고 현재 경기 목록을 갱신했습니다.`);
       return;
     }
+    if (ambiguous) submitUnconfirmedFor = pending;
     const submitStatus = ambiguous
-      ? "제출 여부를 확인하지 못했습니다. ‘점수 제출’을 다시 눌러 확인하세요."
-      : `${recorderReason(error)} 점수를 수정하거나 현재 경기 상태를 다시 불러오세요.`;
-    if (ambiguous && ui.confirmOutcome) ui.confirmOutcome.textContent = `제출 상태: ${submitStatus}`;
+      ? RECORDER_NOTICES.submitLost
+      : `${recorderReason(error)} ${RECORDER_NOTICES.submitFailedGeneric}`;
     if (!preserveOwnershipWarning(pending)) showSubmissionWarning(pending, submitStatus);
   } finally {
     setBusy(false);
@@ -1927,7 +2164,7 @@ ui.endButton.onclick=async()=>{
     edit.reviewedPayload = null;
     clearConfirmation();
     stopHeartbeat();
-    if (!keepOwnershipWarning) status("입력을 종료했습니다. 초안은 보관됩니다.");
+    if (!keepOwnershipWarning) status(RECORDER_NOTICES.inputEnded);
     focus(ui.workflowTitle);
   } catch (error) {
     const ambiguous = ambiguousNetworkResult(error);

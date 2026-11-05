@@ -15,6 +15,10 @@ import {
   reconcileRecorderOwnership,
   reconcileRecorderSnapshot,
   reconcileRecorderSubmit,
+  recorderSubmissionConfirmed,
+  classifyWorkflowReadError,
+  describeRecorderLock,
+  RECORDER_NOTICES,
   removeStoredRecorderDraft,
   writeStoredRecorderDraft,
 } from "./recorder-state.js";
@@ -315,7 +319,8 @@ function submitRaceHarness() {
     courtContextVersion: 1, contextVersion: 0, fixtureIdentity: identities.get("M1"),
     workflow: { submissionVersion: 0 }, assignment: { id: "M1" },
     dataHealth: { queue: { status: "ready" } },
-    submissionWarning: null,
+    submissionWarning: null, submitUnconfirmedFor: null, RECORDER_NOTICES, recorderSubmissionConfirmed,
+    currentUid: () => "uid-1", fetchRecorderWorkflow: () => Promise.reject(new Error("offline")),
     queue: { currentMatchKey: "M1", queueRevision: 1 }, courtStops: [], db: {}, TOURNAMENT_ID: "test",
     buildRecorderSubmitContext, reconcileRecorderSubmit, recorderFixtureIdentityEqual, cloneRecorderFixtureIdentity,
     preserveStoredRecorderDraft, removeStoredRecorderDraft, writeStoredRecorderDraft,
@@ -350,7 +355,7 @@ function submitRaceHarness() {
   vm.createContext(context);
   const names = ["currentFixtureIdentity", "operationContextIsCurrent", "syncScreenVisibility",
     "resetMatchEditor", "clearStoredKey", "clearDeviceDraft", "storeDraft", "fenceAmbiguousOperation", "followCourtQueue", "subscribeCourtStreams",
-    "showSubmissionWarning", "clearSubmissionWarning"];
+    "showSubmissionWarning", "clearSubmissionWarning", "submissionAlreadyOnServer"];
   const start = recorderSource.indexOf("ui.submitButton.onclick=async()=>{");
   const end = recorderSource.indexOf("\nui.endButton.onclick", start);
   assert.ok(start >= 0 && end > start);
@@ -628,6 +633,29 @@ function tabSafetyHarness({ matchKey = "M1" } = {}) {
   h.snapshot("M2");
   assert.deepEqual(readStoredRecorderDraft(h.local, "score:M2").value.draft, h.nextDraft, "match 2's own draft is untouched");
   assert.equal(h.edit.draftMatchKey, null);
+}
+
+// Self-recovery decisions (1108): plain notices, blocked-by-other detection, lost-response confirmation.
+{
+  assert.equal(classifyWorkflowReadError({ denied: false }), "none");
+  assert.equal(classifyWorkflowReadError({ denied: true, matchKey: "M1", queueCurrentMatchKey: "M1", assignmentStatus: "in_progress" }), "blocked_by_other");
+  assert.equal(classifyWorkflowReadError({ denied: true, matchKey: "M1", queueCurrentMatchKey: "M1", assignmentStatus: "" }), "pending");
+  assert.equal(classifyWorkflowReadError({ denied: true, matchKey: "M1", queueCurrentMatchKey: "M2", assignmentStatus: "in_progress" }), "generic", "a denied read for a non-current match is never treated as someone else's lock");
+  const pending = { score: { sets: [{ a: 11, b: 9 }] }, submissionVersion: 0 };
+  const sub = (over = {}) => ({ draftState: "submitted", submissionVersion: 1, submission: { recorder: { uid: "u1" } }, submittedSnapshot: { sets: [{ a: 11, b: 9 }] }, ...over });
+  assert.equal(recorderSubmissionConfirmed({ workflow: sub(), pendingSubmit: pending, uid: "u1" }), true);
+  assert.equal(recorderSubmissionConfirmed({ workflow: sub({ submissionVersion: 0 }), pendingSubmit: pending, uid: "u1" }), false, "an old submission proves nothing");
+  assert.equal(recorderSubmissionConfirmed({ workflow: sub(), pendingSubmit: pending, uid: "u2" }), false, "someone else's submission proves nothing");
+  assert.equal(recorderSubmissionConfirmed({ workflow: sub({ submittedSnapshot: { sets: [{ a: 1, b: 2 }] } }), pendingSubmit: pending, uid: "u1" }), false, "a different score is not our submission");
+  assert.equal(recorderSubmissionConfirmed({ workflow: sub({ draftState: "editing" }), pendingSubmit: pending, uid: "u1" }), false);
+  assert.match(describeRecorderLock({ blocked: true }).text, /최대 3분 뒤 자동으로 넘겨받습니다/);
+  assert.equal(describeRecorderLock({ blocked: true }).button, "지금 다시 확인");
+  assert.equal(describeRecorderLock({ workflow: { lock: { uid: "u1", sessionId: "s1" } }, uid: "u1", sessionId: "s1", resumable: true }).button, "입력 다시 시작");
+  assert.deepEqual(describeRecorderLock({ workflow: { lock: { uid: "u1" } }, hasToken: true }), { text: "", button: "" });
+  const jargon = /워크플로|lease|lock|토큰|revision|리비전|sessionId|draft/i;
+  for (const [key, value] of Object.entries(RECORDER_NOTICES)) {
+    if (typeof value === "string") assert.doesNotMatch(value, jargon, `notice ${key} stays in plain language`);
+  }
 }
 
 console.log("recorder draft identity and submit ordering fixtures passed");

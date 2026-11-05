@@ -930,3 +930,98 @@ export function recorderRouteState(previous = "selection", event = "", { canEnte
   if (event === "logout" || event === "reset") return "selection";
   return current;
 }
+
+/**
+ * Plain-language recorder notices. Every notice says what happened and which
+ * button to press, and that button sits next to the notice. The printed
+ * 기록관 안내 (기록관_안내_1108.md) quotes these strings; keep both in sync.
+ */
+export const RECORDER_NOTICES = Object.freeze({
+  blockedByOther: "앞 기록관의 입력이 아직 끝나지 않았습니다. 최대 3분 뒤 자동으로 넘겨받습니다. 급하면 운영본부에 ‘잠금 해제’를 요청하세요.",
+  blockedByOtherButton: "지금 다시 확인",
+  takenOver: "앞 기록관의 입력 시간이 끝나 이어받았습니다. 점수칸에 앞 기록관이 저장해 둔 점수가 있을 수 있으니 실제 점수와 맞는지 확인하고 이어서 입력하세요.",
+  takenOverEmpty: "앞 기록관의 입력 시간이 끝나 이어받았습니다. 처음부터 입력하세요.",
+  reconnected: "다시 연결했습니다. 이어서 입력하세요.",
+  resumeOwn: "이 계정이 입력하던 경기입니다. ‘입력 다시 시작’을 누르면 입력한 점수 그대로 이어집니다.",
+  sameAccountOtherScreen: "같은 계정의 다른 화면에서 이 경기를 입력 중입니다. 그 화면을 닫거나, ‘입력 다시 시작’을 눌러 이 화면으로 넘겨받으세요.",
+  restartButton: "입력 다시 시작",
+  leaseExpiredKept: "입력 시간이 끝났습니다. 입력한 점수는 이 기기에 보관되어 있습니다. 아래 ‘입력 다시 시작’을 누르세요.",
+  leaseExpiredUnsaved: "입력 시간이 끝났고 점수를 이 기기에 보관하지 못했습니다. 화면을 닫지 말고 아래 ‘입력 다시 시작’을 누르세요.",
+  submitLost: "인터넷이 잠깐 끊겼습니다. ‘다시 제출’을 눌러 주세요. 두 번 눌러도 한 번만 기록됩니다.",
+  submitRetryLabel: "다시 제출",
+  submitLabel: "점수 제출",
+  submitFoundOnServer: "인터넷이 끊겼던 사이에 제출이 이미 끝나 있었습니다. 다시 제출할 필요 없습니다.",
+  submitFailedGeneric: "제출하지 못했습니다. ‘수정’을 눌러 점수를 확인한 뒤 다시 제출하세요. 계속 안 되면 운영본부에 알려 주세요.",
+  offlineSaveWaiting: "인터넷이 잠깐 끊겨 저장을 마치지 못했습니다. 입력한 점수는 이 기기에 보관되어 있고, 연결되면 자동으로 다시 저장합니다. 급하면 ‘다시 저장’을 누르세요.",
+  offlineSaveButton: "다시 저장",
+  saveConflict: "다른 곳에서 먼저 저장한 점수가 있습니다. ‘내 점수 유지’는 지금 화면의 점수를 남기고, ‘서버 점수 사용’은 먼저 저장된 점수로 바꿉니다.",
+  saveConflictTitle: "먼저 저장된 점수가 있습니다.",
+  saveConflictKeepButton: "내 점수 유지",
+  saveConflictServerButton: "서버 점수 사용",
+  offlineAction: "인터넷이 끊겼습니다. 입력한 점수는 이 기기에 보관 중입니다.",
+  offlineBanner: "인터넷이 끊겼습니다. 연결되면 자동으로 이어집니다.",
+  reconnectingBanner: "연결을 확인하는 중입니다.",
+  offlineActionUnsaved: "인터넷이 끊겼고 점수를 이 기기에 보관하지 못했습니다. 화면을 닫지 마세요.",
+  courtChangeBlocked: "점수를 입력하는 중이라 코트를 바꿀 수 없습니다. 먼저 ‘점수 확인/제출’로 제출하거나 ‘입력 관리’의 ‘입력 종료’를 누르세요.",
+  courtChangeUnsaved: "점수를 이 기기에 보관하지 못해 코트를 바꿀 수 없습니다. 먼저 ‘임시 저장’을 누르거나 제출하세요.",
+  courtChangePick: "코트와 이름을 다시 선택하세요.",
+  inputEnded: "입력을 종료했습니다. 입력한 점수는 보관되어 있고, 다시 입력하려면 ‘점수 입력’을 누르세요.",
+  dataLoadFailed: "불러오지 못한 정보가 있습니다. 잠시 뒤 자동으로 다시 시도합니다. 급하면 ‘대회 데이터 다시 불러오기’를 누르세요.",
+  reconnecting: "인터넷 연결을 기다리는 중입니다. 입력한 점수는 화면에 그대로 있습니다. 연결되면 자동으로 이어집니다.",
+  blockedTryAgain: "아직 앞 기록관의 입력 시간이 끝나지 않았습니다. 잠시 뒤 자동으로 다시 확인합니다.",
+  loadingData: "정보를 불러오는 중입니다. 잠시만 기다려 주세요.",
+  matchStateUnknown: "경기 정보를 확인하지 못했습니다. 잠시 뒤 자동으로 다시 확인합니다. 계속되면 ‘대회 데이터 다시 불러오기’를 누르세요.",
+  logoutConfirm: "로그아웃하면 이 경기 입력을 마치고 입력 잠금도 풀립니다. ‘임시 저장’을 누르지 않은 점수는 사라집니다. 계속할까요?",
+  logoutReleaseFailed: "입력 잠금을 풀지 못했습니다. 최대 3분 뒤 자동으로 풀립니다. 급하면 운영본부에 알려 주세요.",
+  takeoverConfirm: "같은 계정의 다른 화면에서 이 경기를 입력 중입니다. 이 화면으로 넘겨받을까요? 넘겨받으면 그 화면의 입력은 멈춥니다.",
+  fixtureChanged: "대진(팀 순서)이 바뀌어 입력 화면을 닫았습니다. 입력했던 점수는 이 기기에 보관했습니다. 새 대진으로 입력하려면 ‘점수 입력’을 누르세요.",
+  fixtureChangedUnsaved: "대진(팀 순서)이 바뀌어 입력 화면을 닫았지만 점수를 이 기기에 보관하지 못했습니다. 화면을 닫지 말고 점수를 따로 적어 두세요.",
+});
+
+/**
+ * A denied workflow read on the court's current, in-progress match means someone
+ * else still holds the lock (the rules hide the document from everybody but its
+ * owner). A denial on a finished or moved-on match is a generic read problem, and
+ * until the assignment is known the answer is "pending".
+ */
+export function classifyWorkflowReadError({
+  denied = false, matchKey = "", queueCurrentMatchKey = "", assignmentStatus = "",
+} = {}) {
+  if (!denied) return "none";
+  if (!matchKey || queueCurrentMatchKey !== matchKey) return "generic";
+  if (!assignmentStatus) return "pending";
+  return assignmentStatus === "in_progress" ? "blocked_by_other" : "generic";
+}
+
+/**
+ * Does a freshly read workflow prove the pending submit was recorded? It must be
+ * a newer submission by this recorder, in a submitted/approved state, with the
+ * same score. An older version or someone else's submission proves nothing.
+ */
+export function recorderSubmissionConfirmed({ workflow = null, pendingSubmit = null, uid = "" } = {}) {
+  if (!workflow || !pendingSubmit || !uid) return false;
+  if (!["submitted", "approved"].includes(workflow.draftState)) return false;
+  const version = Number.isInteger(workflow.submissionVersion) ? workflow.submissionVersion : 0;
+  const before = Number.isInteger(pendingSubmit.submissionVersion) ? pendingSubmit.submissionVersion : 0;
+  if (version <= before) return false;
+  if (workflow.submission?.recorder?.uid !== uid) return false;
+  return recorderDraftsEqual(workflow.submittedSnapshot, pendingSubmit.score);
+}
+
+/**
+ * The notice under the match and the button that goes with it. A lock is only
+ * readable by its owner, so a visible lock always belongs to this account.
+ */
+export function describeRecorderLock({
+  workflow = null, uid = "", sessionId = "", hasToken = false, blocked = false, resumable = false, holdingScores = false,
+} = {}) {
+  if (hasToken) return { text: "", button: "" };
+  if (blocked) return { text: RECORDER_NOTICES.blockedByOther, button: RECORDER_NOTICES.blockedByOtherButton };
+  const lock = workflow?.lock;
+  if (!lock) return { text: "", button: "" };
+  if (!resumable) return { text: RECORDER_NOTICES.blockedByOther, button: "" };
+  if (lock.uid === uid && lock.sessionId === sessionId) {
+    return { text: holdingScores ? RECORDER_NOTICES.leaseExpiredKept : RECORDER_NOTICES.resumeOwn, button: RECORDER_NOTICES.restartButton };
+  }
+  return { text: RECORDER_NOTICES.sameAccountOtherScreen, button: RECORDER_NOTICES.restartButton };
+}
