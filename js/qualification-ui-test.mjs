@@ -109,6 +109,10 @@ function loadAdminFunctions(names, values = {}) {
     finalSlotsLocked,
     buildCrossGroupSeedOrder,
     generateBracket,
+    qualificationInfoLoaded: true,
+    qualificationGroupsLoaded: true,
+    qualificationTeamsLoaded: true,
+    qualificationMatchesLoaded: true,
     FINAL_PUBLISH_NEXT_STEP: "본선 탭에서 ‘관객·기록관 화면에 공개’를 눌러야 다음 경기가 열립니다",
     ...values,
   });
@@ -767,7 +771,7 @@ function testPublishedProofSurvivesDivisionSwitchAndReload() {
     status,
     fingerprint,
     participantIds: ["a", "b"],
-    tieSelections: { g1: [] },
+    tieSelections: { g1: ["a", "b"] },
     reason: "published",
   });
   const published = [{ id: "m_r1_0", round: 1, teamA: { id: "a" }, teamB: { id: "b" }, status: "pending" }];
@@ -834,6 +838,8 @@ function testPublishedProofSurvivesDivisionSwitchAndReload() {
     "division switch restores the persisted server fingerprint");
   assert.equal(call(context, "qualificationProofStatus"), "current",
     "a published, verified final is not reported as unverified after switching divisions");
+  assert.deepEqual(jsonValue(context.qualificationTieSelections), { g1: ["a", "b"] },
+    "division round trip restores the persisted tie picks");
 
   // 동일한 전환에서 서버 기록이 없으면 경고가 그대로 나온다.
   delete context.tournamentInfo.finalQualification.men;
@@ -920,6 +926,159 @@ function testLateTournamentInfoDoesNotStaleAPublishedFinal() {
   context.tournamentInfo = { qualifyPerGroup: { men: 3 } };
   assert.equal(call(context, "qualificationSourceChanged"), true, "real later changes still invalidate the final");
   assert.equal(context.qualificationDraftStale, true);
+}
+
+
+// 새로고침 회귀(1108): 3팀 순환 동률 → 추첨으로 2팀 → 본선 공개 뒤 관리자 화면을 새로 열면
+// 구독(대회 문서·조·팀·예선·본선)이 임의 순서로 도착한다. 어떤 순서에서도(캐시의 빈 스냅샷 포함)
+// 서버에 기록된 추첨 선택이 지워지거나 '예선 순위 확인 필요' 경고가 생기면 안 된다.
+function tieReloadHarness() {
+  const fixture = {
+    groups: [{ id: "g1", division: "men", matchMode: "roundrobin" }],
+    teams: ["a", "b", "c"].map((id) => ({ id, division: "men", groupId: "g1", name: id.toUpperCase() })),
+    matches: [
+      prelimMatch("m1", "g1", "a", "b"),
+      prelimMatch("m2", "g1", "b", "c"),
+      prelimMatch("m3", "g1", "c", "a"),
+    ],
+  };
+  const bracket = generateBracket([{ id: "a", name: "A" }, { id: "b", name: "B" }]).matches
+    .map((match) => ({ ...match, status: "pending" }));
+  const fingerprint = "e".repeat(64);
+  const info = {
+    name: "대회",
+    qualifyPerGroup: { men: 2 },
+    finalQualification: {
+      men: {
+        status: "current", reason: "published", fingerprint,
+        participantIds: ["a", "b"], tieSelections: { g1: ["a", "b"] },
+      },
+    },
+  };
+  const elements = Object.fromEntries([
+    "qualificationProofBanner", "bracketPublishBar", "bracketPublishMsg", "publishBracketBtn", "bracketPublishTitle",
+  ].map((id) => [id, { style: {}, dataset: {}, classList: { toggle() {} } }]));
+  const context = loadAdminFunctions([
+    "noteQualificationSourceSnapshot", "qualificationSnapshotForCurrentData", "qualificationSourceChanged",
+    "qualificationStateForCurrentData", "syncQualificationProofFromTournamentInfo",
+    "qualificationHasFinalBracket", "qualificationHasFinalPlay", "qualificationPostFinalCorrected",
+    "qualificationProofStatus", "qualificationBlockerCode", "qualificationBlockerMessage",
+    "qualificationStateBlockers", "qualificationStateHasStructuralBlockers", "qualificationGuidanceForBlockers",
+    "qualificationGroupTeamIds", "canonicalQualificationTieSelections", "qualificationSelectionIds",
+    "qualificationSeedOrder", "syncQualificationSelection", "qualificationSelectionValidation",
+    "updateQualificationProofUi", "updateBracketPublishBar", "finalEntrantIds",
+    "finalByeLotteryState", "syncFinalByeSelection", "finalByeSelectionComplete", "finalByeSelectionProblem",
+    "finalPublicationStatus", "updateFinalPublicationIndicators", "hasRecordedFinalStructureChanges",
+    "finalStructureMatch", "finalBaselineDescriptor", "cloneFinalMatches",
+  ], {
+    activeDivision: "men",
+    DIVISION_LABELS: { men: "남자부", women: "여자부" },
+    tournamentInfo: {},
+    allGroups: [], allTeams: [], allPrelimMatches: [],
+    qualificationInfoLoaded: false, qualificationGroupsLoaded: false,
+    qualificationTeamsLoaded: false, qualificationMatchesLoaded: false,
+    qualificationSourceInitialized: false, qualificationSourceKey: "",
+    qualificationState: null, qualificationServerState: null, qualificationServerFingerprint: "",
+    qualificationTieSelections: {}, qualificationProof: null, qualificationReplacement: null,
+    qualificationRevalidatedLocally: false, qualificationDraftStale: false,
+    qualificationPreparationInFlight: false, qualificationPreparationError: "",
+    finalByeSelection: null, seedSelection: [], seedAutoMode: true,
+    finalMatches: [], authoritativeFinalMatches: [], finalDraftBaseline: [], finalScoreDrafts: new Map(),
+    bracketPublishPending: false, bracketPublishConflict: false, bracketPublishInFlight: false,
+    reviewAssignments: [], reviewWorkflows: new Map(),
+    document: { getElementById: (id) => elements[id], querySelector: () => null },
+    teamName: (id) => id, divisionLabel: () => "남자부",
+    updateQualificationStructureControls: () => {},
+  });
+  const render = () => {
+    call(context, "qualificationSourceChanged");
+    call(context, "qualificationStateForCurrentData");
+    call(context, "syncQualificationSelection", context.qualificationState);
+    call(context, "updateQualificationProofUi");
+    call(context, "updateBracketPublishBar");
+  };
+  const meta = (fromCache) => ({ fromCache });
+  const events = {
+    info: (cache = false) => {
+      context.tournamentInfo = cache ? {} : structuredClone(info);
+      call(context, "noteQualificationSourceSnapshot", "info", cache ? null : info, meta(cache));
+      call(context, "syncQualificationProofFromTournamentInfo");
+      render();
+    },
+    groups: (cache = false) => {
+      context.allGroups = cache ? [] : structuredClone(fixture.groups);
+      call(context, "noteQualificationSourceSnapshot", "groups", context.allGroups, meta(cache));
+      render();
+    },
+    teams: (cache = false) => {
+      context.allTeams = cache ? [] : structuredClone(fixture.teams);
+      call(context, "noteQualificationSourceSnapshot", "teams", context.allTeams, meta(cache));
+      render();
+    },
+    matches: (cache = false) => {
+      context.allPrelimMatches = cache ? [] : structuredClone(fixture.matches);
+      call(context, "noteQualificationSourceSnapshot", "matches", context.allPrelimMatches, meta(cache));
+      render();
+    },
+    finals: () => {
+      context.authoritativeFinalMatches = structuredClone(bracket);
+      context.finalMatches = structuredClone(bracket);
+      render();
+    },
+  };
+  return { context, elements, events, fixture, render };
+}
+
+function permutations(list) {
+  if (list.length <= 1) return [list];
+  return list.flatMap((item, index) => permutations([...list.slice(0, index), ...list.slice(index + 1)])
+    .map((rest) => [item, ...rest]));
+}
+
+function testReloadWithTieKeepsPicksAndPublishable() {
+  const names = ["info", "groups", "teams", "matches", "finals"];
+  const orders = permutations(names).flatMap((order) => [
+    { order, cacheFirst: false },
+    { order, cacheFirst: true },
+  ]);
+  orders.forEach(({ order, cacheFirst }) => {
+    const label = `${order.join(">")}${cacheFirst ? " (cache-first)" : ""}`;
+    const { context, elements, events } = tieReloadHarness();
+    if (cacheFirst) {
+      // 서버 확인 전 캐시의 빈 스냅샷이 먼저 온다.
+      ["info", "groups", "teams", "matches"].forEach((name) => events[name](true));
+    }
+    order.forEach((name) => events[name]());
+    assert.deepEqual(jsonValue(context.qualificationTieSelections), { g1: ["a", "b"] }, `tie picks restored: ${label}`);
+    assert.equal(context.qualificationDraftStale, false, `no false stale on initial load: ${label}`);
+    assert.equal(call(context, "qualificationProofStatus"), "current", `proof current: ${label}`);
+    assert.equal(elements.qualificationProofBanner.hidden, true, `no warning banner: ${label}`);
+    assert.equal(elements.bracketPublishBar.dataset.publicationState, "published", `not blocked: ${label}`);
+    // 공개 대기 변경이 생기면 공개 버튼이 켜진다.
+    context.bracketPublishPending = true;
+    call(context, "updateBracketPublishBar");
+    assert.equal(elements.publishBracketBtn.disabled, false, `publish enabled: ${label}`);
+    assert.notEqual(elements.bracketPublishBar.dataset.publicationState, "blocked", `publish not blocked: ${label}`);
+  });
+}
+
+function testRealPrelimChangeAfterReloadStillWarns() {
+  const { context, elements, events, fixture, render } = tieReloadHarness();
+  ["info", "groups", "teams", "matches", "finals"].forEach((name) => events[name]());
+  assert.equal(context.qualificationDraftStale, false);
+  // 공개 뒤 예선 점수 하나가 실제로 바뀐다.
+  context.allPrelimMatches = fixture.matches.map((match) => (
+    match.id === "m1" ? { ...match, sets: [{ a: 3, b: 10 }, { a: 4, b: 10 }], officialRevision: 2 } : match
+  ));
+  render();
+  assert.equal(context.qualificationDraftStale, true, "a real prelim change marks the bracket stale");
+  assert.equal(call(context, "qualificationProofStatus"), "stale");
+  assert.equal(elements.qualificationProofBanner.hidden, false);
+  assert.match(elements.qualificationProofBanner.textContent, /예선 점수가 바뀌었습니다/);
+  context.bracketPublishPending = true;
+  call(context, "updateBracketPublishBar");
+  assert.equal(elements.publishBracketBtn.disabled, true, "publication stays blocked until re-checked");
+  assert.equal(elements.bracketPublishBar.dataset.publicationState, "blocked");
 }
 
 // 항목 1: 본선 공개 상태 문구가 기록관 입력 가능 여부를 분명히 알린다.
@@ -1089,6 +1248,8 @@ async function runQualificationUiSuite() {
   testPublishedProofSurvivesDivisionSwitchAndReload();
   testLateTournamentInfoDoesNotStaleAPublishedFinal();
   testFinalPublicationStatusCopy();
+  testReloadWithTieKeepsPicksAndPublishable();
+  testRealPrelimChangeAfterReloadStillWarns();
   testReplacementAvailableAfterReload();
   await testByeLotteryGeneratesAndPublishes();
   testActualSourceInvalidationAndForeignRecords();

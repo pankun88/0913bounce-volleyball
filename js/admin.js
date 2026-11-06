@@ -409,7 +409,21 @@ function qualificationSeedOrder(state, tieSelections = qualificationTieSelection
   return buildCrossGroupSeedOrder(tiers);
 }
 
+/** 구독 스냅샷이 도착했음을 기록한다. 캐시에서 온 빈 스냅샷은 '데이터가 없음'이 아니라
+ * '아직 서버 확인 전'일 수 있어 로드 완료로 치지 않는다. */
+function noteQualificationSourceSnapshot(kind, data, metadata) {
+  const empty = data == null || (Array.isArray(data) && data.length === 0);
+  if (empty && metadata?.fromCache) return;
+  if (kind === "info") qualificationInfoLoaded = true;
+  else if (kind === "groups") qualificationGroupsLoaded = true;
+  else if (kind === "teams") qualificationTeamsLoaded = true;
+  else if (kind === "matches") qualificationMatchesLoaded = true;
+}
+
 function syncQualificationSelection(state) {
+  // 새로고침 직후 구독이 덜 도착한 상태에서 추첨 선택·부전승 추첨을 후보 없음으로 정리해 버리면,
+  // 서버 기록에서 복원한 값이 영영 사라진다. 모든 원본이 도착하기 전에는 건드리지 않는다.
+  if (!qualificationInfoLoaded || !qualificationGroupsLoaded || !qualificationTeamsLoaded || !qualificationMatchesLoaded) return;
   const nextTies = canonicalQualificationTieSelections(state);
   qualificationTieSelections = nextTies;
   const ids = new Set(qualificationSelectionIds(state, nextTies));
@@ -758,11 +772,11 @@ initHelpTooltips();
 bindStaticHandlers();
 initConnectionWatch();
 
-subscribeTournamentInfo((info) => {
+subscribeTournamentInfo((info, metadata) => {
   hideErrorBanner();
   setConnStatus(true);
   tournamentInfo = info || {};
-  qualificationInfoLoaded = true;
+  noteQualificationSourceSnapshot("info", info, metadata);
   syncQualificationProofFromTournamentInfo();
   const nameInput = document.getElementById("tournamentNameInput");
   if (nameInput && !nameInput.value) nameInput.value = tournamentInfo.name || "";
@@ -783,18 +797,18 @@ subscribeTournamentInfo((info) => {
   updateQualificationStructureControls();
 });
 
-subscribeGroups((data) => {
+subscribeGroups((data, metadata) => {
   allGroups = data;
-  qualificationGroupsLoaded = true;
+  noteQualificationSourceSnapshot("groups", data, metadata);
   invalidateCorrectionPreview("조 정보가 바뀌었습니다. 변경 내용을 다시 확인하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
   refreshActiveDivisionData();
 });
 
-subscribeTeams((data) => {
+subscribeTeams((data, metadata) => {
   allTeams = data;
-  qualificationTeamsLoaded = true;
+  noteQualificationSourceSnapshot("teams", data, metadata);
   invalidateCorrectionPreview("팀 정보가 바뀌었습니다. 변경 내용을 다시 확인하세요.");
   if (!workflowDirty) resetWorkflowDraft();
   else refreshWorkflowMatchMetadata();
@@ -803,7 +817,7 @@ subscribeTeams((data) => {
 
 subscribePrelimMatches((data, metadata) => {
   allPrelimMatches = data;
-  qualificationMatchesLoaded = true;
+  noteQualificationSourceSnapshot("matches", data, metadata);
   prelimHistoryReadiness = metadata?.fromCache === false && metadata?.hasPendingWrites === false
     ? { status: "ready", error: null }
     : { status: "loading", error: null };
@@ -6006,7 +6020,7 @@ function finalPublicationStatus(input) {
   }
   const recorderNote = published
     ? "기록관 화면과 관객 화면에는 마지막으로 공개한 대진·점수만 보입니다."
-    : "아직 한 번도 공개하지 않아 기록관에게 본선 경기가 없고, ‘기록·검수’ 코트 배정에도 나타나지 않습니다.";
+    : "아직 한 번도 공개하지 않아 기록관에게 본선 경기가 없고, ‘대회설정 → 통합 경기 배정·순서’ 코트 배정에도 나타나지 않습니다.";
   if (needsReview || byeProblem) {
     return {
       state: "blocked",
@@ -6031,7 +6045,7 @@ function finalPublicationStatus(input) {
   return {
     state: "published",
     title: "공개됨 — 기록관 입력 가능",
-    message: "모든 변경사항이 관객·기록관 화면에 공개되어 있습니다. 두 팀이 확정된 본선 경기는 ‘기록·검수’에서 코트에 배정하면 기록관이 입력합니다.",
+    message: "모든 변경사항이 관객·기록관 화면에 공개되어 있습니다. 두 팀이 확정된 본선 경기는 ‘대회설정 → 통합 경기 배정·순서’에서 코트에 배정하면 기록관이 입력합니다.",
   };
 }
 
