@@ -658,7 +658,11 @@ function measureDashboardStage(stage) {
   let top = 0;
   let right = Math.max(stage.offsetWidth || 0, stage.scrollWidth || 0);
   let bottom = Math.max(stage.offsetHeight || 0, stage.scrollHeight || 0);
+  // 좁은 화면에서는 대진표 상자(.bracket-wrap)가 가로 스크롤을 맡으므로, 그 안쪽이 넓어도
+  // 화면 전체를 줄이는 기준으로 삼지 않는다(글자를 읽을 수 있는 크기를 유지).
+  const scrollingBracket = window.innerWidth <= 720 ? stage.querySelector(".bracket-wrap") : null;
   stage.querySelectorAll("*").forEach((element) => {
+    if (scrollingBracket && element !== scrollingBracket && scrollingBracket.contains(element)) return;
     if (element.hidden) return;
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden") return;

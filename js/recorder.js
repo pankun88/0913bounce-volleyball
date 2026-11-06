@@ -360,6 +360,14 @@ function renderCourtSchedule() {
     return;
   }
   const schedule = currentCourtSchedule();
+  // 제출한 경기가 승인·공개되어 완료로 바뀌면 「운영본부 확인을 기다리는 중」 안내를 결과 안내로 바꾼다.
+  if (ui.successPanel && !ui.successPanel.hidden && successMatchKey) {
+    const submitted = schedule.find((item) => item.matchKey === successMatchKey);
+    if (submitted?.baseStatus === "completed") {
+      if (ui.successTitle) ui.successTitle.textContent = `승인 완료 · ${submitted.matchup}`;
+      if (ui.successNote) ui.successNote.textContent = "운영본부가 승인해 공식 결과로 공개되었습니다.";
+    }
+  }
   if (ui.courtScheduleStatus) {
     ui.courtScheduleStatus.hidden = Boolean(schedule.length);
     ui.courtScheduleStatus.textContent = schedule.length ? "" : recorderWaitingMessage("empty_schedule");

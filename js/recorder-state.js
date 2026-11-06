@@ -940,8 +940,11 @@ export function recorderWaitingMessage(kind, { schedule = [], assignment = null 
   if (remaining.some((item) => isFinalAssignment(item?.assignment) && item?.assignment?.dependencyReady === false)) {
     return FINAL_WAITING_MESSAGE;
   }
-  if (!list.length || list.every((item) => item?.baseStatus === "completed")) {
+  if (!list.length) {
     return `현재 입력할 경기가 없습니다. ${FINAL_PUBLISH_HINT}`;
+  }
+  if (list.every((item) => item?.baseStatus === "completed")) {
+    return "이 코트의 경기가 모두 끝났습니다. 수고하셨습니다. 본선 경기는 관리자가 공개·배정하면 자동으로 나타납니다.";
   }
   return "현재 대기 중인 경기가 없습니다. 관리자가 다음 경기를 진행시키면 자동으로 나타납니다.";
 }

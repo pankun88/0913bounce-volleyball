@@ -2963,6 +2963,13 @@ body.dashboard-page .footer-note {
   body.dashboard-page .live-dot {
     font-size: 11px;
   }
+  /* 좁은 화면: 본선 대진표를 읽을 수 있는 크기로 두고 상자 안에서 좌우로 밀어 본다. */
+  body.dashboard-page #dashBracketCard #dashBracketContainer.bracket-wrap {
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch;
+  }
+  body.dashboard-page #dashBracketContainer .bracket-root { min-width: 360px; }
   body.dashboard-page .dashboard-fullscreen-btn {
     min-height: 29px;
     padding: 5px 9px;

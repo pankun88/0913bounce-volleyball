@@ -1054,6 +1054,10 @@ check('-1:5 target10 -> rejected (음수)', validateSetScore(-1, 5, 10).ok === f
 check('9.5:5 target10 -> rejected (정수 아님)', validateSetScore(9.5, 5, 10).ok === false);
 check('10:0 target10 -> ok (정상 종료)', validateSetScore(10, 0, 10).ok === true);
 check('10:8 target10 -> ok (정상 종료, 2점차)', validateSetScore(10, 8, 10).ok === true);
+check('10:0 target7 message names the 7-point set (not 듀스)', (() => { const r = validateSetScore(10, 0, 7); return r.ok === false && /7점 경기/.test(r.message) && !/듀스 상황/.test(r.message); })());
+check('12:5 target10 message says the set ends at 10 (not 듀스)', (() => { const r = validateSetScore(12, 5, 10); return r.ok === false && /10점 경기/.test(r.message) && !/듀스 상황/.test(r.message); })());
+check('15:10 message explains 15 only follows a deuce', (() => { const r = validateSetScore(15, 10, 10); return r.ok === false && /15:13 또는 15:14/.test(r.message); })());
+check('12:9 target10 keeps the deuce 2-point-gap message', (() => { const r = validateSetScore(12, 9, 10); return r.ok === false && /듀스 상황에서는 2점차/.test(r.message); })());
 check('0:0 target10 -> ok (아직 입력 안 한 세트)', validateSetScore(0, 0, 10).ok === true);
 check('0:0 target7 -> ok (아직 입력 안 한 3세트)', validateSetScore(0, 0, 7).ok === true);
 check('5:3 target10 -> rejected (목표 미달, 아직 안 끝난 세트)', validateSetScore(5, 3, 10).ok === false);
@@ -4288,6 +4292,28 @@ check(
     }) === '다음 본선 경기는 운영본부가 결과를 공개하면 열립니다. 잠시 기다려 주세요.');
   check('recorder waiting: all completed points to publication',
     /공개/.test(recorderWaitingMessage('no_current', { schedule: [{ status: 'completed', baseStatus: 'completed', assignment: {} }] })));
+  check('recorder waiting: all matches done says the court is finished',
+    /이 코트의 경기가 모두 끝났습니다\. 수고하셨습니다\./.test(recorderWaitingMessage('no_current', { schedule: [{ status: 'completed', baseStatus: 'completed', assignment: {} }] })));
+  check('recorder waiting: empty schedule is not reported as finished',
+    !/모두 끝났습니다/.test(recorderWaitingMessage('no_current', { schedule: [] })));
+  {
+    const recSrc = fs.readFileSync(new URL('./recorder.js', import.meta.url), 'utf8');
+    check('recorder success card turns into an approved notice once the match is completed',
+      recSrc.includes('승인 완료 ·') && /submitted\?\.baseStatus === "completed"/.test(recSrc));
+    const dashSrc = fs.readFileSync(new URL('./bracket-render.js', import.meta.url), 'utf8');
+    check('public bracket empty text is true for unpublished brackets too',
+      dashSrc.includes('본선 대진표가 아직 공개되지 않았습니다.') && !dashSrc.includes('아직 본선 대진표가 생성되지 않았습니다'));
+    const admSrc = fs.readFileSync(new URL('./admin.js', import.meta.url), 'utf8');
+    check('admin connection label is unambiguous and offline is shown',
+      admSrc.includes('"실시간 연결됨"') && admSrc.includes('"연결 끊김"') && !admSrc.includes('"동기화중"'));
+    check('division switch confirm says what is lost and suggests publishing first',
+      admSrc.includes('먼저 ‘관객·기록관 화면에 공개’를 누르세요') && admSrc.includes('동률 추첨·부전승 추첨 선택'));
+    check('admin settings history warning hides when no history', /guidance\.hidden = ready && !historyMatches\.length/.test(admSrc));
+    check('admin recorder grants refresh in background on setup tab', admSrc.includes('refreshRecorderGrantsQuietly'));
+    const cssSrc = fs.readFileSync(new URL('../css/style.css', import.meta.url), 'utf8');
+    check('mobile dashboard bracket keeps a readable min width and scrolls sideways',
+      /#dashBracketContainer\.bracket-wrap\s*\{[^}]*overflow-x:\s*auto/.test(cssSrc) && /#dashBracketContainer \.bracket-root\s*\{\s*min-width:\s*360px/.test(cssSrc));
+  }
   check('recorder waiting: remaining ready matches give the queue message',
     /관리자가 다음 경기를 진행/.test(recorderWaitingMessage('no_current', {
       schedule: [{ status: 'waiting', baseStatus: 'waiting', assignment: { matchType: 'prelim' } }],

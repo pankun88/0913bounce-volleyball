@@ -77,10 +77,14 @@ export function validateSetScore(a, b, target) {
     return { ok: false, message: '15점에서는 동점일 수 없습니다.' };
   }
   if (hi === 15 && margin > 2) {
-    return { ok: false, message: '듀스 상황에서는 2점차로 끝나야 합니다 (예: 15:13, 15:14).' };
+    return { ok: false, message: '15점은 듀스 끝에 나오는 점수라 15:13 또는 15:14만 입력할 수 있습니다.' };
   }
   if (hi > target && hi < 15 && margin !== 2) {
     // 목표 점수를 넘었지만 상한(15) 전인 경우 = 듀스 상황. 2점차가 나는 순간 바로 끝나야 한다.
+    if (lo <= target - 2) {
+      // 상대가 목표-2 이하면 목표 점수에 닿는 순간 세트가 끝났어야 한다(듀스 아님).
+      return { ok: false, message: `이 세트는 ${target}점 경기입니다. 상대가 ${target - 2}점 이하이면 ${target}점에서 끝나므로 ${hi}:${lo}은(는) 입력할 수 없습니다 (예: ${target}:${lo}).` };
+    }
     return { ok: false, message: `듀스 상황에서는 2점차로 끝나야 합니다 (예: ${hi}:${hi - 2}).` };
   }
 

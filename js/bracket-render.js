@@ -24,7 +24,7 @@ export function renderBracket(container, matches, options = {}) {
   disposeBracketRender(container);
   container.innerHTML = "";
   if (!matches || matches.length === 0) {
-    container.innerHTML = '<div class="empty-hint">아직 본선 대진표가 생성되지 않았습니다.</div>';
+    container.innerHTML = '<div class="empty-hint">본선 대진표가 아직 공개되지 않았습니다.</div>';
     return;
   }
 

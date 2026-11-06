@@ -708,7 +708,9 @@ function updatePrelimMutationGuardUi() {
       ? prelimHistoryReadinessGuidance()
       : historyMatches.length
       ? prelimMutationGuidance(historyMatches)
-      : PRELIM_HISTORY_GUIDANCE;
+      : "";
+    // 공식 예선 이력이 없고 서버 확인도 끝났으면 해당되지 않는 경고이므로 숨긴다.
+    guidance.hidden = ready && !historyMatches.length;
   }
   [
     ["resetGroupsBtn", "delete_all_groups", "공식 이력이 없는 경우 현재 부문의 모든 조를 삭제합니다."],
@@ -832,6 +834,13 @@ rebindFinalMatches();
 // ---------------- 연결 상태 감시 ----------------
 
 function initConnectionWatch() {
+  window.addEventListener("offline", () => {
+    const el = document.getElementById("connStatus");
+    if (!el) return;
+    el.textContent = "연결 끊김";
+    el.style.color = "#c0392b";
+  });
+  window.addEventListener("online", () => setConnStatus(true));
   window.addEventListener("firestore-error", (e) => {
     const { label, err } = e.detail;
     if (label === "예선경기 구독" || label === "예선경기") {
@@ -863,7 +872,7 @@ function initConnectionWatch() {
 function setConnStatus(ok) {
   const el = document.getElementById("connStatus");
   if (!el) return;
-  el.textContent = ok ? "동기화중" : "연결 오류";
+  el.textContent = ok ? "실시간 연결됨" : "연결 오류";
   el.style.color = ok ? "" : "#c0392b";
 }
 
@@ -3081,6 +3090,43 @@ async function refreshRecorderGrants() {
   }
 }
 
+let recorderGrantsBackgroundBusy = false;
+/** 화면을 비우지 않고 조용히 권한 목록만 다시 받는다(기록관이 입장한 뒤 수동 새로고침 없이 반영). */
+async function refreshRecorderGrantsQuietly() {
+  if (recorderGrantsLoading || recorderGrantsBackgroundBusy || !recorderGrantsAuthUid || document.hidden) return;
+  const requestToken = recorderGrantsRefreshToken;
+  const requestUid = recorderGrantsAuthUid;
+  const isCurrentRequest = () => requestToken === recorderGrantsRefreshToken
+    && requestUid === recorderGrantsAuthUid && !recorderGrantsLoading;
+  recorderGrantsBackgroundBusy = true;
+  try {
+    const grants = [];
+    const seenUids = new Set();
+    const seenCursors = new Set();
+    let cursor = null;
+    while (true) {
+      const result = await adminWorkflowCallable("listRecorderGrants", cursor === null ? {} : { cursor });
+      if (!isCurrentRequest()) return;
+      const page = validateRecorderGrantPage(result?.data, seenUids, seenCursors, cursor);
+      grants.push(...page.grants);
+      if (page.nextCursor === null) break;
+      cursor = page.nextCursor;
+    }
+    if (!isCurrentRequest()) return;
+    const sorted = grants.sort((x, y) => Number(y.issuedAt || 0) - Number(x.issuedAt || 0));
+    const signature = JSON.stringify(sorted);
+    if (signature !== JSON.stringify(recorderGrants) || recorderGrantsError) {
+      recorderGrants = sorted;
+      recorderGrantsError = "";
+      renderRecorderGrants();
+    }
+  } catch {
+    // 조용한 갱신은 실패해도 기존 목록을 그대로 둔다. 수동 새로고침 버튼은 오류를 표시한다.
+  } finally {
+    recorderGrantsBackgroundBusy = false;
+  }
+}
+
 function activeRecorderLockList() {
   return reviewAssignments
     .map((assignment) => ({ assignment, workflow: reviewWorkflows.get(assignment.id) }))
@@ -3533,7 +3579,13 @@ async function saveQualificationCount() {
 function switchActiveDivision(nextDivision) {
   if (!nextDivision || nextDivision === activeDivision) return false;
   if (!finalMutationAllowed()) return false;
-  if (bracketPublishPending && !confirm(`${divisionLabel()}의 공개하지 않은 본선 대진 변경사항을 버리고 ${DIVISION_LABELS[nextDivision]}로 전환할까요?`)) return false;
+  if (bracketPublishPending && !confirm(
+    `${divisionLabel()}의 아직 공개하지 않은 본선 대진 변경이 있습니다.\n`
+    + `지금 ${DIVISION_LABELS[nextDivision]}로 전환하면 다음 내용이 사라지고, 돌아와서 같은 팀·추첨 선택으로 대진을 다시 만들어야 합니다.\n`
+    + `· 생성하거나 고친 대진표 초안\n· 동률 추첨·부전승 추첨 선택\n\n`
+    + `사라지지 않게 하려면 [취소]를 누르고 먼저 ‘관객·기록관 화면에 공개’를 누르세요.\n`
+    + `변경을 버리고 전환하려면 [확인]을 누르세요.`
+  )) return false;
   activeDivision = nextDivision;
   document.body.dataset.division = activeDivision;
   syncDivisionThemeScopes();
@@ -3760,6 +3812,11 @@ function bindStaticHandlers() {
     }
   });
   document.getElementById("refreshRecorderGrantsBtn").addEventListener("click", refreshRecorderGrants);
+  // 대회설정 탭을 보고 있는 동안 기록관 접근 권한 목록을 자동으로 갱신한다.
+  setInterval(() => {
+    if (document.getElementById("tab-setup")?.classList.contains("active")) refreshRecorderGrantsQuietly();
+  }, 20000);
+  document.querySelector('.tab-btn[data-tab="setup"]')?.addEventListener("click", refreshRecorderGrantsQuietly);
   document.querySelectorAll("[data-workflow-phase]").forEach((button) => {
     button.addEventListener("click", () => {
       if (!["all", "prelim", "final"].includes(button.dataset.workflowPhase)) return;
