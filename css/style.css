@@ -344,7 +344,7 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   background: var(--cream);
   color: var(--red-dark);
 }
-.badge.win { background: rgba(46,139,87,0.15); color: var(--win); }
+.badge.win { background: var(--win-bg, rgba(46,139,87,0.15)); color: var(--win); }
 .badge.draw { background: rgba(140,120,60,0.15); color: #8a6d1d; }
 .badge.loss { background: rgba(192,57,43,0.12); color: #c0392b; }
 .badge.lottery { background: rgba(192,57,43,0.12); color: #c0392b; }
@@ -2109,6 +2109,8 @@ tr.rank-1 td:first-child { color: var(--red-dark); font-weight: 800; }
   --muted: #776d82;
   --line: rgba(111, 82, 163, 0.16);
   --white: #fdfaff;
+  --win: #6f52bf;
+  --win-bg: rgba(130, 101, 207, 0.15);
   --theme-primary: #8265cf;
   --theme-primary-soft: #ad92ee;
   --theme-primary-dark: #594b78;
