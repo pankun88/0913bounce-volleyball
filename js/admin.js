@@ -3723,7 +3723,8 @@ function bindStaticHandlers() {
     const mode = document.getElementById("venueDisplayMode").value;
     const intervalSeconds = Number(document.getElementById("venueDisplayInterval").value);
     try {
-      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds } });
+      // 서버 보안 규칙이 숫자 cycleStartedAt을 요구함. 대시보드는 이 값을 쓰지 않고 자체 시계로 교대함.
+      await saveTournamentInfo({ venueDisplay: { mode, intervalSeconds, cycleStartedAt: Date.now() } });
       showToast("경기장 송출 설정을 저장했습니다");
     } catch (err) {
       reportError("경기장 송출 설정 저장", err);

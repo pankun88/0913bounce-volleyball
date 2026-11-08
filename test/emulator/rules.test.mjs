@@ -203,6 +203,21 @@ export async function runRulesSuite() {
       venueDisplay: { mode: 'auto', intervalSeconds: 15, cycleStartedAt: 1 },
       updatedAt: serverTimestamp(),
     }));
+    // 운영과 같은 상태(저장된 venueDisplay에 cycleStartedAt 없음)에서 송출 설정 저장 버튼과 같은 setDoc(merge) 쓰기:
+    // cycleStartedAt 없이는 거부, 있으면 모드·간격 변경 허용.
+    await f.seed(async (admin) => {
+      await updateDoc(doc(admin, 'tournaments/main'), { venueDisplay: { mode: 'auto', intervalSeconds: 15 } });
+    });
+    await assertFails(setDoc(doc(seededAdmin, 'tournaments/main'), {
+      venueDisplay: { mode: 'auto', intervalSeconds: 20 },
+      updatedAt: serverTimestamp(),
+    }, { merge: true }));
+    for (const [mode, intervalSeconds] of [['auto', 10], ['auto', 20], ['auto', 30], ['men', 15], ['women', 15], ['auto', 15]]) {
+      await assertSucceeds(setDoc(doc(seededAdmin, 'tournaments/main'), {
+        venueDisplay: { mode, intervalSeconds, cycleStartedAt: Date.now() },
+        updatedAt: serverTimestamp(),
+      }, { merge: true }));
+    }
     await assertFails(updateDoc(doc(seededAdmin, 'tournaments/main'), {
       name: 'missing server timestamp',
     }));
